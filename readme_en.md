@@ -120,7 +120,7 @@ Chat Agent mode replaces the traditional LLM Handler with a multi-turn tool-call
 
 * WeChat Group
 
-<img alt="community_wechat.png" height="200" src="https://github.com/HumanAIGC-Engineering/OpenAvatarChat/blob/main/assets/images/community_wechat.png" width="200"/>
+<img alt="community_wechat.png" height="200" src="https://github.com/HumanAIGC-Engineering/OpenAvatarChat/blob/main/assets/images/OpenAvatarChat.png" width="200"/>
 
 * 🚨 [FAQ](https://humanaigc-engineering.github.io/OpenAvatarChat/en/community/faq)
 
