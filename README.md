@@ -118,7 +118,7 @@ Chat Agent 模式使用多轮工具调用 Agent 替代传统 LLM Handler，为�
 
 * 微信群
 
-<img alt="community_wechat.png" height="200" src="https://github.com/HumanAIGC-Engineering/OpenAvatarChat/blob/main/assets/images/community_wechat.png" width="200"/>
+<img alt="community_wechat.png" height="200" src="https://github.com/HumanAIGC-Engineering/OpenAvatarChat/blob/main/assets/images/OpenAvatarChat.png" width="200"/>
 
 * 官方视频教程：[Bilibili](https://www.bilibili.com/video/BV1sv8QzLEC2)
 * 🚨 [常见问题](https://humanaigc-engineering.github.io/OpenAvatarChat/community/faq)
