@@ -11,9 +11,18 @@ from fastapi import FastAPI
 from loguru import logger
 
 from engine_utils.directory_info import DirectoryInfo
+from service.service_security.certificate_session_control import (
+    install_certificate_session_control_v1,
+)
 from service.service_utils.logger_utils import config_loggers
-from service.service_utils.service_config_loader import load_configs
-from service.service_utils.ssl_helpers import create_ssl_context
+from service.service_utils.service_config_loader import (
+    CertificateCaptureConfigurationError,
+    load_configs,
+)
+from service.service_utils.ssl_helpers import (
+    CertificateCaptureStartupError,
+    create_ssl_context,
+)
 
 project_dir = DirectoryInfo.get_project_dir()
 if project_dir not in sys.path:
@@ -78,6 +87,9 @@ def main():
     if  config_from_env:
         args.config = config_from_env
     logger_config, service_config, engine_config = load_configs(args)
+    ssl_context = None
+    if service_config.certificate_capture.enabled:
+        ssl_context = create_ssl_context(args, service_config)
 
     # 设置modelscope的默认下载地址
     if not os.path.isabs(engine_config.model_root):
@@ -87,23 +99,44 @@ def main():
     config_loggers(logger_config)
     
     demo_app, ui, parent_block = setup_demo()
+    if service_config.certificate_capture.enabled:
+        install_certificate_session_control_v1(
+            demo_app,
+            service_config.certificate_capture,
+        )
     
     chat_engine = ChatEngine()
     chat_engine.initialize(engine_config, app=demo_app, ui=ui, parent_block=parent_block)
 
-    ssl_context = create_ssl_context(args, service_config)
+    if ssl_context is None:
+        ssl_context = create_ssl_context(args, service_config)
 
-    uvicorn_config = uvicorn.Config(demo_app, host=service_config.host, port=service_config.port, **ssl_context)
+    uvicorn_options = dict(ssl_context)
+    if service_config.certificate_capture.enabled:
+        uvicorn_options["workers"] = service_config.workers
+    uvicorn_config = uvicorn.Config(
+        demo_app,
+        host=service_config.host,
+        port=service_config.port,
+        **uvicorn_options,
+    )
     server = OpenAvatarChatWebServer(chat_engine, uvicorn_config)
     server.run()
 
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
         main()
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, exiting.")
+    except (
+        CertificateCaptureConfigurationError,
+        CertificateCaptureStartupError,
+    ) as exception:
+        logger.error(str(exception))
+        exit_code = 1
     finally:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        os._exit(0)
+        os._exit(exit_code)
