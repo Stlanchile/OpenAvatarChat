@@ -28,7 +28,8 @@ class RTCProvider(metaclass=SingletonMeta):
         else:
             rtc_config = None
         if rtc_config is not None:
-            logger.info(f"Parsing RTC config: {rtc_config}")
+            # TURN credentials are signaling secrets and must never be logged.
+            logger.info("Parsing RTC configuration.")
             turn_provider_name = rtc_config.get("turn_provider")
             turn_provider = None
             turn_provider_config = None

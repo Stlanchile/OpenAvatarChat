@@ -8,12 +8,14 @@ from chat_engine.common.client_handler_base import (
     ClientHandlerDelegate,
     ClientSessionDelegate,
 )
+from service.service_security.certificate_session_authority import (
+    session_admission_ownership_matches_v1,
+)
 from service.service_security.websocket_session_admission import (
     WebSocketAdmissionErrorV1,
     WebSocketAdmissionReasonV1,
     WebSocketSessionAdmissionGuardV1,
     reject_websocket_admission_v1,
-    session_admissions_match_v1,
     websocket_session_admission_guard_v1,
 )
 
@@ -81,7 +83,11 @@ async def _serve_authenticated_websocket(
                     established_admission = (
                         handler_delegate.find_session_admission(session_id)
                     )
-                    if not session_admissions_match_v1(
+                    # Each transport has already consumed its own channel-bound
+                    # ticket. Existing application state may therefore have
+                    # been created by RTC while still naming the exact same
+                    # authority-owned session and principal.
+                    if not session_admission_ownership_matches_v1(
                         established_admission,
                         session_admission,
                     ):

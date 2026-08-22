@@ -245,6 +245,9 @@ from handlers.client.ws_client.ws_message_protocol import (
 )
 from service.frontend_service import register_frontend
 from service.rtc_service.rtc_provider import RTCProvider
+from service.rtc_service.rtc_session_admission import (
+    mount_rtc_signaling_routes_v1,
+)
 from service.rtc_service.rtc_stream import RtcStream
 from chat_engine.data_models.chat_signal_type import ChatSignalType
 
@@ -328,7 +331,7 @@ class RtcClientSessionDelegate(ClientSessionDelegate):
 
 class ClientRtcConfigModel(HandlerBaseConfigModel, BaseModel):
     connection_ttl: int = Field(default=900)
-    turn_config: Optional[Dict] = Field(default=None)
+    turn_config: Optional[Dict] = Field(default=None, repr=False)
     output_video_fps: int = Field(
         default=30, description="Output video frame rate for RTC stream. Must match the avatar handler's fps (e.g. 20 for MuseTalk, 30 for LiteAvatar) to ensure correct lip-sync PTS.")
 
@@ -412,7 +415,11 @@ class ClientHandlerRtc(ClientHandlerBase):
             handler=self.rtc_streamer_factory,
             concurrency_limit=self.handler_config.concurrent_limit,
         )
-        webrtc.mount(fastapi)
+        mount_rtc_signaling_routes_v1(
+            fastapi,
+            webrtc,
+            self.rtc_streamer_factory,
+        )
 
         def init_config_provider():
             return {

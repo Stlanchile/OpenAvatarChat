@@ -13,6 +13,7 @@ from service.service_security.certificate_session_authority import (
     SessionAdmissionChannelV1,
     SessionAuthorityErrorV1,
     SessionAuthorityReasonV1,
+    session_admission_ownership_matches_v1,
 )
 from service.service_security.certificate_session_control import (
     CertificateSessionControlRuntimeV1,
@@ -187,10 +188,8 @@ def session_admissions_match_v1(
     """Compare only immutable server-owned session-authority identity."""
 
     return (
-        isinstance(established, ConsumedSessionAdmissionV1)
-        and established.session_id == candidate.session_id
-        and established.owner_issuer == candidate.owner_issuer
-        and established.owner_subject == candidate.owner_subject
+        session_admission_ownership_matches_v1(established, candidate)
+        and isinstance(established, ConsumedSessionAdmissionV1)
         and established.channel is candidate.channel
     )
 

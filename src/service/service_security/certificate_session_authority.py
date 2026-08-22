@@ -130,6 +130,20 @@ class ConsumedSessionAdmissionV1:
         return "ConsumedSessionAdmissionV1(<redacted>)"
 
 
+def session_admission_ownership_matches_v1(
+    established: object,
+    candidate: ConsumedSessionAdmissionV1,
+) -> bool:
+    """Compare immutable authority-owned session and principal identity."""
+
+    return (
+        isinstance(established, ConsumedSessionAdmissionV1)
+        and established.session_id == candidate.session_id
+        and established.owner_issuer == candidate.owner_issuer
+        and established.owner_subject == candidate.owner_subject
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SessionAuthorityCleanupV1:
     removed_sessions: int
@@ -516,6 +530,69 @@ class CertificateSessionAuthorityV1:
             admission_ticket=admission_ticket,
             channel=SessionAdmissionChannelV1.WEBSOCKET,
         )
+
+    def validate_consumed_session_admission(
+        self,
+        admission: ConsumedSessionAdmissionV1,
+        *,
+        channel: SessionAdmissionChannelV1 | str,
+        principal: AuthenticatedPrincipalV1 | None = None,
+    ) -> SessionOwnershipV1:
+        """Validate that a trusted consumed admission still names live authority.
+
+        Consumed tickets are intentionally not restored or retained. This seam
+        checks the immutable admission against the current Milestone 1C session
+        lifecycle so a later transport-to-application transition cannot attach
+        after revocation, replacement, or expiry.
+        """
+
+        with self._lock:
+            self._ensure_open_locked()
+            now_epoch, now_monotonic = self._read_clocks_locked()
+            self._cleanup_expired_locked(now_epoch, now_monotonic)
+
+            try:
+                validated_channel = SessionAdmissionChannelV1(channel)
+            except (TypeError, ValueError):
+                validated_channel = None
+
+            state = (
+                self._sessions.get(admission.session_id)
+                if isinstance(admission, ConsumedSessionAdmissionV1)
+                else None
+            )
+            admission_matches = (
+                state is not None
+                and validated_channel is not None
+                and admission.channel is validated_channel
+                and state.ownership.owner_issuer == admission.owner_issuer
+                and state.ownership.owner_subject == admission.owner_subject
+            )
+
+            principal_matches = True
+            if principal is not None:
+                owner_material = self._owner_material_or_none(principal)
+                principal_expiry = self._token_expiry_or_none(principal)
+                principal_matches = (
+                    state is not None
+                    and owner_material is not None
+                    and principal_expiry is not None
+                    and principal_expiry > now_epoch
+                    and state.ownership.owner_issuer
+                    == getattr(principal, "issuer", None)
+                    and state.ownership.owner_subject
+                    == getattr(principal, "subject", None)
+                    and hmac.compare_digest(
+                        state.owner_digest,
+                        self._owner_digest(owner_material),
+                    )
+                )
+
+            if not admission_matches or not principal_matches:
+                raise SessionAuthorityErrorV1(
+                    SessionAuthorityReasonV1.TICKET_ACCESS_DENIED
+                )
+            return state.ownership
 
     def _consume_admission_ticket(
         self,

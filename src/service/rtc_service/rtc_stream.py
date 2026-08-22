@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import time
 import uuid
 import weakref
-from typing import Optional, Dict
+from typing import TYPE_CHECKING, Dict, Optional
 
 import numpy as np
 # noinspection PyPackageRequirements
@@ -29,6 +31,15 @@ from handlers.client.ws_client.ws_message_protocol import (
     MessageType,
     serialize_message,
 )
+
+if TYPE_CHECKING:
+    from service.rtc_service.rtc_session_admission import (
+        TrustedRtcSessionAdmissionV1,
+    )
+    from service.service_security.certificate_session_authority import (
+        ConsumedSessionAdmissionV1,
+    )
+
 
 def _get_h264_encoder_info():
     """Get H.264 encoder info dynamically to avoid circular imports"""
@@ -78,7 +89,17 @@ class RtcStream(AsyncAudioVideoStreamHandler):
 
         self.streams: Dict[str, RtcStream] = {}
         self.owns_session = False
+        self.webrtc_id: str | None = None
+        self.transport_id: str | None = None
+        self.session_admission: ConsumedSessionAdmissionV1 | None = None
+        self.trusted_rtc_admission: TrustedRtcSessionAdmissionV1 | None = None
+        self._secure_admission_required_v1 = False
+        self._shutdown_started = False
 
+    def require_secure_rtc_admission_v1(self) -> None:
+        """Fail closed unless copy() receives server-owned admission context."""
+
+        self._secure_admission_required_v1 = True
 
     # copy is used as create_instance in fastrtc
     def copy(self, **kwargs) -> AsyncAudioVideoStreamHandler:
@@ -96,9 +117,25 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                 stream_start_delay=self.stream_start_delay,
             )
             new_stream.weak_factory = weakref.ref(self)
+            new_stream._secure_admission_required_v1 = (
+                self._secure_admission_required_v1
+            )
+            if self._secure_admission_required_v1:
+                from service.rtc_service.rtc_session_admission import (
+                    get_current_trusted_rtc_admission_v1,
+                )
+
+                trusted_admission = get_current_trusted_rtc_admission_v1()
+                if trusted_admission is None:
+                    raise RuntimeError("SECURE_RTC_ADMISSION_REQUIRED")
+                new_stream.webrtc_id = trusted_admission.webrtc_id
+                new_stream.transport_id = trusted_admission.transport_id
+                new_stream.session_admission = trusted_admission.session_admission
+                new_stream.trusted_rtc_admission = trusted_admission
+                trusted_admission.bind_stream(new_stream)
             return new_stream
-        except Exception as e:
-            logger.opt(exception=True).error(f"Failed to create stream: {e}")
+        except Exception:
+            logger.opt(exception=True).error("Failed to create RTC stream.")
             raise
 
     async def start_up(self):
@@ -111,6 +148,12 @@ class RtcStream(AsyncAudioVideoStreamHandler):
 
         if factory.client_handler_delegate is None:
             raise RuntimeError("ClientHandlerDelegate is not set.")
+
+        if self._secure_admission_required_v1:
+            if self.trusted_rtc_admission is None:
+                raise RuntimeError("SECURE_RTC_ADMISSION_REQUIRED")
+            await self.trusted_rtc_admission.attach_stream(self)
+            return
 
         session_id = self.session_id
         if not session_id:
@@ -257,11 +300,10 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                 
             @channel.on("message")
             def _(message):
-                logger.info(f"Received message Custom: {message}")
                 try:
                     message = json.loads(message)
-                except Exception as e:
-                    logger.info(e)
+                except Exception:  # noqa: BLE001
+                    logger.debug("Ignored malformed RTC data-channel message.")
                     message = {}
 
                 if self.client_session_delegate is None:
@@ -269,7 +311,6 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                 timestamp = self.client_session_delegate.get_timestamp()
                 if timestamp[0] / timestamp[1] < self.stream_start_delay:
                     return
-                logger.info(f'on_chat_datachannel: {message}')
     
                 if message['header']['name'] == 'Interrupt':
                     self.client_session_delegate.emit_signal(
@@ -320,8 +361,8 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                                 ),
                             )
                             self.chat_channel.send(json.dumps(serialize_message(response)))
-                        except Exception as e:
-                            logger.opt(exception=e).warning("Failed to send local human text echo")
+                        except Exception:  # noqa: BLE001
+                            logger.warning("Failed to send local human text echo.")
                 # else:
 
                 # channel.send(json.dumps({"type": "chat", "unique_id": unique_id, "message": message}))
@@ -330,7 +371,11 @@ class RtcStream(AsyncAudioVideoStreamHandler):
         # {"type":"chat",id:"标识属于同一段话", "message":"Hello, world!"}
         # unique_id = uuid.uuid4().hex
         pass
+
     def shutdown(self):
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
         self.quit.set()
         factory = None
         if self.weak_factory is not None:
@@ -341,4 +386,12 @@ class RtcStream(AsyncAudioVideoStreamHandler):
         if self.session_id in factory.streams:
             factory.streams.pop(self.session_id, None)
         if self.owns_session and factory.client_handler_delegate is not None:
-            factory.client_handler_delegate.stop_session(self.session_id)
+            try:
+                factory.client_handler_delegate.stop_session(self.session_id)
+            except Exception:  # noqa: BLE001
+                logger.error("Failed to stop RTC-owned session.")
+        if self.trusted_rtc_admission is not None:
+            try:
+                self.trusted_rtc_admission.release_stream(self)
+            except Exception:  # noqa: BLE001
+                logger.error("Failed to release secure RTC transport.")

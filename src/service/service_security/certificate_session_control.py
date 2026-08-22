@@ -26,6 +26,9 @@ from service.service_security.oidc_resource_server import (
 from service.service_utils.ssl_helpers import CertificateCaptureStartupError
 
 SESSION_CAPABILITY_HEADER_V1 = "X-Certificate-Session-Capability"
+CERTIFICATE_CAPTURE_ENABLED_STATE_ATTRIBUTE_V1 = (
+    "certificate_capture_enabled_v1"
+)
 
 _AUTHORIZATION_HEADER_V1 = "Authorization"
 _MAX_AUTHORIZATION_HEADER_CHARACTERS_V1 = 16 * 1024
@@ -97,6 +100,11 @@ def install_certificate_session_control_v1(
     if not feature_config.enabled:
         return None
 
+    setattr(
+        app.state,
+        CERTIFICATE_CAPTURE_ENABLED_STATE_ATTRIBUTE_V1,
+        True,
+    )
     validator = access_token_validator
     if validator is None:
         try:
