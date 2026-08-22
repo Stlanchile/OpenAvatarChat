@@ -1,14 +1,16 @@
-import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from loguru import logger
 
 from engine_utils.directory_info import DirectoryInfo
 from chat_engine.data_models.chat_engine_config_data import ChatEngineConfigModel
 from service.manager_service.data_tool_service import ManagerDataToolService
+from service.service_security.manager_authorization import (
+    require_manager_http_authorization_v1,
+)
 
 _data_tool_service: Optional[ManagerDataToolService] = None
 _data_tool_base_dir: Optional[Path] = None
@@ -61,11 +63,12 @@ def register_manager_apis(app: FastAPI, engine_config: Optional[ChatEngineConfig
         logger.info("Manager data tool websocket registered.")
 
     @app.get("/download/manager/data_tool/file")
-    async def get_data_tool_file(file_path: str):
+    async def get_data_tool_file(request: Request, file_path: str):
         """
         Serve files stored by the data tool handler. The file_path must be a
         relative path under the data_tool base directory.
         """
+        await require_manager_http_authorization_v1(app, request)
         base_dir = get_data_tool_base_dir()
         target_path = (base_dir / file_path).resolve()
 

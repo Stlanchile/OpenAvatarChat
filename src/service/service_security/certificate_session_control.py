@@ -19,6 +19,7 @@ from service.service_security.certificate_session_authority import (
     SessionCapabilityGrantV1,
 )
 from service.service_security.oidc_resource_server import (
+    OIDC_CERTIFICATE_CAPTURE_SCOPE_V1,
     AuthenticatedPrincipalV1,
     OidcAuthenticationErrorV1,
     create_oidc_access_token_validator_v1,
@@ -29,6 +30,12 @@ SESSION_CAPABILITY_HEADER_V1 = "X-Certificate-Session-Capability"
 CERTIFICATE_CAPTURE_ENABLED_STATE_ATTRIBUTE_V1 = (
     "certificate_capture_enabled_v1"
 )
+_LEGACY_RTC_ROUTE_PATHS_V1 = {
+    "/webrtc/offer",
+    "/telephone/handler",
+    "/telephone/incoming",
+    "/websocket/offer",
+}
 
 _AUTHORIZATION_HEADER_V1 = "Authorization"
 _MAX_AUTHORIZATION_HEADER_CHARACTERS_V1 = 16 * 1024
@@ -100,6 +107,14 @@ def install_certificate_session_control_v1(
     if not feature_config.enabled:
         return None
 
+    if any(getattr(route, "path", None) == "/gradio" for route in app.routes):
+        raise CertificateCaptureStartupError("LEGACY_GRADIO_ROUTE_CONFLICT")
+    if any(
+        getattr(route, "path", None) in _LEGACY_RTC_ROUTE_PATHS_V1
+        for route in app.routes
+    ):
+        raise CertificateCaptureStartupError("RTC_SIGNALING_ROUTE_CONFLICT")
+
     setattr(
         app.state,
         CERTIFICATE_CAPTURE_ENABLED_STATE_ATTRIBUTE_V1,
@@ -128,25 +143,46 @@ def install_certificate_session_control_v1(
         authority=session_authority,
         access_token_validator=validator,
     )
+    app.state.certificate_session_control_v1 = runtime
+    try:
+        from service.service_security.manager_authorization import (
+            install_manager_authorization_v1,
+        )
+
+        manager_runtime = install_manager_authorization_v1(
+            app,
+            validator,
+        )
+    except CertificateCaptureStartupError:
+        session_authority.close()
+        delattr(app.state, "certificate_session_control_v1")
+        raise
+    except Exception:  # noqa: BLE001
+        session_authority.close()
+        delattr(app.state, "certificate_session_control_v1")
+        raise CertificateCaptureStartupError(
+            "MANAGER_AUTHORIZATION_INITIALIZATION_FAILED"
+        ) from None
+    if manager_runtime is None:
+        session_authority.close()
+        delattr(app.state, "certificate_session_control_v1")
+        raise CertificateCaptureStartupError(
+            "MANAGER_AUTHORIZATION_INITIALIZATION_FAILED"
+        )
 
     async def authenticated_principal(
         request: Request,
     ) -> AuthenticatedPrincipalV1:
-        encoded_access_token = _extract_bearer_token(request)
-        try:
-            return await validator.validate_access_token(encoded_access_token)
-        except OidcAuthenticationErrorV1:
-            raise _http_error(
-                status.HTTP_401_UNAUTHORIZED,
-                "AUTHENTICATION_FAILED",
-                authenticate=True,
-            ) from None
-        # A custom validator must not let its internals escape or fail open.
-        except Exception:  # noqa: BLE001
+        principal = await require_certificate_control_authorization_v1(
+            app,
+            request,
+        )
+        if principal is None:
             raise _http_error(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "AUTHENTICATION_UNAVAILABLE",
-            ) from None
+            )
+        return principal
 
     @app.post(
         "/api/v1/session-capabilities",
@@ -221,8 +257,59 @@ def install_certificate_session_control_v1(
             session_authority.close()
 
     app.add_event_handler("shutdown", close_session_authority)
-    app.state.certificate_session_control_v1 = runtime
     return runtime
+
+
+async def require_certificate_control_authorization_v1(
+    app: FastAPI,
+    request: Request,
+) -> AuthenticatedPrincipalV1 | None:
+    """Require certificate scope for an enabled-mode control-plane surface."""
+
+    if not (
+        getattr(
+            app.state,
+            CERTIFICATE_CAPTURE_ENABLED_STATE_ATTRIBUTE_V1,
+            False,
+        )
+        or getattr(app.state, "certificate_session_control_v1", None)
+        is not None
+    ):
+        return None
+    runtime = getattr(app.state, "certificate_session_control_v1", None)
+    if not isinstance(runtime, CertificateSessionControlRuntimeV1):
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "AUTHENTICATION_UNAVAILABLE",
+        )
+
+    encoded_access_token = _extract_bearer_token(request)
+    try:
+        principal = await runtime.access_token_validator.validate_access_token(
+            encoded_access_token
+        )
+    except OidcAuthenticationErrorV1:
+        raise _http_error(
+            status.HTTP_401_UNAUTHORIZED,
+            "AUTHENTICATION_FAILED",
+            authenticate=True,
+        ) from None
+    except Exception:  # noqa: BLE001
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "AUTHENTICATION_UNAVAILABLE",
+        ) from None
+
+    if (
+        not isinstance(principal, AuthenticatedPrincipalV1)
+        or OIDC_CERTIFICATE_CAPTURE_SCOPE_V1 not in principal.scopes
+    ):
+        raise _http_error(
+            status.HTTP_401_UNAUTHORIZED,
+            "AUTHENTICATION_FAILED",
+            authenticate=True,
+        )
+    return principal
 
 
 def _extract_bearer_token(request: Request) -> str:

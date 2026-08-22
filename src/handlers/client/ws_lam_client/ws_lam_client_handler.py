@@ -232,6 +232,18 @@ class WsLamClientHandler(_rtc_module.ClientHandlerRtc):
 
         @app.get(asset_route + "/{file_name}")
         async def get_asset(file_name: str):
+            if (
+                getattr(
+                    app.state,
+                    "certificate_capture_enabled_v1",
+                    False,
+                )
+                and file_name != self.asset_name
+            ):
+                return JSONResponse(
+                    status_code=404,
+                    content={"message": "File not found"},
+                )
             if not re.match(r'^[a-zA-Z0-9._-]+$', file_name):
                 logger.error(f"Invalid file name: {file_name}")
                 return JSONResponse(status_code=400, content={"message": "Invalid file name"})

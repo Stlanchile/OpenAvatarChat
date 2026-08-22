@@ -9,12 +9,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union
 
 import gradio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from src.engine_utils.directory_info import DirectoryInfo
+from service.service_security.certificate_session_control import (
+    require_certificate_control_authorization_v1,
+)
 
 InitConfigSource = Union[Dict[str, Any], Callable[[], Dict[str, Any]]]
 
@@ -70,7 +73,8 @@ def register_frontend(
     frontend_path = _resolve_frontend_path(opts)
 
     @app.get(opts.init_config_route)
-    async def init_config_endpoint():
+    async def init_config_endpoint(request: Request):
+        await require_certificate_control_authorization_v1(app, request)
         config = _materialize_init_config(init_config)
         return JSONResponse(status_code=200, content=config)
 
@@ -86,4 +90,3 @@ def register_frontend(
     with ui:
         with active_parent:
             gradio.components.HTML(opts.gradio_placeholder_html, visible=True)
-

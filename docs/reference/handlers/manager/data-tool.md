@@ -46,6 +46,7 @@ Manager 注册了以下接口：
 
 | 接口 | 类型 | 说明 |
 |------|------|------|
+| `/api/v1/manager/websocket-admission-tickets` | POST | 签发一次性 Manager WebSocket 票据 |
 | `/ws/manager/data_tool` | WebSocket | 实时事件推送、配置快照、远程打断 |
 | `/download/manager/data_tool/file` | GET | 下载音频/图片等临时文件（仅限 `temp/data_tool/` 目录） |
 
@@ -69,7 +70,23 @@ Manager 注册了以下接口：
 
 ### 认证
 
-监控台支持可选的 Token 认证。在页面右上角的"认证设置"中输入 Token 后，WebSocket 连接和文件下载请求会自动附带该 Token。
+关闭 Secure Certificate Capture 时，保留现有的 Manager 旧版行为。
+
+启用 Secure Certificate Capture 时，Manager 访问必须使用具有独立
+`oac:manager` scope 的 OIDC access token：
+
+- 监控台通过 HTTPS 将 bearer token 发送到
+  `POST /api/v1/manager/websocket-admission-tickets`。
+- 返回的票据有效期为 60 秒且只能使用一次；客户端通过
+  `Sec-WebSocket-Protocol` 值
+  `oac.manager-admission.v1.<ticket>` 发送。服务端在接受 WebSocket
+  之前消费票据，并且不会回显包含秘密的协议值。
+- 文件下载通过 `Authorization` header 发送 OIDC bearer token。
+- token、capability 和 ticket 均不得放入 URL query string。
+
+`certificate:capture` scope、证书会话 capability、证书 WebSocket/RTC
+ticket 和 RTC transport binding 均不授予 Manager 权限。同样，仅有
+`oac:manager` 也不授予证书会话控制权限。
 
 ## 监控台界面
 

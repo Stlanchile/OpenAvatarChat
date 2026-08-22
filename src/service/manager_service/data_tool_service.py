@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import copy
 import json
 import threading
@@ -9,6 +8,13 @@ from typing import Any, Callable, Deque, Dict, Optional, Set
 
 from fastapi import WebSocket, WebSocketDisconnect
 from loguru import logger
+
+from service.service_security.manager_websocket_admission import (
+    ManagerWebSocketAdmissionErrorV1,
+    ManagerWebSocketAdmissionReasonV1,
+    manager_websocket_admission_guard_v1,
+    reject_manager_websocket_admission_v1,
+)
 
 
 class ManagerDataToolService:
@@ -114,9 +120,32 @@ class ManagerDataToolService:
 
         @app.websocket("/ws/manager/data_tool")
         async def data_tool_ws(websocket: WebSocket):
-            await websocket.accept()
-            self._set_loop_if_needed(asyncio.get_running_loop())
+            try:
+                admission_guard = manager_websocket_admission_guard_v1(app)
+                if admission_guard is not None:
+                    admission_guard.consume(websocket)
+            except ManagerWebSocketAdmissionErrorV1 as error:
+                await reject_manager_websocket_admission_v1(websocket, error)
+                return
+            except Exception:  # noqa: BLE001
+                await reject_manager_websocket_admission_v1(
+                    websocket,
+                    ManagerWebSocketAdmissionErrorV1(
+                        ManagerWebSocketAdmissionReasonV1.AUTHORITY_UNAVAILABLE,
+                        status_code=503,
+                    ),
+                )
+                return
+
+            try:
+                await websocket.accept()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                return
+
             queue: asyncio.Queue = asyncio.Queue()
+            tasks: set[asyncio.Task] = set()
 
             def _register_queue():
                 with self._lock:
@@ -127,17 +156,21 @@ class ManagerDataToolService:
                     if queue in self._queues:
                         self._queues.remove(queue)
 
-            _register_queue()
             try:
+                self._set_loop_if_needed(asyncio.get_running_loop())
+                _register_queue()
                 sender = asyncio.create_task(self._sender_loop(websocket, queue))
+                tasks.add(sender)
                 receiver = asyncio.create_task(self._receiver_loop(websocket))
+                tasks.add(receiver)
                 done, pending = await asyncio.wait(
-                    {sender, receiver}, return_when=asyncio.FIRST_EXCEPTION
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in pending:
                     task.cancel()
-                    with contextlib.suppress(Exception):
-                        await task
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 for task in done:
                     if task.cancelled():
                         continue
@@ -146,9 +179,16 @@ class ManagerDataToolService:
                         raise exc
             except WebSocketDisconnect:
                 pass
-            except Exception as e:  # pragma: no cover - defensive
-                logger.opt(exception=e).warning("Data tool websocket error for session")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive  # noqa: BLE001
+                logger.warning("Manager data tool websocket failed.")
             finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 _unregister_queue()
 
     # ------------------------------------------------------------------ #
@@ -243,8 +283,8 @@ class ManagerDataToolService:
         for cb in handlers:
             try:
                 cb(payload)
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(f"Interrupt handler error for {session_id}: {e}")
+            except Exception:  # pragma: no cover - defensive  # noqa: BLE001
+                logger.warning("Manager interrupt callback failed.")
 
     # ------------------------------------------------------------------ #
     # Internal: websocket loops
@@ -297,4 +337,3 @@ class ManagerDataToolService:
             logger.warning("Interrupt payload missing session_id.")
             return
         self._fire_interrupt(session_id, payload)
-

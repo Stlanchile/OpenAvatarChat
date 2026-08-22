@@ -46,6 +46,7 @@ Manager registers the following endpoints:
 
 | Endpoint | Type | Description |
 |----------|------|-------------|
+| `/api/v1/manager/websocket-admission-tickets` | POST | Issue a one-use manager WebSocket ticket |
 | `/ws/manager/data_tool` | WebSocket | Real-time event push, config snapshot, remote interrupt |
 | `/download/manager/data_tool/file` | GET | Download audio/image temp files (restricted to `temp/data_tool/` directory) |
 
@@ -69,7 +70,24 @@ Client-to-server messages:
 
 ### Authentication
 
-The console supports optional token-based authentication. Enter a token in the "Auth Settings" in the top-right corner, and it will be automatically attached to WebSocket connections and file download requests.
+When Secure Certificate Capture is disabled, the existing legacy manager
+behavior is preserved.
+
+When Secure Certificate Capture is enabled, manager access requires an OIDC
+access token with the independent `oac:manager` scope:
+
+- The console sends the bearer token over HTTPS to
+  `POST /api/v1/manager/websocket-admission-tickets`.
+- The returned 60-second, one-use ticket is sent in the
+  `Sec-WebSocket-Protocol` value
+  `oac.manager-admission.v1.<ticket>`. The server consumes the ticket before
+  accepting the WebSocket and does not echo the secret protocol value.
+- File downloads send the OIDC bearer token in the `Authorization` header.
+- Tokens, capabilities, and tickets must not be placed in URL query strings.
+
+The `certificate:capture` scope, certificate session capabilities, certificate
+WebSocket/RTC tickets, and RTC transport bindings do not grant manager access.
+Likewise, `oac:manager` alone does not grant certificate session-control access.
 
 ## Console Interface
 

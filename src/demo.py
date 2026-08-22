@@ -57,7 +57,7 @@ class OpenAvatarChatWebServer(uvicorn.Server):
         await super().shutdown(sockets)
 
 
-def setup_demo():
+def setup_demo(*, mount_legacy_gradio: bool = True):
     """设置 FastAPI 应用和 Gradio 界面"""
     app = FastAPI(docs_url=None, redoc_url=None)
 
@@ -77,7 +77,8 @@ def setup_demo():
             with gr.Group() as rtc_container:
                 pass
 
-    gradio.mount_gradio_app(app, gradio_block, "/gradio")
+    if mount_legacy_gradio:
+        gradio.mount_gradio_app(app, gradio_block, "/gradio")
     return app, gradio_block, rtc_container
 
 
@@ -98,7 +99,10 @@ def main():
 
     config_loggers(logger_config)
     
-    demo_app, ui, parent_block = setup_demo()
+    if service_config.certificate_capture.enabled:
+        demo_app, ui, parent_block = setup_demo(mount_legacy_gradio=False)
+    else:
+        demo_app, ui, parent_block = setup_demo()
     if service_config.certificate_capture.enabled:
         install_certificate_session_control_v1(
             demo_app,

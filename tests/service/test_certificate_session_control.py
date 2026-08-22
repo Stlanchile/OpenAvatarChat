@@ -33,6 +33,7 @@ from service.service_security.oidc_resource_server import (
     AuthenticatedPrincipalV1,
     OidcAuthenticationErrorV1,
     OidcAuthenticationReasonV1,
+    OidcRequiredScopeV1,
 )
 from service.service_utils.ssl_helpers import CertificateCaptureStartupError
 
@@ -87,6 +88,18 @@ class FakeAccessTokenValidator:
         if principal is None:
             raise OidcAuthenticationErrorV1(
                 OidcAuthenticationReasonV1.SIGNATURE_INVALID
+            )
+        return principal
+
+    async def validate_access_token_for_scope(
+        self,
+        encoded_access_token: str,
+        required_scope: OidcRequiredScopeV1,
+    ) -> AuthenticatedPrincipalV1:
+        principal = await self.validate_access_token(encoded_access_token)
+        if required_scope not in principal.scopes:
+            raise OidcAuthenticationErrorV1(
+                OidcAuthenticationReasonV1.REQUIRED_SCOPE_MISSING
             )
         return principal
 

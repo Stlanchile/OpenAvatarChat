@@ -47,6 +47,7 @@ from service.service_security.certificate_session_control import (
     CertificateSessionControlRuntimeV1,
 )
 from service.service_security.oidc_resource_server import (
+    OIDC_CERTIFICATE_CAPTURE_SCOPE_V1,
     AuthenticatedPrincipalV1,
     OidcAuthenticationErrorV1,
 )
@@ -919,7 +920,10 @@ class AuthenticatedRtcAdmissionControllerV1:
                 RtcAdmissionReasonV1.AUTHENTICATION_UNAVAILABLE,
                 status_code=503,
             ) from None
-        if not isinstance(principal, AuthenticatedPrincipalV1):
+        if (
+            not isinstance(principal, AuthenticatedPrincipalV1)
+            or OIDC_CERTIFICATE_CAPTURE_SCOPE_V1 not in principal.scopes
+        ):
             raise RtcAdmissionErrorV1(
                 RtcAdmissionReasonV1.AUTHENTICATION_UNAVAILABLE,
                 status_code=503,

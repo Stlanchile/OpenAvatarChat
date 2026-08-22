@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import aiohttp
 import jwt
@@ -36,6 +36,10 @@ from service.service_data_models.certificate_capture_config import (
 JWKS_FETCH_TIMEOUT_SECONDS_V1 = 5.0
 JWKS_MAX_RESPONSE_BYTES_V1 = 1024 * 1024
 JWKS_CACHE_MAX_AGE_SECONDS_V1 = 5 * 60
+
+OIDC_CERTIFICATE_CAPTURE_SCOPE_V1 = "certificate:capture"
+OIDC_MANAGER_SCOPE_V1 = "oac:manager"
+OidcRequiredScopeV1 = Literal["certificate:capture", "oac:manager"]
 
 _JWKS_CONNECT_TIMEOUT_SECONDS_V1 = 2.0
 _JWKS_MAX_KEYS_V1 = 128
@@ -229,6 +233,37 @@ class OidcAccessTokenValidatorV1:
         self,
         encoded_access_token: str,
     ) -> AuthenticatedPrincipalV1:
+        """Validate the configured certificate-capture resource scope."""
+
+        return await self._validate_access_token_for_required_scope(
+            encoded_access_token,
+            self._config.required_scope,
+        )
+
+    async def validate_access_token_for_scope(
+        self,
+        encoded_access_token: str,
+        required_scope: OidcRequiredScopeV1,
+    ) -> AuthenticatedPrincipalV1:
+        """Validate one explicitly supported resource-server scope."""
+
+        if required_scope not in {
+            OIDC_CERTIFICATE_CAPTURE_SCOPE_V1,
+            OIDC_MANAGER_SCOPE_V1,
+        }:
+            raise OidcAuthenticationErrorV1(
+                OidcAuthenticationReasonV1.SCOPE_INVALID
+            )
+        return await self._validate_access_token_for_required_scope(
+            encoded_access_token,
+            required_scope,
+        )
+
+    async def _validate_access_token_for_required_scope(
+        self,
+        encoded_access_token: str,
+        required_scope: OidcRequiredScopeV1,
+    ) -> AuthenticatedPrincipalV1:
         header = self._validate_header(encoded_access_token)
         snapshot = await self._get_jwks_snapshot()
         matching_keys = snapshot.keys_by_id.get(header.key_id, ())
@@ -254,7 +289,7 @@ class OidcAccessTokenValidatorV1:
             header,
             signing_key,
         )
-        return self._validate_claims(claims)
+        return self._validate_claims(claims, required_scope)
 
     def _validate_header(
         self,
@@ -492,6 +527,7 @@ class OidcAccessTokenValidatorV1:
     def _validate_claims(
         self,
         claims: Mapping[str, Any],
+        required_scope: OidcRequiredScopeV1,
     ) -> AuthenticatedPrincipalV1:
         issuer = claims.get("iss")
         if not isinstance(issuer, str) or issuer != self._config.issuer:
@@ -556,7 +592,7 @@ class OidcAccessTokenValidatorV1:
         scopes = _parse_scope_claim(claims.get("scope"))
         if scopes is None:
             raise OidcAuthenticationErrorV1(OidcAuthenticationReasonV1.SCOPE_INVALID)
-        if self._config.required_scope not in scopes:
+        if required_scope not in scopes:
             raise OidcAuthenticationErrorV1(
                 OidcAuthenticationReasonV1.REQUIRED_SCOPE_MISSING
             )

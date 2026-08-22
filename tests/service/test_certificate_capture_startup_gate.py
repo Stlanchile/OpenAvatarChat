@@ -686,7 +686,7 @@ def test_main_enabled_mode_installs_control_plane_before_engine_initialization(
         "initialize"
     )
     setup_demo = Mock(
-        side_effect=lambda: (
+        side_effect=lambda **_kwargs: (
             events.append("setup_demo") or ("app", "ui", "parent")
         )
     )
@@ -750,4 +750,5 @@ def test_main_enabled_mode_installs_control_plane_before_engine_initialization(
         "app",
         service_config.certificate_capture,
     )
+    setup_demo.assert_called_once_with(mount_legacy_gradio=False)
     server.run.assert_called_once_with()

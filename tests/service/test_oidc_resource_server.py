@@ -29,6 +29,7 @@ from service.service_security.oidc_resource_server import (
     JWKS_CACHE_MAX_AGE_SECONDS_V1,
     JWKS_FETCH_TIMEOUT_SECONDS_V1,
     JWKS_MAX_RESPONSE_BYTES_V1,
+    OIDC_MANAGER_SCOPE_V1,
     AuthenticatedPrincipalV1,
     OidcAccessTokenValidatorV1,
     OidcAuthenticationErrorV1,
@@ -288,6 +289,101 @@ async def test_valid_token_returns_immutable_redacted_principal(
     assert fetcher.calls == [JWKS_URL]
     with pytest.raises(FrozenInstanceError):
         principal.subject = "replacement"
+
+
+@pytest.mark.asyncio
+async def test_purpose_specific_scope_validation_never_treats_scopes_as_or():
+    signing_material = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+    signing_jwk = _public_jwk(signing_material, "scope-key")
+    fetcher = FakeJwksFetcher([_jwks(signing_jwk)])
+    validator = _validator(fetcher)
+    certificate_only = _signed_token(
+        signing_material,
+        key_id="scope-key",
+        claims=_claims(scope=REQUIRED_SCOPE),
+    )
+    manager_only = _signed_token(
+        signing_material,
+        key_id="scope-key",
+        claims=_claims(scope=OIDC_MANAGER_SCOPE_V1),
+    )
+    both = _signed_token(
+        signing_material,
+        key_id="scope-key",
+        claims=_claims(scope=f"{REQUIRED_SCOPE} {OIDC_MANAGER_SCOPE_V1}"),
+    )
+
+    certificate_principal = await validator.validate_access_token(
+        certificate_only
+    )
+    manager_principal = await validator.validate_access_token_for_scope(
+        manager_only,
+        OIDC_MANAGER_SCOPE_V1,
+    )
+    both_certificate = await validator.validate_access_token(both)
+    both_manager = await validator.validate_access_token_for_scope(
+        both,
+        OIDC_MANAGER_SCOPE_V1,
+    )
+
+    assert certificate_principal.scopes == frozenset({REQUIRED_SCOPE})
+    assert manager_principal.scopes == frozenset({OIDC_MANAGER_SCOPE_V1})
+    assert both_certificate == both_manager
+    with pytest.raises(OidcAuthenticationErrorV1) as manager_denied:
+        await validator.validate_access_token(manager_only)
+    with pytest.raises(OidcAuthenticationErrorV1) as certificate_denied:
+        await validator.validate_access_token_for_scope(
+            certificate_only,
+            OIDC_MANAGER_SCOPE_V1,
+        )
+    assert manager_denied.value.reason_code == "REQUIRED_SCOPE_MISSING"
+    assert certificate_denied.value.reason_code == "REQUIRED_SCOPE_MISSING"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_kind", "reason_code"),
+    [
+        ("signature", "SIGNATURE_INVALID"),
+        ("issuer", "ISSUER_INVALID"),
+        ("audience", "AUDIENCE_INVALID"),
+        ("expiry", "TOKEN_EXPIRED"),
+    ],
+)
+async def test_manager_scope_keeps_existing_cryptographic_and_claim_failures(
+    signing_material,
+    failure_kind,
+    reason_code,
+):
+    claims = _claims(scope=OIDC_MANAGER_SCOPE_V1)
+    private_key = signing_material["first_private"]
+    if failure_kind == "signature":
+        private_key = signing_material["attacker_private"]
+    elif failure_kind == "issuer":
+        claims["iss"] = "https://wrong-issuer.example.test"
+    elif failure_kind == "audience":
+        claims["aud"] = "wrong-audience"
+    elif failure_kind == "expiry":
+        claims["exp"] = NOW
+    token = _signed_token(
+        private_key,
+        key_id="key-1",
+        claims=claims,
+    )
+    validator = _validator(
+        FakeJwksFetcher([_jwks(signing_material["first_jwk"])])
+    )
+
+    with pytest.raises(OidcAuthenticationErrorV1) as exception:
+        await validator.validate_access_token_for_scope(
+            token,
+            OIDC_MANAGER_SCOPE_V1,
+        )
+
+    assert exception.value.reason_code == reason_code
 
 
 @pytest.mark.asyncio

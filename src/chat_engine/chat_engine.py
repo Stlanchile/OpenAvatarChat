@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
 
 from dotenv import load_dotenv
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from loguru import logger
 
 from chat_engine.common.client_handler_base import ClientHandlerBase
@@ -15,6 +15,9 @@ from chat_engine.core.logic_manager import LogicManager
 from chat_engine.data_models.chat_engine_config_data import ChatEngineConfigModel
 from chat_engine.data_models.session_info_data import SessionInfoData
 from engine_utils.directory_info import DirectoryInfo
+from service.service_security.manager_authorization import (
+    require_manager_http_authorization_v1,
+)
 
 if TYPE_CHECKING:
     from service.service_security.certificate_session_authority import (
@@ -47,15 +50,18 @@ class ChatEngine(object):
 
         if app:
             @app.get("/version")
-            async def root():
+            async def root(request: Request):
+                await require_manager_http_authorization_v1(app, request)
                 return {"version": OPEN_AVATAR_CHAT_VERSION}
 
             @app.get("/liveness")
-            async def check_liveness():
+            async def check_liveness(request: Request):
+                await require_manager_http_authorization_v1(app, request)
                 return {"status": "ok"}
 
             @app.get("/readiness")
-            async def check_readiness():
+            async def check_readiness(request: Request):
+                await require_manager_http_authorization_v1(app, request)
                 if not self.states.inited:
                     raise HTTPException(status_code=500, detail="Chat engine is not ready yet.")
                 return {"status": "ok"}

@@ -29,7 +29,13 @@ Fixed invariants:
 - ChatAgent tools are not a V1 trigger. Deferred/suspend tool semantics remain out of scope.
 - V1 extracts text only; it never verifies certificate authenticity or issuer validity.
 - Normal camera and microphone input are dropped—not buffered—while certificate mode is active.
-- The feature is disabled by default and requires TLS, OIDC, authenticated session binding, a healthy GPU OCR sidecar, and matching calibration artifacts.
+- The feature is disabled by default and requires TLS, OIDC, authenticated session binding, a healthy CPU-only OCR sidecar, and matching calibration artifacts.
+- CPU is the Certificate OCR V1 production device, not a fallback. Every OCR pipeline and submodule must be configured explicitly with `device=cpu`; an unset device or automatic device selection is forbidden.
+- The certificate OCR sidecar must expose zero GPU/CUDA initialization or allocation in V1. It must not load or initialize a CUDA-capable runtime, open an accelerator device, create a GPU context, or reserve or allocate VRAM.
+- The CPU-only restriction applies only to the certificate OCR sidecar. OpenAvatarChat retains its existing GPU/CUDA use for its current handlers and avatar workloads.
+- Certificate OCR requests and responses cross only the private engine-to-sidecar Unix-domain socket (UDS). The sidecar has no TCP listener, published port, or outbound network route.
+- The CPU inference engine and execution backend are explicit, identity-bound production choices. Automatic engine/backend selection and automatic backend fallback are forbidden.
+- Failure to initialize the exact selected CPU engine/backend/runtime tuple prevents certificate readiness. The sidecar must not retry through a different engine, backend, optimization path, or device.
 
 ## 2. Normative Lifecycle and Epoch Contracts
 
@@ -297,31 +303,74 @@ InferenceIdentityV1 {
     python_abi,
     paddleocr_version,
     paddlepaddle_version,
+    paddlepaddle_distribution,
     paddlex_version,
+    cpu_runtime_packages[],
     locked_wheel_hashes[]
   },
 
   execution: {
+    device,
+    automatic_device_selection,
     engine,
+    engine_version,
+    engine_configuration_sha256,
+    execution_backend,
+    execution_backend_version,
+    execution_backend_configuration_sha256,
+    automatic_backend_selection,
+    automatic_backend_fallback,
     precision,
     deterministic_algorithms,
     hpi_enabled,
-    tensorrt_enabled,
+    hpi_auto_config,
     batch_policy,
-    device_kind,
-    cuda_runtime_version,
-    cudnn_version,
-    gpu_compute_capability,
-    gpu_model,
-    driver_version
+
+    cpu_runtime: {
+      cpu_qualification_class_sha256,
+      cpu_architecture,
+      cpu_isa_policy,
+      inference_thread_count,
+      inter_op_thread_count,
+      intra_op_thread_count,
+      process_thread_cap,
+      thread_affinity_policy,
+      thread_environment_sha256,
+      runtime_library_versions[],
+      runtime_configuration_sha256
+    },
+
+    accelerator_policy: {
+      gpu_allowed,
+      cuda_initialization_allowed,
+      cuda_allocation_allowed
+    }
+  },
+
+  host_provenance: {
+    os_release,
+    kernel_version,
+    cpu_vendor,
+    cpu_model,
+    cpu_features_sha256,
+    microcode_version,
+    logical_cpu_count
   },
 
   models: [{
     role,
     model_name,
-    artifact_sha256,
+    source_artifact_sha256,
+    executable_artifact_sha256,
     configuration_sha256
   }],
+
+  model_conversion: {
+    enabled,
+    tool,
+    tool_version,
+    configuration_sha256
+  },
 
   pipeline: {
     canonical_configuration_sha256,
@@ -349,21 +398,39 @@ Define an exact typed calibration projection:
 ```text
 CalibrationDependencyV1 {
   schema_version,
-  paddleocr_version,
-  paddlepaddle_version,
-  paddlex_version,
-  locked_wheel_hashes,
-  engine,
-  precision,
-  deterministic_algorithms,
-  hpi_enabled,
-  tensorrt_enabled,
-  batch_policy,
-  device_kind,
-  cuda_runtime_version,
-  cudnn_version,
-  gpu_compute_capability,
+
+  software: {
+    python_abi,
+    paddleocr_version,
+    paddlepaddle_version,
+    paddlepaddle_distribution,
+    paddlex_version,
+    cpu_runtime_packages,
+    locked_wheel_hashes
+  },
+
+  execution: {
+    device,
+    automatic_device_selection,
+    engine,
+    engine_version,
+    engine_configuration_sha256,
+    execution_backend,
+    execution_backend_version,
+    execution_backend_configuration_sha256,
+    automatic_backend_selection,
+    automatic_backend_fallback,
+    precision,
+    deterministic_algorithms,
+    hpi_enabled,
+    hpi_auto_config,
+    batch_policy,
+    cpu_runtime,
+    accelerator_policy
+  },
+
   models,
+  model_conversion,
   pipeline,
   preprocessing,
   postprocessing
@@ -374,33 +441,83 @@ Rules:
 
 - Compute `calibration_dependency_sha256` from the canonical typed object.
 - Calibration artifacts embed both the complete object and its hash; free-form compatibility strings and wildcard matching are forbidden.
-- GPU serial number, ordinal, and driver patch version remain in the full inference identity for provenance but are excluded from calibration compatibility. Driver compatibility is enforced separately by startup health checks.
+- `device` must equal the literal `cpu`, and `paddlepaddle_distribution` must equal the CPU package name `paddlepaddle`. `automatic_device_selection`, `automatic_backend_selection`, `automatic_backend_fallback`, `hpi_auto_config`, `gpu_allowed`, `cuda_initialization_allowed`, and `cuda_allocation_allowed` must all be `false`.
+- `engine` must name the concrete qualified engine; unset/default/auto-resolved engine values are forbidden. When HPI is selected as a candidate, its lower-level `execution_backend` must also be explicit and its automatic configuration must remain disabled.
+- Host name, physical CPU serial, and non-behavioral OS patch provenance are excluded from calibration compatibility. The Milestone 6 CPU qualification class, CPU architecture/ISA policy, selected engine/backend tuple, effective thread/runtime configuration, and behavior-affecting library versions are included.
 - Any calibration-dependency mismatch prevents the OCR sidecar from becoming certificate-ready.
 - A missing field-specific calibration under an otherwise matching identity produces `UNCALIBRATED`.
-- Model, dictionary, preprocessing, postprocessing, engine, precision, CUDA ABI, cuDNN, compute capability, or batch-policy changes require a new calibration artifact.
+- Engine, execution backend, backend configuration, thread/runtime configuration, CPU qualification class, precision, batch policy, model or converted model, dictionary, preprocessing, postprocessing, or any other accuracy-relevant setting change requires a new calibration artifact.
+- No GPU-derived calibration is reusable in V1. After Milestone 6 selects the final CPU engine/backend/runtime tuple, every declared CPU qualification class × production profile × field combination requires fresh calibration generated with that exact CPU dependency projection.
 
-The initial GPU service remains pinned to PaddleOCR 3.7.0, PaddlePaddle GPU 3.2.0, CUDA 12.6, FP32 standard Paddle inference, and PP-OCRv6 medium. PaddleOCR’s official documentation identifies PP-OCRv6 medium as the 3.7 general-OCR default and exposes the recognized regions required for grounding. ([OCR pipeline](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/pipeline_usage/OCR.en.md), [GPU serving](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/inference_deployment/serving/serving.en.md))
+The initial CPU qualification candidate uses PaddleOCR 3.7.0, the CPU
+`paddlepaddle==3.2.0` distribution rather than `paddlepaddle-gpu`, a matching
+PaddleX environment, FP32, and PP-OCRv6 medium. PP-OCRv6 medium remains the
+accuracy-oriented starting model unless Milestone 6 evidence justifies another
+model. This does not freeze the production engine/backend: standard
+Paddle Inference and an explicitly configured OpenVINO/HPI path remain
+qualification candidates. PaddleOCR documents that an unset device may choose a
+GPU and that HPI may automatically select a backend, so V1 must set `device=cpu`,
+must select the final engine/backend explicitly, and must disable all automatic
+selection and fallback. ([OCR pipeline](https://www.paddleocr.ai/main/en/version3.x/pipeline_usage/OCR.html),
+[inference engine configuration](https://paddlepaddle.github.io/PaddleX/3.7/en/pipeline_usage/instructions/pipeline_python_API.html),
+[high-performance inference](https://www.paddleocr.ai/main/en/version3.x/inference_deployment/local_inference/high_performance_inference.html))
 
 ## 4. Privacy, Grounded Answering, and Delivery
 
 - Store frames, observations, assertions, answers, and generated audio using a per-capture 256-bit AES-256-GCM key.
 - Delete the key before clearing ciphertext and references on EndCapture, inactivity, disconnect, failure, or session replacement.
 - Use no persistent files, generic history, browser storage, analytics payloads, or crash-report attachments.
-- Run OCR in a read-only GPU sidecar with baked and hashed models, tmpfs scratch space, no published port, no outbound route, one warmed worker, and no CPU fallback.
+- Run OCR in an isolated, read-only CPU sidecar with baked and hashed models, tmpfs scratch space, a private UDS owned only by the engine and sidecar, no TCP listener or published port, no outbound route, and a fixed qualified worker/thread configuration.
+- The future sidecar environment uses only the CPU PaddlePaddle distribution and CPU-qualified backend dependencies. It contains no `paddlepaddle-gpu`, CUDA, cuDNN, TensorRT, or other GPU execution dependency and never falls back to another device or backend.
 - Run deterministic bilingual certificate queries without an LLM. Supported fields are title, holder, issuer, issue date, expiry date, and qualification/award.
 - Every answer copies its value from a live `SUPPORTED` assertion and includes assertion ID, source polygons, expiry, and `verification_state:"not_checked"`.
 - Every answer states that the information was read from the image and authenticity was not verified.
 - Local CosyVoice consumes only `CERTIFICATE_RESPONSE_TEXT`, logs no text, and produces private `CERTIFICATE_RESPONSE_AUDIO` for the owning WebUI. TTS output never uses generic avatar text/audio channels.
 - The WebUI detaches the normal camera track before BeginCapture, waits for `ARMED`, captures up to eight frames, displays `SealOutcomeV1` guidance, shows highlighted evidence, and revokes all in-memory object URLs at EndCapture.
 
-Implementation order:
+Implementation execution plan:
+
+- This specification revision does not modify Milestones 1A–1D-B runtime. Their startup, session-authority, control, WebSocket-admission, and RTC-admission behavior remains unchanged.
+- This revision is planning-only. It does not add PaddleOCR, PaddlePaddle, PaddleX, OpenVINO/HPI, sidecar/container definitions, UDS runtime code, dependency locks, or model downloads.
 
 1. TLS/OIDC session ownership and core-owned security envelopes.
 2. Formal epochs, fencing predicate, barriers, and deterministic state-machine tests.
 3. Private frame/control APIs and WebUI capture workflow with mock inference.
-4. Typed inference identity, GPU OCR sidecar, evidence model, and calibration artifacts.
+4. In Milestone 6, benchmark and qualify an explicit CPU engine/backend/runtime tuple, then freeze the typed inference identity and generate fresh CPU calibration artifacts before any production OCR enablement.
 5. Independent query/speech lifecycles, grounded rendering, highlighted evidence, and private local TTS.
-6. Security, statistical, performance, deletion, and rollout gates.
+6. Security, statistical, CPU resource/contention, deletion, and rollout gates.
+
+Milestone 6 is a qualification gate, not authorization to implement OCR in this
+revision:
+
+1. Define reproducible CPU candidate manifests. At minimum, evaluate explicit
+   standard Paddle Inference and explicit OpenVINO/HPI configurations while
+   holding the initial PP-OCRv6 medium model, inputs, preprocessing,
+   postprocessing, and statistical dataset constant. Every candidate sets
+   `device=cpu`; no candidate may use an unset/auto device, automatic HPI
+   backend selection, or backend fallback.
+2. For each candidate, record the complete prospective
+   `InferenceIdentityV1`, including engine, execution backend and versions,
+   effective backend configuration, model/conversion hashes, CPU qualification
+   class, thread counts and cap, runtime libraries, affinity/ISA policy,
+   batching, precision, and all accuracy-relevant pipeline settings.
+3. Benchmark cold start and warmed operation on each declared production CPU
+   class while representative existing OpenAvatarChat GPU workloads and
+   realtime audio/video paths are active. Measure accuracy, P50/P95/P99
+   seal-to-`READY` latency, steady and peak RSS, observed process/thread counts,
+   CPU utilization, and realtime contention/regression.
+4. Freeze the RSS budget, process/thread cap, latency objective, supported CPU
+   qualification classes, and realtime-contention limits before final
+   qualification. A candidate that needs undeclared thread oversubscription,
+   swapping, automatic selection/fallback, or GPU/CUDA initialization fails.
+5. Select exactly one production engine/backend/runtime tuple. If PP-OCRv6
+   medium cannot pass the frozen accuracy and operational gates, a different
+   model requires a recorded benchmark justification and a complete rerun of
+   qualification.
+6. Generate fresh calibration for every selected production tuple × declared
+   CPU qualification class × production profile × field combination.
+   Alternate backends and all earlier GPU calibrations remain incompatible and
+   cannot serve as runtime fallbacks.
 
 ## 5. Statistical and Operational Acceptance Gates
 
@@ -457,8 +574,14 @@ Required results:
 - Race tests must complete old Perception, ChatAgent, OCR, query, and TTS operations after Begin/End and prove every stale callback is fenced.
 - Tests must cover session replacement, generation rollover, capture/query sequence mismatch, idempotent retries, late cleanup acknowledgements, and malicious metadata/type/stream rewriting.
 - Identity tests must reject every single-field `CalibrationDependencyV1` mismatch and accept changes only to explicitly non-calibration provenance fields.
-- P95 seal-to-`READY` latency must be at most five seconds on the declared reference GPU.
+- Sidecar startup, health, inference, cancellation, purge, and shutdown tests must prove zero CUDA/GPU runtime initialization, device access, process/context creation, and VRAM allocation attributable to certificate OCR.
+- The sidecar must report the selected CPU engine/backend identity and `device=cpu`; its dependency manifest, loaded libraries, and effective configuration must match that identity. Any automatic selection or fallback attempt fails closed.
+- P95 seal-to-`READY` latency must be at most five seconds on every declared production CPU qualification class.
+- Steady and peak sidecar RSS must remain within the Milestone 6 frozen budgets without swapping or OOM recovery.
+- Configured and observed inference/runtime thread counts must remain within the identity-bound process/thread cap; dynamic oversubscription is a failed gate.
+- Under concurrent certificate OCR and representative existing OpenAvatarChat GPU workloads, realtime audio/video paths must add no deadline misses, underruns, frame starvation, or watchdog failures, and interactive P95 latency regression must not exceed 5% against the same workload without OCR.
 - Feature-idle normal-chat P95 latency regression must not exceed 5%.
-- Any failed authentication, epoch, isolation, identity, deletion, calibration, confidence-interval, GPU, or compatibility gate blocks production rollout.
+- Private-UDS peer authorization, permissions, framing, size/deadline enforcement, purge acknowledgement, and absence of TCP/outbound transport must pass.
+- Any failed authentication, epoch, isolation, identity, deletion, calibration, confidence-interval, CPU backend, zero-GPU/CUDA, RSS, thread-count, latency, realtime-contention, UDS, or compatibility gate blocks production rollout.
 
 V1 excludes authenticity verification, issuer/QR networking, remote OCR/TTS, continuous background certificate detection, private voice ASR, ChatAgent tool triggering, arbitrary documents outside configured profiles, and queries after EndCapture.
