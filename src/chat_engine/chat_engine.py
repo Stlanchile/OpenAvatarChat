@@ -1,22 +1,25 @@
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import TYPE_CHECKING, Dict, Optional
+
 from dotenv import load_dotenv
 from fastapi import HTTPException
-
 from loguru import logger
-
-from engine_utils.directory_info import DirectoryInfo
 
 from chat_engine.common.client_handler_base import ClientHandlerBase
 from chat_engine.contexts.session_context import SessionContext
 from chat_engine.core.chat_session import ChatSession
 from chat_engine.core.handler_manager import HandlerManager
 from chat_engine.core.logic_manager import LogicManager
-
 from chat_engine.data_models.chat_engine_config_data import ChatEngineConfigModel
 from chat_engine.data_models.session_info_data import SessionInfoData
+from engine_utils.directory_info import DirectoryInfo
+
+if TYPE_CHECKING:
+    from service.service_security.certificate_session_authority import (
+        ConsumedSessionAdmissionV1,
+    )
 
 
 OPEN_AVATAR_CHAT_VERSION = "0.6.0"
@@ -66,13 +69,20 @@ class ChatEngine(object):
         self.logic_manager.load_logics(engine_config)
         self.states.inited = True
 
-    def _create_session(self, session_info: SessionInfoData):
+    def _create_session(
+        self,
+        session_info: SessionInfoData,
+        session_admission: "ConsumedSessionAdmissionV1 | None" = None,
+    ):
         if not session_info.session_id:
             session_info.session_id = str(uuid.uuid4())
         if session_info.session_id in self.sessions:
             raise RuntimeError(f"session {session_info.session_id} already exists")
 
-        session_context = SessionContext(session_info=session_info)
+        session_context = SessionContext(
+            session_info=session_info,
+            session_admission=session_admission,
+        )
 
         session = ChatSession(session_context, self.engine_config)
         handlers = self.handler_manager.get_enabled_handler_registries()
@@ -89,13 +99,21 @@ class ChatEngine(object):
         self.sessions[session_info.session_id] = session
         return session
 
-    def create_client_session(self, session_info: SessionInfoData, client_handler: ClientHandlerBase):
+    def create_client_session(
+        self,
+        session_info: SessionInfoData,
+        client_handler: ClientHandlerBase,
+        session_admission: "ConsumedSessionAdmissionV1 | None" = None,
+    ):
         # TODO currently multi client in one session is not allowed.
         if session_info.session_id in self.sessions:
             msg = f"Session {session_info.session_id} already exists."
             raise RuntimeError(msg)
 
-        session = self._create_session(session_info)
+        session = self._create_session(
+            session_info,
+            session_admission=session_admission,
+        )
 
         registry = self.handler_manager.find_client_handler(client_handler)
         if registry is None:

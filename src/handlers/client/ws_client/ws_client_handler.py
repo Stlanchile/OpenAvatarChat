@@ -5,26 +5,41 @@ WebSocket Client Handler
 from typing import Any, Dict, Optional, cast
 
 import gradio
-from fastapi import FastAPI, WebSocketDisconnect
+from fastapi import FastAPI
 from loguru import logger
 from pydantic import BaseModel, Field
-from starlette.websockets import WebSocket, WebSocketState
 
-from chat_engine.common.client_handler_base import ClientHandlerBase, ClientSessionDelegate
-from chat_engine.common.handler_base import HandlerDataInfo, HandlerDetail, HandlerBaseInfo
+from chat_engine.common.client_handler_base import (
+    ClientHandlerBase,
+    ClientSessionDelegate,
+)
+from chat_engine.common.handler_base import (
+    HandlerBaseInfo,
+    HandlerDataInfo,
+    HandlerDetail,
+)
 from chat_engine.contexts.handler_context import HandlerContext
 from chat_engine.contexts.session_context import SessionContext
 from chat_engine.data_models.chat_data.chat_data_model import ChatData
 from chat_engine.data_models.chat_data_type import ChatDataType
-from chat_engine.data_models.chat_stream_config import ChatStreamConfig
-from chat_engine.data_models.chat_engine_config_data import HandlerBaseConfigModel, ChatEngineConfigModel
+from chat_engine.data_models.chat_engine_config_data import (
+    ChatEngineConfigModel,
+    HandlerBaseConfigModel,
+)
 from chat_engine.data_models.chat_signal import ChatSignal
 from chat_engine.data_models.chat_signal_type import ChatSignalType
+from chat_engine.data_models.chat_stream_config import ChatStreamConfig
 from chat_engine.data_models.engine_channel_type import EngineChannelType
-from chat_engine.data_models.runtime_data.data_bundle import DataBundleDefinition, DataBundleEntry, VariableSize
+from chat_engine.data_models.runtime_data.data_bundle import (
+    DataBundleDefinition,
+    DataBundleEntry,
+    VariableSize,
+)
+from service.frontend_service import register_frontend
 
 from .ws_input_delegate import WsInputSessionDelegate
-from service.frontend_service import register_frontend
+from .ws_session_endpoint import register_ws_session_endpoint
+
 # ============================================================================
 # 配置模型
 # ============================================================================
@@ -127,50 +142,12 @@ class WsClientHandler(ClientHandlerBase):
         logger.info(f"WsClientHandler loaded with config: {self.handler_config}")
     def on_setup_app(self, app: FastAPI, ui: gradio.blocks.Block, parent_block: Optional[gradio.blocks.Block] = None):
         """设置 FastAPI 路由"""
-        
-        @app.websocket("/ws/session/{session_id}")
-        async def ws_session_endpoint(websocket: WebSocket, session_id: str):
-            """单端口会话 - 负责上传输入与接收 Motion Data"""
-            await websocket.accept()
-            logger.info(f"Session WebSocket connected: session_id={session_id}")
-            
-            should_stop = False
-            try:
-                # 查找或创建会话
-                session_delegate = self.handler_delegate.find_session_delegate(session_id)
-                
-                if session_delegate is None:
-                    # 创建新会话
-                    logger.info(f"Creating new session: {session_id}")
-                    session_delegate = self.handler_delegate.start_session(session_id)
-                
-                if not isinstance(session_delegate, WsInputSessionDelegate):
-                    logger.error(f"Invalid session delegate type: {type(session_delegate)}")
-                    await websocket.close(code=1003, reason="Invalid session")
-                    return
-                
-                # 服务 WebSocket
-                should_stop = await session_delegate.serve_websocket(websocket)
-            
-            except WebSocketDisconnect:
-                logger.info(f"Session WebSocket disconnected: session_id={session_id}")
-            except Exception as e:
-                logger.error(f"Error in session WebSocket: {e}")
-            finally:
-                # 如主连接断开或会话结束, 清理会话
-                if should_stop:
-                    try:
-                        self.handler_delegate.stop_session(session_id)
-                        logger.info(f"Session stopped: {session_id}")
-                    except Exception as e:
-                        logger.error(f"Error stopping session: {e}")
-                
-                # 确保连接关闭
-                try:
-                    if not websocket.client_state == WebSocketState.DISCONNECTED:
-                        await websocket.close()
-                except Exception:
-                    pass
+
+        register_ws_session_endpoint(
+            app,
+            self.handler_delegate,
+            WsInputSessionDelegate,
+        )
         
         self.register_additional_routes(app)
 
@@ -344,4 +321,3 @@ class WsClientHandler(ClientHandlerBase):
             context.client_session_delegate.clear_data()
         
         logger.info(f"Context destroyed for session {context.session_id}")
-

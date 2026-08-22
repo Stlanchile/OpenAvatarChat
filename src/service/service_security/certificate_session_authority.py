@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -9,7 +10,8 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -182,6 +184,9 @@ class CertificateSessionAuthorityV1:
         "_ticket_key",
         "_ticket_sequence",
         "_tickets",
+        "_transition_active",
+        "_transition_lock",
+        "_transition_owner_task",
         "_wall_clock",
     )
 
@@ -196,6 +201,9 @@ class CertificateSessionAuthorityV1:
         self._wall_clock = wall_clock
         self._monotonic_clock = monotonic_clock
         self._lock = threading.RLock()
+        self._transition_lock = asyncio.Lock()
+        self._transition_active = False
+        self._transition_owner_task: asyncio.Task[object] | None = None
         self._closed = False
         self._sessions: dict[str, _SessionAuthorityStateV1] = {}
         self._session_ids_by_owner: dict[bytes, str] = {}
@@ -218,6 +226,32 @@ class CertificateSessionAuthorityV1:
             b"certificate-session-owner-v1",
             b"",
         )
+
+    @asynccontextmanager
+    async def serialized_transition(self) -> AsyncIterator[None]:
+        """Serialize admission commit with create/revoke control transitions."""
+
+        async with self._transition_lock:
+            owner_task = asyncio.current_task()
+            if owner_task is None:
+                raise SessionAuthorityErrorV1(
+                    SessionAuthorityReasonV1.AUTHORITY_UNAVAILABLE
+                )
+            with self._lock:
+                self._ensure_open_locked()
+                if self._transition_active:
+                    raise SessionAuthorityErrorV1(
+                        SessionAuthorityReasonV1.AUTHORITY_UNAVAILABLE
+                    )
+                self._transition_active = True
+                self._transition_owner_task = owner_task
+            try:
+                yield
+            finally:
+                with self._lock:
+                    if self._transition_owner_task is owner_task:
+                        self._transition_owner_task = None
+                        self._transition_active = False
 
     def create_session(
         self,
@@ -457,18 +491,60 @@ class CertificateSessionAuthorityV1:
     ) -> ConsumedSessionAdmissionV1:
         """Atomically consume a ticket; this is intentionally not an HTTP API."""
 
+        return self._consume_admission_ticket(
+            principal=principal,
+            session_id=session_id,
+            admission_ticket=admission_ticket,
+            channel=channel,
+        )
+
+    def consume_websocket_admission_ticket(
+        self,
+        session_id: str,
+        admission_ticket: str,
+    ) -> ConsumedSessionAdmissionV1:
+        """Consume a WebSocket ticket using only server-owned authority state.
+
+        The ticket is a short-lived bearer capability issued only after OIDC,
+        capability, owner, and session validation. WebSocket admission therefore
+        does not require a second access-token credential in the handshake.
+        """
+
+        return self._consume_admission_ticket(
+            principal=None,
+            session_id=session_id,
+            admission_ticket=admission_ticket,
+            channel=SessionAdmissionChannelV1.WEBSOCKET,
+        )
+
+    def _consume_admission_ticket(
+        self,
+        *,
+        principal: AuthenticatedPrincipalV1 | None,
+        session_id: str,
+        admission_ticket: str,
+        channel: SessionAdmissionChannelV1 | str,
+    ) -> ConsumedSessionAdmissionV1:
         with self._lock:
             self._ensure_open_locked()
             now_epoch, now_monotonic = self._read_clocks_locked()
             self._cleanup_expired_locked(now_epoch, now_monotonic)
 
-            owner_material = self._owner_material_or_none(principal)
+            owner_material = (
+                self._owner_material_or_none(principal)
+                if principal is not None
+                else None
+            )
             owner_digest = (
                 self._owner_digest(owner_material)
                 if owner_material is not None
                 else self._dummy_owner_digest
             )
-            principal_expiry = self._token_expiry_or_none(principal)
+            principal_expiry = (
+                self._token_expiry_or_none(principal)
+                if principal is not None
+                else None
+            )
             ticket_entropy = _decode_opaque_value(
                 _ADMISSION_TICKET_PREFIX_V1,
                 admission_ticket,
@@ -493,7 +569,8 @@ class CertificateSessionAuthorityV1:
                 owner_digest,
             )
             exact_owner_matches = (
-                session_state is not None
+                principal is not None
+                and session_state is not None
                 and session_state.ownership.owner_issuer
                 == getattr(principal, "issuer", None)
                 and session_state.ownership.owner_subject
@@ -518,16 +595,27 @@ class CertificateSessionAuthorityV1:
                 and ticket_state.channel is validated_channel
             )
             principal_is_current = (
-                principal_expiry is not None and principal_expiry > now_epoch
+                principal is None
+                or (
+                    principal_expiry is not None
+                    and principal_expiry > now_epoch
+                )
+            )
+            owner_authorized = (
+                session_matches
+                if principal is None
+                else (
+                    owner_material is not None
+                    and owner_matches
+                    and exact_owner_matches
+                )
             )
 
             if not (
                 ticket_entropy is not None
                 and ticket_state is not None
-                and owner_material is not None
-                and owner_matches
-                and exact_owner_matches
                 and session_matches
+                and owner_authorized
                 and channel_matches
                 and principal_is_current
             ):
@@ -588,6 +676,7 @@ class CertificateSessionAuthorityV1:
         """Destroy all process-local authorization state and close the service."""
 
         with self._lock:
+            self._ensure_transition_access_locked()
             for session_id in tuple(self._sessions):
                 self._remove_session_locked(session_id)
             self._sessions.clear()
@@ -841,6 +930,19 @@ class CertificateSessionAuthorityV1:
     def _ensure_open_locked(self) -> None:
         if self._closed:
             raise SessionAuthorityErrorV1(SessionAuthorityReasonV1.AUTHORITY_CLOSED)
+        self._ensure_transition_access_locked()
+
+    def _ensure_transition_access_locked(self) -> None:
+        if not self._transition_active:
+            return
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if current_task is not self._transition_owner_task:
+            raise SessionAuthorityErrorV1(
+                SessionAuthorityReasonV1.AUTHORITY_UNAVAILABLE
+            )
 
 
 def _validated_channel(

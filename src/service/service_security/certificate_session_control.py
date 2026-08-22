@@ -76,7 +76,7 @@ class AdmissionTicketResponseV1(BaseModel):
 
 @dataclass(frozen=True, slots=True, repr=False)
 class CertificateSessionControlRuntimeV1:
-    """Enabled-only references needed by a future internal integration."""
+    """Enabled-only references shared by control and transport admission."""
 
     authority: CertificateSessionAuthorityV1
     access_token_validator: _AccessTokenValidatorV1
@@ -151,7 +151,8 @@ def install_certificate_session_control_v1(
     ) -> SessionCapabilityResponseV1:
         principal = await authenticated_principal(request)
         try:
-            grant = session_authority.create_session(principal)
+            async with session_authority.serialized_transition():
+                grant = session_authority.create_session(principal)
         except SessionAuthorityErrorV1 as exception:
             raise _authority_http_error(exception) from None
         _apply_no_store(response)
@@ -171,12 +172,13 @@ def install_certificate_session_control_v1(
         session_capability = _extract_session_capability(request)
         admission_channel = await _extract_admission_channel(request)
         try:
-            grant = session_authority.issue_admission_ticket(
-                principal,
-                session_id,
-                session_capability,
-                admission_channel,
-            )
+            async with session_authority.serialized_transition():
+                grant = session_authority.issue_admission_ticket(
+                    principal,
+                    session_id,
+                    session_capability,
+                    admission_channel,
+                )
         except SessionAuthorityErrorV1 as exception:
             raise _authority_http_error(exception) from None
         _apply_no_store(response)
@@ -193,11 +195,12 @@ def install_certificate_session_control_v1(
         principal = await authenticated_principal(request)
         session_capability = _extract_session_capability(request)
         try:
-            session_authority.revoke_session(
-                principal,
-                session_id,
-                session_capability,
-            )
+            async with session_authority.serialized_transition():
+                session_authority.revoke_session(
+                    principal,
+                    session_id,
+                    session_capability,
+                )
         except SessionAuthorityErrorV1 as exception:
             raise _authority_http_error(exception) from None
         return Response(
@@ -206,7 +209,8 @@ def install_certificate_session_control_v1(
         )
 
     async def close_session_authority() -> None:
-        session_authority.close()
+        async with session_authority.serialized_transition():
+            session_authority.close()
 
     app.add_event_handler("shutdown", close_session_authority)
     app.state.certificate_session_control_v1 = runtime

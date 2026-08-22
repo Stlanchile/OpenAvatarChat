@@ -17,31 +17,41 @@ import re
 from typing import Any, Dict, Literal, Optional, cast
 
 import gradio
-from fastapi import FastAPI, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from loguru import logger
 from pydantic import BaseModel, Field
-from starlette.websockets import WebSocket, WebSocketState
 
+import handlers.client.rtc_client.client_handler_rtc as _rtc_module
 from chat_engine.common.client_handler_base import ClientSessionDelegate
-from chat_engine.common.handler_base import HandlerDataInfo, HandlerDetail, HandlerBaseInfo
+from chat_engine.common.handler_base import (
+    HandlerBaseInfo,
+    HandlerDataInfo,
+    HandlerDetail,
+)
 from chat_engine.contexts.handler_context import HandlerContext
 from chat_engine.contexts.session_context import SessionContext
 from chat_engine.data_models.chat_data.chat_data_model import ChatData
 from chat_engine.data_models.chat_data_type import ChatDataType
-from chat_engine.data_models.chat_engine_config_data import HandlerBaseConfigModel, ChatEngineConfigModel
+from chat_engine.data_models.chat_engine_config_data import (
+    ChatEngineConfigModel,
+    HandlerBaseConfigModel,
+)
 from chat_engine.data_models.chat_signal import ChatSignal
 from chat_engine.data_models.chat_signal_type import ChatSignalType
 from chat_engine.data_models.engine_channel_type import EngineChannelType
 from chat_engine.data_models.runtime_data.data_bundle import (
-    DataBundleDefinition, DataBundleEntry, VariableSize,
+    DataBundleDefinition,
+    DataBundleEntry,
+    VariableSize,
 )
 from engine_utils.directory_info import DirectoryInfo
+from handlers.client.ws_client.ws_session_endpoint import (
+    register_ws_session_endpoint,
+)
 from service.frontend_service import register_frontend
 
-import handlers.client.rtc_client.client_handler_rtc as _rtc_module
 from .ws_lam_session_delegate import WsLamClientSessionDelegate
-
 
 # ============================================================================
 # Config
@@ -211,41 +221,11 @@ class WsLamClientHandler(_rtc_module.ClientHandlerRtc):
             logger.info("WsLamClientHandler: WS + asset routes registered (pure WS mode)")
 
     def _register_ws_session_endpoint(self, app: FastAPI):
-        @app.websocket("/ws/session/{session_id}")
-        async def ws_session_endpoint(websocket: WebSocket, session_id: str):
-            await websocket.accept()
-            logger.info(f"Session WebSocket connected: session_id={session_id}")
-
-            should_stop = False
-            try:
-                session_delegate = self.handler_delegate.find_session_delegate(session_id)
-                if session_delegate is None:
-                    logger.info(f"Creating new session: {session_id}")
-                    session_delegate = self.handler_delegate.start_session(session_id)
-
-                if not isinstance(session_delegate, WsLamClientSessionDelegate):
-                    logger.error(f"Invalid session delegate type: {type(session_delegate)}")
-                    await websocket.close(code=1003, reason="Invalid session")
-                    return
-
-                should_stop = await session_delegate.serve_websocket(websocket)
-
-            except WebSocketDisconnect:
-                logger.info(f"Session WebSocket disconnected: session_id={session_id}")
-            except Exception as e:
-                logger.error(f"Error in session WebSocket: {e}")
-            finally:
-                if should_stop:
-                    try:
-                        self.handler_delegate.stop_session(session_id)
-                        logger.info(f"Session stopped: {session_id}")
-                    except Exception as e:
-                        logger.error(f"Error stopping session: {e}")
-                try:
-                    if websocket.client_state != WebSocketState.DISCONNECTED:
-                        await websocket.close()
-                except Exception:
-                    pass
+        register_ws_session_endpoint(
+            app,
+            self.handler_delegate,
+            WsLamClientSessionDelegate,
+        )
 
     def _register_asset_route(self, app: FastAPI):
         asset_route = self.asset_route
