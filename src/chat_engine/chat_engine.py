@@ -39,6 +39,7 @@ class ChatEngine(object):
         self.handler_manager: HandlerManager = HandlerManager(self)
         self.logic_manager: LogicManager = LogicManager(self)
         self.states = ChatEngineBaseStates()
+        self._certificate_capture_enabled_v1 = False
 
         self.sessions: Dict[str, ChatSession] = {}
 
@@ -47,6 +48,14 @@ class ChatEngine(object):
             return
 
         load_dotenv()
+        self._certificate_capture_enabled_v1 = bool(
+            app is not None
+            and getattr(
+                app.state,
+                "certificate_capture_enabled_v1",
+                False,
+            )
+        )
 
         if app:
             @app.get("/version")
@@ -80,6 +89,13 @@ class ChatEngine(object):
         session_info: SessionInfoData,
         session_admission: "ConsumedSessionAdmissionV1 | None" = None,
     ):
+        if (
+            self._certificate_capture_enabled_v1
+            and session_admission is None
+        ):
+            raise RuntimeError(
+                "secure dispatch requires authenticated session admission"
+            )
         if not session_info.session_id:
             session_info.session_id = str(uuid.uuid4())
         if session_info.session_id in self.sessions:
@@ -88,6 +104,9 @@ class ChatEngine(object):
         session_context = SessionContext(
             session_info=session_info,
             session_admission=session_admission,
+            certificate_capture_enabled_v1=(
+                self._certificate_capture_enabled_v1
+            ),
         )
 
         session = ChatSession(session_context, self.engine_config)

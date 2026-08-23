@@ -8,7 +8,13 @@ from typing import Dict, List, Iterable
 from loguru import logger
 
 from chat_engine.core.signal_manager import SignalManager
-from chat_engine.core.stream_manager import StreamManager, ChatDataSubmitter
+from chat_engine.core.stream_manager import (
+    ChatDataSubmitter,
+    ChatDataSubmitterConsumerViewV1,
+    StreamManager,
+)
+from chat_engine.data_models.chat_data.chat_data_model import ChatData
+from chat_engine.data_models.chat_stream import ChatStreamIdentity
 from chat_engine.data_models.chat_stream_status import ChatStreamStatus
 
 from chat_engine.common.logic_base import LogicBase
@@ -28,6 +34,16 @@ from chat_engine.data_models.chat_signal import ChatSignal, SignalFilterRule
 from chat_engine.data_models.chat_signal_type import ChatSignalSourceType, ChatSignalType
 
 from chat_engine.contexts.session_context import SessionContext
+from chat_engine.security.audit_events import SecurityAuditEventCodeV1
+from chat_engine.security.authority import SecurityAuthorityV1
+from chat_engine.security.dispatch import (
+    CoreRegistrarCapabilityV1,
+    ConsumerCapabilityV1,
+    ProducerAuthorityReferenceV1,
+    ValidatedDispatchV1,
+)
+from chat_engine.security.envelope import SecurityClassificationV1
+from chat_engine.security.history import SessionHistoryConsumerViewV1
 
 
 class ChatSession:
@@ -37,11 +53,72 @@ class ChatSession:
         EngineChannelType.TEXT: [ChatDataType.HUMAN_TEXT]
     }
 
-    def __init__(self, session_context: SessionContext, _engine_config: ChatEngineConfigModel):
+    def __init__(
+        self,
+        session_context: SessionContext,
+        _engine_config: ChatEngineConfigModel,
+        *,
+        _security_authority_v1: SecurityAuthorityV1 | None = None,
+        _security_registrar_v1: CoreRegistrarCapabilityV1 | None = None,
+    ):
         self.session_context = session_context
-        self.signal_manager = SignalManager(self.session_context.session_clock)
+        self._security_authority: SecurityAuthorityV1 | None = None
+        self._security_registrar_v1: (
+            CoreRegistrarCapabilityV1 | None
+        ) = None
+        if self.session_context.secure_dispatch_enabled_v1:
+            if _security_authority_v1 is None:
+                (
+                    self._security_authority,
+                    self._security_registrar_v1,
+                ) = SecurityAuthorityV1.create_v1()
+            else:
+                if _security_registrar_v1 is None:
+                    raise RuntimeError(
+                        "injected security authority requires registrar"
+                    )
+                self._security_authority = _security_authority_v1
+                self._security_registrar_v1 = _security_registrar_v1
+        elif (
+            _security_authority_v1 is not None
+            or _security_registrar_v1 is not None
+        ):
+            raise RuntimeError(
+                "security authority requires a secure session"
+            )
+        self._history_capability: ConsumerCapabilityV1 | None = None
+        self._history_producer_authority: (
+            ProducerAuthorityReferenceV1 | None
+        ) = None
+        if self._security_authority is not None:
+            self._history_capability = (
+                self._security_authority
+                ._issue_public_consumer_capability_v1(
+                    self._security_registrar_v1
+                )
+            )
+            if self._history_capability is None:
+                raise RuntimeError("secure dispatch authority unavailable")
+            self._history_producer_authority = (
+                self._security_authority._issue_producer_authority_v1(
+                    self._security_registrar_v1,
+                    self._history_capability,
+                )
+            )
+            if self._history_producer_authority is None:
+                raise RuntimeError("secure history authority unavailable")
+            self.session_context.session_history.configure_security_write_authorizer_v1(
+                self._security_authority.history_writer_is_authorized_v1
+            )
+        self.signal_manager = SignalManager(
+            self.session_context.session_clock,
+            security_authority=self._security_authority,
+        )
         self.signal_manager.init()
-        self.stream_manager = StreamManager(self.signal_manager)
+        self.stream_manager = StreamManager(
+            self.signal_manager,
+            security_authority=self._security_authority,
+        )
         self.stream_manager.enable_debug_logging(True)
         self.data_sinks: Dict[ChatDataType, List[DataSink]] = {}
         self.handlers: Dict[str, HandlerRecord] = {}
@@ -49,7 +126,12 @@ class ChatSession:
         self._register_playback_auto_recorder()
 
     @classmethod
-    def handler_pumper(cls, session_context: SessionContext, handler_env: HandlerEnv):
+    def handler_pumper(
+        cls,
+        session_context: SessionContext,
+        handler_env: HandlerEnv,
+        security_authority: SecurityAuthorityV1 | None = None,
+    ):
         shared_states = session_context.shared_states
         input_queue = handler_env.input_queue
         handler = handler_env.handler
@@ -69,12 +151,74 @@ class ChatSession:
         
         while shared_states.active:
             try:
-                input_data = input_queue.get_nowait()
+                queued_item = input_queue.get_nowait()
             except (queue.Empty, asyncio.QueueEmpty):
                 time.sleep(0.03)
                 continue
-            
-            context.data_submitter.update_input_stream(input_data)
+
+            validated_dispatch: ValidatedDispatchV1 | None = None
+            history_authorized = True
+            if security_authority is not None:
+                # This is intentionally the first security-relevant action
+                # after dequeue. No stream, history, state, type, or log path
+                # may inspect the queued payload before this validation.
+                capability = handler_env.consumer_capability
+                if capability is None:
+                    security_authority._record(
+                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED
+                    )
+                    continue
+                validated_dispatch = (
+                    security_authority.validate_dequeued_dispatch_v1(
+                        queued_item,
+                        capability,
+                    )
+                )
+                if validated_dispatch is None:
+                    continue
+                input_data = validated_dispatch.payload
+                if not isinstance(input_data, ChatData):
+                    security_authority._record(
+                        SecurityAuditEventCodeV1.DISPATCH_DENIED,
+                        dispatch_id=validated_dispatch.dispatch_id,
+                    )
+                    continue
+                producer_authority = handler_env.producer_authority
+                if (
+                    producer_authority is None
+                    or not security_authority.record_dispatch_for_producer_v1(
+                        producer_authority,
+                        capability,
+                        validated_dispatch,
+                    )
+                ):
+                    continue
+
+                trusted_identity = validated_dispatch.stream_ref.identity
+                input_data.stream_id = ChatStreamIdentity(
+                    data_type=trusted_identity.data_type,
+                    builder_id=trusted_identity.builder_id,
+                    stream_id=trusted_identity.stream_id,
+                    name=trusted_identity.name,
+                    producer_name=trusted_identity.producer_name,
+                )
+                input_data.type = validated_dispatch.trusted_data_type
+                input_data.source = validated_dispatch.trusted_source
+                handler_env.core_data_submitter.update_input_dispatch_v1(
+                    validated_dispatch
+                )
+                history_capability = handler_env.history_capability
+                history_authorized = (
+                    history_capability is not None
+                    and security_authority.consumer_is_authorized_v1(
+                        validated_dispatch.envelope_ref,
+                        history_capability,
+                        audit_denial=False,
+                    )
+                )
+            else:
+                input_data = queued_item
+                handler_env.core_data_submitter.update_input_stream(input_data)
 
             # Consumer-side cancel guard: drop data from cancelled streams.
             # The production-side guard in stream_data() blocks new data, but residual
@@ -89,6 +233,7 @@ class ChatSession:
 
             # Auto-record STREAM_BEGIN to history
             if (input_data.is_first_data 
+                and history_authorized
                 and handler.should_auto_record_history(input_data.type)
                 and input_data.stream_id is not None):
                 stream_key_obj = input_data.stream_id.key
@@ -105,6 +250,7 @@ class ChatSession:
             # Accumulate streaming text data for TEXT types
             # Use timestamp as chunk_id for deduplication across multiple handlers
             if (handler.should_auto_record_history(input_data.type)
+                and history_authorized
                 and input_data.stream_id is not None
                 and input_data.data is not None
                 and context.session_history is not None):
@@ -132,9 +278,18 @@ class ChatSession:
             try:
                 handler_result = handler.handle(context, input_data, handler_visible_output_info)
             except Exception as e:
-                handler_name = handler_env.handler_info.name if handler_env.handler_info else "Unknown"
-                logger.opt(exception=e).error(f"Handler {handler_name} raised exception during handle(), "
-                                              f"input type: {input_data.type}, stream: {input_data.stream_id}")
+                if (
+                    validated_dispatch is not None
+                    and validated_dispatch.classification
+                    is SecurityClassificationV1.CERTIFICATE_PRIVATE
+                ):
+                    logger.bind(
+                        dispatch_id=validated_dispatch.dispatch_id
+                    ).error("PRIVATE_HANDLER_FAILURE_V1")
+                else:
+                    handler_name = handler_env.handler_info.name if handler_env.handler_info else "Unknown"
+                    logger.opt(exception=e).error(f"Handler {handler_name} raised exception during handle(), "
+                                                  f"input type: {input_data.type}, stream: {input_data.stream_id}")
                 # 重置 input_data.type 然后继续处理下一个数据
                 input_data.type = actual_type
                 continue
@@ -144,6 +299,7 @@ class ChatSession:
             
             # Auto-record STREAM_END to history with accumulated data content
             if (input_data.is_last_data 
+                and history_authorized
                 and handler.should_auto_record_history(input_data.type)
                 and input_data.stream_id is not None):
                 stream_key_obj = input_data.stream_id.key
@@ -173,7 +329,21 @@ class ChatSession:
             for handler_output in handler_result:
                 if context.data_submitter is None:
                     continue
-                context.data_submitter.submit(handler_output)
+                try:
+                    handler_env.core_data_submitter.submit(handler_output)
+                except Exception as error:
+                    if (
+                        validated_dispatch is not None
+                        and validated_dispatch.classification
+                        is SecurityClassificationV1.CERTIFICATE_PRIVATE
+                    ):
+                        logger.bind(
+                            dispatch_id=validated_dispatch.dispatch_id
+                        ).error("PRIVATE_OUTPUT_REJECTED_V1")
+                    else:
+                        logger.opt(exception=error).error(
+                            "Handler output submission failed."
+                        )
 
     def _register_playback_auto_recorder(self):
         """Register signal listeners to auto-record CLIENT_PLAYBACK stream lifecycle to SessionHistory."""
@@ -181,6 +351,7 @@ class ChatSession:
             self.signal_manager.register_listener(
                 listener=self._on_playback_stream_signal,
                 signal_filter=SignalFilterRule(signal_type, None, ChatDataType.CLIENT_PLAYBACK),
+                consumer_capability=self._history_capability,
             )
 
     def _on_playback_stream_signal(self, signal: ChatSignal):
@@ -200,6 +371,7 @@ class ChatSession:
                 signal_type=ChatSignalType.STREAM_BEGIN,
                 source_stream_key=stream_key_str,
                 owner=signal.source_name,
+                _security_writer_v1=self._history_producer_authority,
             )
             if event_id and stream_key_str:
                 self._playback_begin_event_ids[stream_key_str] = event_id
@@ -211,11 +383,47 @@ class ChatSession:
                 source_stream_key=stream_key_str,
                 owner=signal.source_name,
                 parent_event_id=begin_event_id,
+                _security_writer_v1=self._history_producer_authority,
             )
 
-    def prepare_handler(self, handler: HandlerBase, handler_info: HandlerBaseInfo,
-                        handler_config: HandlerBaseConfigModel):
+    def prepare_handler(
+        self,
+        handler: HandlerBase,
+        handler_info: HandlerBaseInfo,
+        handler_config: HandlerBaseConfigModel,
+        *,
+        _consumer_capability_v1: ConsumerCapabilityV1 | None = None,
+    ):
+        if (
+            self._security_authority is not None
+            and self._security_registrar_v1 is None
+        ):
+            raise RuntimeError("secure consumer registration is closed")
+        consumer_capability = _consumer_capability_v1
+        if self._security_authority is not None:
+            if consumer_capability is None:
+                consumer_capability = (
+                    self._security_authority
+                    ._issue_public_consumer_capability_v1(
+                        self._security_registrar_v1
+                    )
+                )
+            if consumer_capability is None:
+                raise RuntimeError("secure consumer capability unavailable")
+        producer_authority: ProducerAuthorityReferenceV1 | None = None
+        if self._security_authority is not None:
+            producer_authority = (
+                self._security_authority._issue_producer_authority_v1(
+                    self._security_registrar_v1,
+                    consumer_capability
+                )
+            )
+            if producer_authority is None:
+                raise RuntimeError("secure producer authority unavailable")
         handler_env = HandlerEnv(handler_info=handler_info, handler=handler, config=handler_config)
+        handler_env.consumer_capability = consumer_capability
+        handler_env.history_capability = self._history_capability
+        handler_env.producer_authority = producer_authority
         handler_env.context = handler.create_context(self.session_context, handler_env.config)
         handler_env.context.owner = handler_info.name
         handler_env.input_queue = queue.Queue()
@@ -266,7 +474,12 @@ class ChatSession:
         inputs = io_detail.inputs
         for input_type, input_info in inputs.items():
             sink_list = self.data_sinks.setdefault(input_type, [])
-            data_sink = DataSink(owner=handler_info.name, sink_queue=handler_env.input_queue, consume_info=input_info)
+            data_sink = DataSink(
+                owner=handler_info.name,
+                sink_queue=handler_env.input_queue,
+                consume_info=input_info,
+                consumer_capability=consumer_capability,
+            )
             sink_list.append(data_sink)
         handler_env.output_info = io_detail.outputs
         
@@ -294,17 +507,43 @@ class ChatSession:
         for signal_filter in filters:
             self.signal_manager.register_listener(
                 listener=lambda signal: handler.on_signal(handler_env.context, signal),
-                signal_filter=signal_filter
+                signal_filter=signal_filter,
+                consumer_capability=consumer_capability,
+                producer_authority=producer_authority,
             )
-        handler_context.signal_emitter = self.signal_manager.get_emitter(handler_info.name)
-        handler_context.data_submitter = ChatDataSubmitter()
+        core_data_submitter = ChatDataSubmitter(
+            security_authority=self._security_authority,
+            producer_authority=producer_authority,
+        )
+        handler_env.core_data_submitter = core_data_submitter
+        handler_context.signal_emitter = self.signal_manager.get_emitter(
+            handler_info.name,
+            producer_authority=producer_authority,
+        )
         # Set type mapping for override support - handlers can use original type names
         if output_type_mapping:
-            handler_context.data_submitter.set_output_type_mapping(output_type_mapping)
+            core_data_submitter.set_output_type_mapping(
+                output_type_mapping
+            )
         # Inject session history for duplex conversation support
-        handler_context.session_history = self.session_context.session_history
+        if self._security_authority is None:
+            handler_context.session_history = (
+                self.session_context.session_history
+            )
+        else:
+            handler_context.session_history = SessionHistoryConsumerViewV1(
+                self.session_context.session_history,
+                producer_authority,
+            )
         # Inject stream_manager so handlers can query stream graph and create lifecycle streams
-        handler_context.stream_manager = self.stream_manager
+        if self._security_authority is None:
+            handler_context.stream_manager = self.stream_manager
+        else:
+            handler_context.stream_manager = (
+                self.stream_manager.create_consumer_view_v1(
+                    producer_authority
+                )
+            )
 
         for output_type, output_data_info in handler_env.output_info.items():
             streamer = self.stream_manager.create_streamer(
@@ -313,8 +552,15 @@ class ChatSession:
                 producer_name=handler_info.name,
                 data_name=output_data_info.data_name,
                 config=output_data_info.output_stream_config,
-                )
-            handler_context.data_submitter.register_streamer(streamer)
+                producer_authority=producer_authority,
+            )
+            core_data_submitter.register_streamer(streamer)
+        if self._security_authority is None:
+            handler_context.data_submitter = core_data_submitter
+        else:
+            handler_context.data_submitter = (
+                ChatDataSubmitterConsumerViewV1(core_data_submitter)
+            )
         self.handlers[handler_info.name] = HandlerRecord(env=handler_env)
         return handler_env
 
@@ -335,9 +581,26 @@ class ChatSession:
         if self.session_context.shared_states.active:
             return
         self.sort_sinks()
+        # Capability/producer issuance is construction-time only. Remove the
+        # registrar before any handler lifecycle code can execute.
+        if (
+            self._security_authority is not None
+            and (
+                self._security_registrar_v1 is None
+                or not self._security_authority.close_registration_v1(
+                    self._security_registrar_v1
+                )
+            )
+        ):
+            raise RuntimeError("secure consumer registration close failed")
+        self._security_registrar_v1 = None
         self.session_context.shared_states.active = True
         for handler_name, handler_record in self.handlers.items():
-            start_args = (self.session_context, handler_record.env)
+            start_args = (
+                self.session_context,
+                handler_record.env,
+                self._security_authority,
+            )
             handler_record.env.handler.start_context(self.session_context, handler_record.env.context)
             handler_record.pump_thread = threading.Thread(target=self.handler_pumper, args=start_args)
             handler_record.pump_thread.start()
@@ -349,10 +612,20 @@ class ChatSession:
             if handler_record.pump_thread:
                 handler_record.pump_thread.join()
                 handler_record.pump_thread = None
+            while True:
+                try:
+                    handler_record.env.input_queue.get_nowait()
+                except (queue.Empty, asyncio.QueueEmpty):
+                    break
             handler_record.env.handler.destroy_context(handler_record.env.context)
         self.signal_manager.shutdown()
         self.handlers.clear()
+        self.data_sinks.clear()
+        self._playback_begin_event_ids.clear()
         self.session_context.cleanup()
+        if self._security_authority is not None:
+            self.stream_manager.release_secure_state_v1()
+            self._security_authority.close()
         logger.info("chat session stopped")
 
     def get_timestamp(self):

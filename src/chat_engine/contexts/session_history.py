@@ -13,7 +13,7 @@ Key features:
 - Extension points for persistence and LLM summarization
 """
 
-from typing import Optional, List, Any, Dict
+from typing import Any, Callable, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import time
@@ -104,8 +104,32 @@ class SessionHistory:
         # Lock for thread-safe accumulation
         import threading
         self._accumulator_lock = threading.Lock()
+        self._security_write_authorizer_v1: (
+            Callable[[object], bool] | None
+        ) = None
+
+    def configure_security_write_authorizer_v1(
+        self,
+        authorizer: Callable[[object], bool],
+    ) -> None:
+        """Require core-issued authority for every generic-history mutation."""
+
+        if self._security_write_authorizer_v1 is not None:
+            raise RuntimeError("history security authorizer already configured")
+        self._security_write_authorizer_v1 = authorizer
+
+    def _security_write_allowed_v1(self, writer_ref: object) -> bool:
+        authorizer = self._security_write_authorizer_v1
+        return authorizer is None or authorizer(writer_ref)
     
-    def accumulate_stream_data(self, stream_key: str, text: str, chunk_id: Optional[str] = None) -> bool:
+    def accumulate_stream_data(
+        self,
+        stream_key: str,
+        text: str,
+        chunk_id: Optional[str] = None,
+        *,
+        _security_writer_v1: object = None,
+    ) -> bool:
         """
         Accumulate text data for a streaming source.
         
@@ -121,7 +145,10 @@ class SessionHistory:
         Returns:
             True if data was accumulated, False if skipped (duplicate)
         """
-        if not text:
+        if (
+            not self._security_write_allowed_v1(_security_writer_v1)
+            or not text
+        ):
             return False
         
         with self._accumulator_lock:
@@ -156,7 +183,12 @@ class SessionHistory:
         with self._accumulator_lock:
             return self._stream_accumulators.get(stream_key)
     
-    def finalize_stream_accumulator(self, stream_key: str) -> Optional[str]:
+    def finalize_stream_accumulator(
+        self,
+        stream_key: str,
+        *,
+        _security_writer_v1: object = None,
+    ) -> Optional[str]:
         """
         Get and remove accumulated data for a finished stream.
         
@@ -166,11 +198,18 @@ class SessionHistory:
         Returns:
             Final accumulated text, or None if no data
         """
+        if not self._security_write_allowed_v1(_security_writer_v1):
+            return None
         with self._accumulator_lock:
             self._stream_chunk_hashes.pop(stream_key, None)
             return self._stream_accumulators.pop(stream_key, None)
     
-    def add_event(self, event: HistoryEvent) -> str:
+    def add_event(
+        self,
+        event: HistoryEvent,
+        *,
+        _security_writer_v1: object = None,
+    ) -> Optional[str]:
         """
         Add an event to history.
         
@@ -180,6 +219,8 @@ class SessionHistory:
         Returns:
             The event_id of the added event
         """
+        if not self._security_write_allowed_v1(_security_writer_v1):
+            return None
         self._maybe_cleanup()
         self._events.append(event)
         self._event_index[event.event_id] = event
@@ -194,7 +235,9 @@ class SessionHistory:
         related_event_ids: Optional[List[str]] = None,
         parent_event_id: Optional[str] = None,
         source_stream_key: Optional[str] = None,
-    ) -> str:
+        *,
+        _security_writer_v1: object = None,
+    ) -> Optional[str]:
         """
         Convenience method to create and add an event in one call.
         
@@ -211,9 +254,18 @@ class SessionHistory:
             parent_event_id=parent_event_id,
             source_stream_key=source_stream_key,
         )
-        return self.add_event(event)
+        return self.add_event(
+            event,
+            _security_writer_v1=_security_writer_v1,
+        )
     
-    def revoke_event(self, event_id: str, owner: str) -> bool:
+    def revoke_event(
+        self,
+        event_id: str,
+        owner: str,
+        *,
+        _security_writer_v1: object = None,
+    ) -> bool:
         """
         Revoke an event (logical revocation, excluded from queries).
         
@@ -226,6 +278,8 @@ class SessionHistory:
         Returns:
             True if revoked, False otherwise
         """
+        if not self._security_write_allowed_v1(_security_writer_v1):
+            return False
         event = self._event_index.get(event_id)
         if event is None:
             return False
@@ -235,7 +289,13 @@ class SessionHistory:
         event.revoked_at = time.monotonic()
         return True
     
-    def revoke_by_owner(self, owner: str, since_timestamp: Optional[float] = None) -> int:
+    def revoke_by_owner(
+        self,
+        owner: str,
+        since_timestamp: Optional[float] = None,
+        *,
+        _security_writer_v1: object = None,
+    ) -> int:
         """
         Revoke all events from a specific owner.
         
@@ -246,6 +306,8 @@ class SessionHistory:
         Returns:
             Number of events revoked
         """
+        if not self._security_write_allowed_v1(_security_writer_v1):
+            return 0
         count = 0
         for event in self._events:
             if event.owner == owner and not event.revoked:
@@ -529,8 +591,16 @@ class SessionHistory:
                 related.append(related_event)
         return related
     
-    def link_events(self, event_id: str, related_event_id: str):
+    def link_events(
+        self,
+        event_id: str,
+        related_event_id: str,
+        *,
+        _security_writer_v1: object = None,
+    ):
         """Establish a relationship between two events."""
+        if not self._security_write_allowed_v1(_security_writer_v1):
+            return
         event = self._event_index.get(event_id)
         if event and related_event_id not in event.related_event_ids:
             event.related_event_ids.append(related_event_id)

@@ -22,9 +22,20 @@ class SessionContext(object):
         session_info: SessionInfoData,
         history_config: Optional[HistoryConfig] = None,
         session_admission: "ConsumedSessionAdmissionV1 | None" = None,
+        certificate_capture_enabled_v1: bool = False,
     ):
+        if certificate_capture_enabled_v1 and session_admission is None:
+            raise RuntimeError(
+                "secure dispatch requires authenticated session admission"
+            )
         self.session_info = session_info
         self.session_admission = session_admission
+        # Admission is installed only by the Milestone 1 authenticated
+        # transport seam. Secure sessions must never fall back to naked queues.
+        self.secure_dispatch_enabled_v1 = (
+            certificate_capture_enabled_v1
+            or session_admission is not None
+        )
         self.session_clock: SessionClock = SessionClock(self.session_info.timestamp_base)
         self.shared_states = SharedStates()
         # Global session history for full-duplex conversation support
