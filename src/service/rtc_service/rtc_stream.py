@@ -395,3 +395,37 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                 self.trusted_rtc_admission.release_stream(self)
             except Exception:  # noqa: BLE001
                 logger.error("Failed to release secure RTC transport.")
+
+    async def shutdown_async(self):
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        self.quit.set()
+        factory = None
+        if self.weak_factory is not None:
+            factory = self.weak_factory()
+        if factory is None:
+            factory = self
+        self.client_session_delegate = None
+        if self.session_id in factory.streams:
+            factory.streams.pop(self.session_id, None)
+        if self.owns_session and factory.client_handler_delegate is not None:
+            try:
+                stop_async = getattr(
+                    factory.client_handler_delegate,
+                    "stop_session_async",
+                    None,
+                )
+                if callable(stop_async):
+                    await stop_async(self.session_id)
+                else:
+                    factory.client_handler_delegate.stop_session(
+                        self.session_id
+                    )
+            except Exception:  # noqa: BLE001
+                logger.error("Failed to stop RTC-owned session.")
+        if self.trusted_rtc_admission is not None:
+            try:
+                self.trusted_rtc_admission.release_stream(self)
+            except Exception:  # noqa: BLE001
+                logger.error("Failed to release secure RTC transport.")

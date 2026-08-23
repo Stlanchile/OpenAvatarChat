@@ -95,7 +95,7 @@ async def _serve_authenticated_websocket(
 
                 if not isinstance(session_delegate, expected_delegate_type):
                     if created_session:
-                        _stop_session_after_failed_handshake(
+                        await _stop_session_after_failed_handshake(
                             handler_delegate,
                             session_id,
                         )
@@ -104,7 +104,7 @@ async def _serve_authenticated_websocket(
                 raise
             except Exception:  # noqa: BLE001
                 if session_delegate is None or created_session:
-                    _stop_session_after_failed_handshake(
+                    await _stop_session_after_failed_handshake(
                         handler_delegate,
                         session_id,
                     )
@@ -117,7 +117,7 @@ async def _serve_authenticated_websocket(
                 return
             finally:
                 if not accepted and created_session:
-                    _stop_session_after_failed_handshake(
+                    await _stop_session_after_failed_handshake(
                         handler_delegate,
                         session_id,
                     )
@@ -127,7 +127,7 @@ async def _serve_authenticated_websocket(
     except Exception:  # noqa: BLE001
         if accepted:
             if created_session:
-                _stop_session_after_failed_handshake(
+                await _stop_session_after_failed_handshake(
                     handler_delegate,
                     session_id,
                 )
@@ -158,7 +158,10 @@ async def _serve_authenticated_websocket(
     finally:
         if should_stop:
             try:
-                handler_delegate.stop_session(session_id)
+                await _stop_session_async_v1(
+                    handler_delegate,
+                    session_id,
+                )
                 logger.info("Authenticated session stopped.")
             except Exception:  # noqa: BLE001
                 logger.error("Authenticated session cleanup failed.")
@@ -211,12 +214,23 @@ async def _serve_legacy_websocket(
             logger.debug("Session WebSocket close failed.")
 
 
-def _stop_session_after_failed_handshake(
+async def _stop_session_async_v1(
+    handler_delegate: ClientHandlerDelegate,
+    session_id: str,
+) -> None:
+    stop_async = getattr(handler_delegate, "stop_session_async", None)
+    if callable(stop_async):
+        await stop_async(session_id)
+        return
+    handler_delegate.stop_session(session_id)
+
+
+async def _stop_session_after_failed_handshake(
     handler_delegate: ClientHandlerDelegate,
     session_id: str,
 ) -> None:
     try:
-        handler_delegate.stop_session(session_id)
+        await _stop_session_async_v1(handler_delegate, session_id)
     except Exception:  # noqa: BLE001
         logger.error("Authenticated session handshake cleanup failed.")
 

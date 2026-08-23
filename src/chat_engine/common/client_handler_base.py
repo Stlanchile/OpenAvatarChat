@@ -97,6 +97,15 @@ class ClientHandlerDelegate:
         finally:
             self.session_delegates.pop(session_id, None)
 
+    async def stop_session_async(self, session_id: str):
+        engine = self.engine_ref()
+        assert engine is not None
+        self.session_delegates.pop(session_id, None)
+        try:
+            await engine.stop_session_async(session_id)
+        finally:
+            self.session_delegates.pop(session_id, None)
+
     def find_session_delegate(self, session_id: str):
         return self.session_delegates.get(session_id)
 

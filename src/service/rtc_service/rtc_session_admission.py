@@ -1232,9 +1232,17 @@ class AuthenticatedRtcAdmissionControllerV1:
 
                 if bound_stream is not None:
                     try:
-                        shutdown_result = bound_stream.shutdown()
-                        if inspect.isawaitable(shutdown_result):
-                            await shutdown_result
+                        shutdown_async = getattr(
+                            bound_stream,
+                            "shutdown_async",
+                            None,
+                        )
+                        if callable(shutdown_async):
+                            await shutdown_async()
+                        else:
+                            shutdown_result = bound_stream.shutdown()
+                            if inspect.isawaitable(shutdown_result):
+                                await shutdown_result
                     except Exception:  # noqa: BLE001
                         shutdown_result = None
             finally:

@@ -44,6 +44,9 @@ from chat_engine.security.dispatch import (
 )
 from chat_engine.security.envelope import SecurityClassificationV1
 from chat_engine.security.history import SessionHistoryConsumerViewV1
+from chat_engine.security.session_work_controller import (
+    SessionWorkControllerV1,
+)
 
 
 class ChatSession:
@@ -60,6 +63,7 @@ class ChatSession:
         *,
         _security_authority_v1: SecurityAuthorityV1 | None = None,
         _security_registrar_v1: CoreRegistrarCapabilityV1 | None = None,
+        _work_controller_v1: SessionWorkControllerV1 | None = None,
     ):
         self.session_context = session_context
         self._security_authority: SecurityAuthorityV1 | None = None
@@ -110,6 +114,19 @@ class ChatSession:
             self.session_context.session_history.configure_security_write_authorizer_v1(
                 self._security_authority.history_writer_is_authorized_v1
             )
+        self._work_controller_v1: SessionWorkControllerV1 | None = None
+        if self.session_context.secure_dispatch_enabled_v1:
+            self._work_controller_v1 = (
+                _work_controller_v1
+                if _work_controller_v1 is not None
+                else SessionWorkControllerV1()
+            )
+            if not self._work_controller_v1._claim_session_owner_v1():
+                raise RuntimeError("secure work controller unavailable")
+        elif _work_controller_v1 is not None:
+            raise RuntimeError(
+                "work controller requires a secure session"
+            )
         self.signal_manager = SignalManager(
             self.session_context.session_clock,
             security_authority=self._security_authority,
@@ -123,6 +140,9 @@ class ChatSession:
         self.data_sinks: Dict[ChatDataType, List[DataSink]] = {}
         self.handlers: Dict[str, HandlerRecord] = {}
         self._playback_begin_event_ids: Dict[str, str] = {}
+        self._stop_state_lock_v1 = threading.Lock()
+        self._stop_complete_event_v1 = threading.Event()
+        self._stop_started_v1 = False
         self._register_playback_auto_recorder()
 
     @classmethod
@@ -607,7 +627,61 @@ class ChatSession:
         self.session_context.get_clock().start()
 
     def stop(self):
-        self.session_context.shared_states.active = False
+        if (
+            self._work_controller_v1 is not None
+            and not self._stop_complete_event_v1.is_set()
+        ):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                raise RuntimeError(
+                    "secure session stop requires await stop_async()"
+                )
+        if not self._claim_stop_owner_v1():
+            self._stop_complete_event_v1.wait()
+            return
+        try:
+            if self._work_controller_v1 is not None:
+                cleanup_succeeded = self._work_controller_v1.shutdown()
+                if not cleanup_succeeded:
+                    logger.error("SECURE_SESSION_WORK_CLEANUP_FAILED_V1")
+        finally:
+            try:
+                self._finish_stop_v1()
+            finally:
+                self._stop_complete_event_v1.set()
+
+    async def stop_async(self):
+        """Stop a secure session without blocking its cooperative event loop."""
+
+        if not self._claim_stop_owner_v1():
+            while not self._stop_complete_event_v1.is_set():
+                await asyncio.sleep(0.01)
+            return
+        try:
+            if self._work_controller_v1 is not None:
+                cleanup_succeeded = (
+                    await self._work_controller_v1.shutdown_async()
+                )
+                if not cleanup_succeeded:
+                    logger.error("SECURE_SESSION_WORK_CLEANUP_FAILED_V1")
+        finally:
+            try:
+                self._finish_stop_v1()
+            finally:
+                self._stop_complete_event_v1.set()
+
+    def _claim_stop_owner_v1(self) -> bool:
+        with self._stop_state_lock_v1:
+            if self._stop_started_v1:
+                return False
+            self._stop_started_v1 = True
+            self.session_context.shared_states.active = False
+            return True
+
+    def _finish_stop_v1(self):
         for handler_name, handler_record in self.handlers.items():
             if handler_record.pump_thread:
                 handler_record.pump_thread.join()

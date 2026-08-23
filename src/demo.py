@@ -53,7 +53,7 @@ class OpenAvatarChatWebServer(uvicorn.Server):
     
     async def shutdown(self, sockets=None):
         logger.info("Start normal shutdown process")
-        self.chat_engine.shutdown()
+        await self.chat_engine.shutdown_async()
         await super().shutdown(sockets)
 
 

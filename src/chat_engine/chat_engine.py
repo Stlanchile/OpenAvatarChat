@@ -1,4 +1,6 @@
+import asyncio
 import os
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
@@ -42,6 +44,9 @@ class ChatEngine(object):
         self._certificate_capture_enabled_v1 = False
 
         self.sessions: Dict[str, ChatSession] = {}
+        self._sessions_lock_v1 = threading.RLock()
+        self._stopping_session_ids_v1: set[str] = set()
+        self._session_stop_events_v1: dict[str, threading.Event] = {}
 
     def initialize(self, engine_config: ChatEngineConfigModel, app=None, ui=None, parent_block=None):
         if self.states.inited:
@@ -96,33 +101,43 @@ class ChatEngine(object):
             raise RuntimeError(
                 "secure dispatch requires authenticated session admission"
             )
-        if not session_info.session_id:
-            session_info.session_id = str(uuid.uuid4())
-        if session_info.session_id in self.sessions:
-            raise RuntimeError(f"session {session_info.session_id} already exists")
+        with self._sessions_lock_v1:
+            if not session_info.session_id:
+                session_info.session_id = str(uuid.uuid4())
+            if (
+                session_info.session_id in self.sessions
+                or session_info.session_id in self._stopping_session_ids_v1
+            ):
+                raise RuntimeError(
+                    f"session {session_info.session_id} already exists"
+                )
 
-        session_context = SessionContext(
-            session_info=session_info,
-            session_admission=session_admission,
-            certificate_capture_enabled_v1=(
-                self._certificate_capture_enabled_v1
-            ),
-        )
+            session_context = SessionContext(
+                session_info=session_info,
+                session_admission=session_admission,
+                certificate_capture_enabled_v1=(
+                    self._certificate_capture_enabled_v1
+                ),
+            )
 
-        session = ChatSession(session_context, self.engine_config)
-        handlers = self.handler_manager.get_enabled_handler_registries()
-        for registry in handlers:
-            if isinstance(registry.handler, ClientHandlerBase):
-                # client create_context and data_sink creation of handler is not called here,
-                # they are created by its internal logic after every other handlers are ready.
-                continue
-            session.prepare_handler(registry.handler, registry.base_info, registry.handler_config)
-        logics = self.logic_manager.get_enabled_logics()
-        # TODO
-        # for registry in logics:
-        #     session.create_logic_contexts(handlers, registry.logic, registry.base_info, registry.logic_config)
-        self.sessions[session_info.session_id] = session
-        return session
+            session = ChatSession(session_context, self.engine_config)
+            handlers = self.handler_manager.get_enabled_handler_registries()
+            for registry in handlers:
+                if isinstance(registry.handler, ClientHandlerBase):
+                    # Client context and sinks are created by the transport
+                    # after the shared session handlers are ready.
+                    continue
+                session.prepare_handler(
+                    registry.handler,
+                    registry.base_info,
+                    registry.handler_config,
+                )
+            logics = self.logic_manager.get_enabled_logics()
+            # TODO
+            # for registry in logics:
+            #     session.create_logic_contexts(handlers, registry.logic, registry.base_info, registry.logic_config)
+            self.sessions[session_info.session_id] = session
+            return session
 
     def create_client_session(
         self,
@@ -131,30 +146,133 @@ class ChatEngine(object):
         session_admission: "ConsumedSessionAdmissionV1 | None" = None,
     ):
         # TODO currently multi client in one session is not allowed.
-        if session_info.session_id in self.sessions:
-            msg = f"Session {session_info.session_id} already exists."
-            raise RuntimeError(msg)
+        with self._sessions_lock_v1:
+            if (
+                session_info.session_id in self.sessions
+                or session_info.session_id in self._stopping_session_ids_v1
+            ):
+                msg = f"Session {session_info.session_id} already exists."
+                raise RuntimeError(msg)
 
-        session = self._create_session(
-            session_info,
-            session_admission=session_admission,
-        )
+            session = self._create_session(
+                session_info,
+                session_admission=session_admission,
+            )
 
-        registry = self.handler_manager.find_client_handler(client_handler)
-        if registry is None:
-            raise RuntimeError(f"client handler {client_handler} not found")
+            registry = self.handler_manager.find_client_handler(client_handler)
+            if registry is None:
+                raise RuntimeError(
+                    f"client handler {client_handler} not found"
+                )
 
-        handler_env = session.prepare_handler(client_handler, registry.base_info, registry.handler_config)
-        return session, handler_env
+            handler_env = session.prepare_handler(
+                client_handler,
+                registry.base_info,
+                registry.handler_config,
+            )
+            return session, handler_env
 
     def stop_session(self, session_id: str):
-        session = self.sessions.pop(session_id, None)
-        if session is None:
-            logger.warning(f"Session {session_id} already stopped or not found.")
+        with self._sessions_lock_v1:
+            session = self.sessions.get(session_id)
+            if session is None:
+                logger.warning(
+                    f"Session {session_id} already stopped or not found."
+                )
+                return
+            if (
+                session._work_controller_v1 is not None
+                and not session._stop_complete_event_v1.is_set()
+            ):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                else:
+                    raise RuntimeError(
+                        "secure session stop requires await stop_session_async()"
+                    )
+            stop_event = self._session_stop_events_v1.get(session_id)
+            owns_stop = stop_event is None
+            if owns_stop:
+                stop_event = threading.Event()
+                self._session_stop_events_v1[session_id] = stop_event
+                self._stopping_session_ids_v1.add(session_id)
+        assert stop_event is not None
+        if not owns_stop:
+            stop_event.wait()
+            if not session._stop_complete_event_v1.is_set():
+                raise RuntimeError("session stop did not complete")
             return
-        session.stop()
+        try:
+            session.stop()
+        finally:
+            with self._sessions_lock_v1:
+                if (
+                    session._stop_complete_event_v1.is_set()
+                    and self.sessions.get(session_id) is session
+                ):
+                    self.sessions.pop(session_id, None)
+                self._stopping_session_ids_v1.discard(session_id)
+                self._session_stop_events_v1.pop(session_id, None)
+                stop_event.set()
+
+    async def stop_session_async(self, session_id: str):
+        with self._sessions_lock_v1:
+            session = self.sessions.get(session_id)
+            if session is None:
+                logger.warning(
+                    f"Session {session_id} already stopped or not found."
+                )
+                return
+            stop_event = self._session_stop_events_v1.get(session_id)
+            owns_stop = stop_event is None
+            if owns_stop:
+                stop_event = threading.Event()
+                self._session_stop_events_v1[session_id] = stop_event
+                self._stopping_session_ids_v1.add(session_id)
+        assert stop_event is not None
+        if not owns_stop:
+            while not stop_event.is_set():
+                await asyncio.sleep(0.01)
+            if not session._stop_complete_event_v1.is_set():
+                raise RuntimeError("session stop did not complete")
+            return
+        try:
+            await session.stop_async()
+        finally:
+            with self._sessions_lock_v1:
+                if (
+                    session._stop_complete_event_v1.is_set()
+                    and self.sessions.get(session_id) is session
+                ):
+                    self.sessions.pop(session_id, None)
+                self._stopping_session_ids_v1.discard(session_id)
+                self._session_stop_events_v1.pop(session_id, None)
+                stop_event.set()
     
     def shutdown(self):
         logger.info("Shutting down chat engine...")
+        with self._sessions_lock_v1:
+            secure_session_ids = tuple(
+                session_id
+                for session_id, session in self.sessions.items()
+                if session._work_controller_v1 is not None
+            )
+        for session_id in secure_session_ids:
+            self.stop_session(session_id)
+        self.logic_manager.destroy()
+        self.handler_manager.destroy()
+
+    async def shutdown_async(self):
+        logger.info("Shutting down chat engine...")
+        with self._sessions_lock_v1:
+            secure_session_ids = tuple(
+                session_id
+                for session_id, session in self.sessions.items()
+                if session._work_controller_v1 is not None
+            )
+        for session_id in secure_session_ids:
+            await self.stop_session_async(session_id)
         self.logic_manager.destroy()
         self.handler_manager.destroy()
