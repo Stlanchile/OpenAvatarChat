@@ -13,6 +13,7 @@ Key features:
 - Extension points for persistence and LLM summarization
 """
 
+import copy
 from typing import Any, Callable, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
@@ -121,6 +122,13 @@ class SessionHistory:
     def _security_write_allowed_v1(self, writer_ref: object) -> bool:
         authorizer = self._security_write_authorizer_v1
         return authorizer is None or authorizer(writer_ref)
+
+    def _security_read_snapshot_v1(self, value: Any) -> Any:
+        """Return defensive read snapshots only when secure dispatch is active."""
+
+        if self._security_write_authorizer_v1 is None:
+            return value
+        return copy.deepcopy(value)
     
     def accumulate_stream_data(
         self,
@@ -321,7 +329,7 @@ class SessionHistory:
         """Get a specific event by ID."""
         event = self._event_index.get(event_id)
         if event and (include_revoked or not event.revoked):
-            return event
+            return self._security_read_snapshot_v1(event)
         return None
     
     def get_recent_events(
@@ -369,7 +377,8 @@ class SessionHistory:
             if len(results) >= max_count:
                 break
         
-        return list(reversed(results))  # Return in chronological order
+        ordered = list(reversed(results))
+        return self._security_read_snapshot_v1(ordered)
     
     def get_recent_dialog(self, max_turns: int = 5) -> List[HistoryEvent]:
         """
@@ -543,7 +552,7 @@ class SessionHistory:
             if self._is_playback_begin(event):
                 if event.source_stream_key and event.source_stream_key in ended_stream_keys:
                     continue
-                return event
+                return self._security_read_snapshot_v1(event)
         
         return None
     
@@ -576,7 +585,7 @@ class SessionHistory:
                     active_streams.append(event)
                     seen_stream_keys.add(sk)
         
-        return active_streams
+        return self._security_read_snapshot_v1(active_streams)
     
     def get_related_events(self, event_id: str, include_revoked: bool = False) -> List[HistoryEvent]:
         """Get all events related to a specific event."""

@@ -781,7 +781,30 @@ class ChatStreamer:
         return refs
 
     def find_stream(self, stream_id: ChatStreamIdentity):
-        return self._storage.find_stream(stream_id)
+        stream = self._storage.find_stream(stream_id)
+        if (
+            self._security_authority is None
+            or stream is None
+        ):
+            return stream
+        if (
+            stream.security_stream_ref is None
+            or self._producer_authority is None
+            or not self._security_authority.producer_can_access_envelope_v1(
+                self._producer_authority,
+                stream.security_stream_ref.envelope_ref,
+            )
+        ):
+            self._security_authority._record(
+                SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED,
+                envelope_id=(
+                    stream.security_stream_ref.envelope_ref.envelope_id
+                    if stream.security_stream_ref is not None
+                    else None
+                ),
+            )
+            return None
+        return stream
 
     def _security_parents_for_stream_v1(
         self,
@@ -1264,7 +1287,7 @@ class ChatStreamer:
         Returns:
             True if the stream was cancelled, False otherwise
         """
-        stream = self._storage.find_stream(stream_id)
+        stream = self.find_stream(stream_id)
         if stream is None:
             return False
         return stream.cancel(self._storage)
@@ -1763,8 +1786,18 @@ class ChatStreamerConsumerViewV1:
     @property
     def current_stream(self) -> ChatStreamConsumerViewV1 | None:
         stream = self.__streamer.current_stream
+        if (
+            stream is not None
+            and self.__streamer.find_stream(stream.identity) is None
+        ):
+            return None
         return (
-            ChatStreamConsumerViewV1(stream)
+            ChatStreamConsumerViewV1(
+                stream,
+                access_check=lambda: (
+                    self.__streamer.find_stream(stream.identity) is not None
+                ),
+            )
             if stream is not None
             else None
         )
@@ -1838,7 +1871,12 @@ class ChatStreamerConsumerViewV1:
     ) -> ChatStreamConsumerViewV1 | None:
         stream = self.__streamer.find_stream(stream_id)
         return (
-            ChatStreamConsumerViewV1(stream)
+            ChatStreamConsumerViewV1(
+                stream,
+                access_check=lambda: (
+                    self.__streamer.find_stream(stream.identity) is not None
+                ),
+            )
             if stream is not None
             else None
         )

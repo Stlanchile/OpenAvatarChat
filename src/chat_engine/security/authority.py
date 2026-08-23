@@ -66,6 +66,278 @@ class _ProducerAuthorityStateV1:
     envelope_refs: tuple[_ProducerEnvelopeStateV1, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _RegisteredConsumerCapabilityStateV1:
+    authority_id: str
+    capability_id: str
+    allowed_classifications: frozenset[SecurityClassificationV1]
+    allowed_egress_policies: frozenset[EgressPolicyV1]
+    authenticator: bytes
+
+    @classmethod
+    def from_capability(
+        cls,
+        capability: ConsumerCapabilityV1,
+    ) -> _RegisteredConsumerCapabilityStateV1:
+        return cls(
+            authority_id=capability.authority_id,
+            capability_id=capability.capability_id,
+            allowed_classifications=frozenset(
+                capability.allowed_classifications
+            ),
+            allowed_egress_policies=frozenset(
+                capability.allowed_egress_policies
+            ),
+            authenticator=bytes(capability.authenticator),
+        )
+
+    def token(self) -> ConsumerCapabilityV1:
+        return ConsumerCapabilityV1(
+            authority_id=self.authority_id,
+            capability_id=self.capability_id,
+            allowed_classifications=self.allowed_classifications,
+            allowed_egress_policies=self.allowed_egress_policies,
+            authenticator=self.authenticator,
+        )
+
+
+def _consumer_capability_state_accessors_v1():
+    """Keep canonical capability grants outside handler-reachable objects."""
+
+    stores: weakref.WeakKeyDictionary[
+        SecurityAuthorityV1,
+        dict[str, _RegisteredConsumerCapabilityStateV1],
+    ] = weakref.WeakKeyDictionary()
+
+    def initialize(authority: SecurityAuthorityV1) -> None:
+        stores.setdefault(authority, {})
+
+    def register(
+        authority: SecurityAuthorityV1,
+        capability: ConsumerCapabilityV1,
+        issuance_authority: object,
+    ) -> bool:
+        if not (
+            authority._validate_registrar_locked(issuance_authority)
+            or authority._validate_private_test_issuer_locked(issuance_authority)
+        ):
+            return False
+        store = stores.setdefault(authority, {})
+        if capability.capability_id in store:
+            return False
+        store[capability.capability_id] = (
+            _RegisteredConsumerCapabilityStateV1.from_capability(capability)
+        )
+        return True
+
+    def get(
+        authority: SecurityAuthorityV1,
+        capability_id: str,
+    ) -> ConsumerCapabilityV1 | None:
+        state = stores.get(authority, {}).get(capability_id)
+        return state.token() if state is not None else None
+
+    def clear(authority: SecurityAuthorityV1) -> None:
+        stores.pop(authority, None)
+
+    return initialize, register, get, clear
+
+
+(
+    _initialize_consumer_capability_state_v1,
+    _register_consumer_capability_v1,
+    _get_registered_consumer_capability_v1,
+    _clear_consumer_capability_state_v1,
+) = _consumer_capability_state_accessors_v1()
+
+
+def _authority_mac_key_accessors_v1():
+    """Keep session signing keys outside handler-reachable authority fields."""
+
+    keys: weakref.WeakKeyDictionary[
+        SecurityAuthorityV1,
+        bytes,
+    ] = weakref.WeakKeyDictionary()
+
+    def initialize(authority: SecurityAuthorityV1) -> None:
+        keys.setdefault(authority, secrets.token_bytes(32))
+
+    def sign(authority: SecurityAuthorityV1, message: bytes) -> bytes:
+        key = keys.get(authority)
+        if key is None:
+            raise SecurityAuthorityUnavailableV1(
+                "security authority unavailable"
+            )
+        return hmac.new(key, message, hashlib.sha256).digest()
+
+    def rotate(authority: SecurityAuthorityV1) -> None:
+        if authority in keys:
+            keys[authority] = secrets.token_bytes(32)
+
+    return initialize, sign, rotate
+
+
+(
+    _initialize_authority_mac_key_v1,
+    _sign_authority_message_v1,
+    _rotate_authority_mac_key_v1,
+) = _authority_mac_key_accessors_v1()
+
+
+def _authority_registration_accessors_v1():
+    """Keep construction authority monotonic and outside instance mutation."""
+
+    states: weakref.WeakKeyDictionary[
+        SecurityAuthorityV1,
+        dict[str, object],
+    ] = weakref.WeakKeyDictionary()
+
+    def initialize(
+        authority: SecurityAuthorityV1,
+        *,
+        test_mode: bool,
+    ) -> None:
+        if authority in states:
+            return
+        states[authority] = {
+            "registrar_id": _opaque_id_v1("crv1_"),
+            "registration_open": True,
+            "test_issuer_id": (
+                _opaque_id_v1("ptiv1_")
+                if test_mode
+                else None
+            ),
+            "test_issuer_exported": False,
+        }
+
+    def registrar_token(
+        authority: SecurityAuthorityV1,
+    ) -> CoreRegistrarCapabilityV1:
+        state = states[authority]
+        registrar_id = str(state["registrar_id"])
+        authority_id = authority.authority_id
+        return CoreRegistrarCapabilityV1(
+            authority_id=authority_id,
+            registrar_id=registrar_id,
+            authenticator=authority._mac(
+                b"core-registrar-v1",
+                authority_id,
+                registrar_id,
+            ),
+        )
+
+    def validate_registrar(
+        authority: SecurityAuthorityV1,
+        registrar: object,
+    ) -> bool:
+        state = states.get(authority)
+        if (
+            state is None
+            or not state["registration_open"]
+            or not isinstance(registrar, CoreRegistrarCapabilityV1)
+        ):
+            return False
+        authority_id = authority.authority_id
+        registrar_id = str(state["registrar_id"])
+        if (
+            registrar.authority_id != authority_id
+            or registrar.registrar_id != registrar_id
+        ):
+            return False
+        return hmac.compare_digest(
+            registrar.authenticator,
+            authority._mac(
+                b"core-registrar-v1",
+                authority_id,
+                registrar_id,
+            ),
+        )
+
+    def close_registration(authority: SecurityAuthorityV1) -> None:
+        state = states.get(authority)
+        if state is None:
+            return
+        state["registration_open"] = False
+        state["registrar_id"] = _opaque_id_v1("closed_crv1_")
+
+    def test_issuer_token(
+        authority: SecurityAuthorityV1,
+    ) -> PrivateTestIssuerCapabilityV1 | None:
+        state = states.get(authority)
+        issuer_id = state.get("test_issuer_id") if state is not None else None
+        if (
+            not isinstance(issuer_id, str)
+            or bool(state["test_issuer_exported"])
+        ):
+            return None
+        state["test_issuer_exported"] = True
+        authority_id = authority.authority_id
+        return PrivateTestIssuerCapabilityV1(
+            authority_id=authority_id,
+            issuer_id=issuer_id,
+            authenticator=authority._mac(
+                b"private-test-issuer-v1",
+                authority_id,
+                issuer_id,
+            ),
+        )
+
+    def validate_test_issuer(
+        authority: SecurityAuthorityV1,
+        issuer: object,
+    ) -> bool:
+        state = states.get(authority)
+        registered_id = (
+            state.get("test_issuer_id")
+            if state is not None
+            else None
+        )
+        if (
+            not isinstance(registered_id, str)
+            or not isinstance(issuer, PrivateTestIssuerCapabilityV1)
+            or issuer.authority_id != authority.authority_id
+            or issuer.issuer_id != registered_id
+        ):
+            return False
+        return hmac.compare_digest(
+            issuer.authenticator,
+            authority._mac(
+                b"private-test-issuer-v1",
+                issuer.authority_id,
+                issuer.issuer_id,
+            ),
+        )
+
+    def revoke(authority: SecurityAuthorityV1) -> None:
+        state = states.get(authority)
+        if state is None:
+            return
+        state["registration_open"] = False
+        state["registrar_id"] = _opaque_id_v1("closed_crv1_")
+        state["test_issuer_id"] = None
+
+    return (
+        initialize,
+        registrar_token,
+        validate_registrar,
+        close_registration,
+        test_issuer_token,
+        validate_test_issuer,
+        revoke,
+    )
+
+
+(
+    _initialize_authority_registration_v1,
+    _authority_registrar_token_v1,
+    _validate_authority_registrar_v1,
+    _close_authority_registration_v1,
+    _authority_test_issuer_token_v1,
+    _validate_authority_test_issuer_v1,
+    _revoke_authority_registration_v1,
+) = _authority_registration_accessors_v1()
+
+
 def _producer_state_accessors_v1():
     """Expose only monotonic producer-lineage transitions."""
 
@@ -169,20 +441,22 @@ class SecurityAuthorityV1:
     primitive.
     """
 
-    def __init__(self):
+    def __init__(self, *, _test_mode_v1: bool = False):
         self._authority_id = _opaque_id_v1("saa1_")
         self._owning_session_authority_ref = _opaque_id_v1("sar1_")
-        self._mac_key = secrets.token_bytes(32)
-        self._registrar_id = _opaque_id_v1("crv1_")
-        self._registration_open = True
         self._lock = threading.RLock()
         self._closed = False
         self._failed = False
         self._envelopes: dict[str, SecurityEnvelopeV1] = {}
         self._envelope_refs: dict[str, SecurityEnvelopeReferenceV1] = {}
-        self._capabilities: dict[str, ConsumerCapabilityV1] = {}
         self._stream_refs: dict[str, SecurityStreamReferenceV1] = {}
         self._audit = CoreSecurityAuditV1()
+        _initialize_authority_mac_key_v1(self)
+        _initialize_authority_registration_v1(
+            self,
+            test_mode=_test_mode_v1,
+        )
+        _initialize_consumer_capability_state_v1(self)
         _initialize_producer_state_v1(self)
 
     @classmethod
@@ -204,17 +478,10 @@ class SecurityAuthorityV1:
     ]:
         """Test-only bootstrap; callers must keep the issuer outside sessions."""
 
-        authority = cls()
-        issuer_id = _opaque_id_v1("ptiv1_")
-        issuer = PrivateTestIssuerCapabilityV1(
-            authority_id=authority._authority_id,
-            issuer_id=issuer_id,
-            authenticator=authority._mac(
-                b"private-test-issuer-v1",
-                authority._authority_id,
-                issuer_id,
-            ),
-        )
+        authority = cls(_test_mode_v1=True)
+        issuer = _authority_test_issuer_token_v1(authority)
+        if issuer is None:
+            raise RuntimeError("private test issuer unavailable")
         return authority, authority._new_registrar_v1(), issuer
 
     @property
@@ -227,40 +494,16 @@ class SecurityAuthorityV1:
             encoded = _part_bytes_v1(part)
             message.extend(len(encoded).to_bytes(8, "big"))
             message.extend(encoded)
-        return hmac.new(self._mac_key, bytes(message), hashlib.sha256).digest()
+        return _sign_authority_message_v1(self, bytes(message))
 
     def _new_registrar_v1(self) -> CoreRegistrarCapabilityV1:
-        return CoreRegistrarCapabilityV1(
-            authority_id=self._authority_id,
-            registrar_id=self._registrar_id,
-            authenticator=self._mac(
-                b"core-registrar-v1",
-                self._authority_id,
-                self._registrar_id,
-            ),
-        )
+        return _authority_registrar_token_v1(self)
 
     def _validate_registrar_locked(
         self,
         registrar: object,
     ) -> bool:
-        if not self._registration_open or not isinstance(
-            registrar, CoreRegistrarCapabilityV1
-        ):
-            return False
-        if (
-            registrar.authority_id != self._authority_id
-            or registrar.registrar_id != self._registrar_id
-        ):
-            return False
-        return hmac.compare_digest(
-            registrar.authenticator,
-            self._mac(
-                b"core-registrar-v1",
-                registrar.authority_id,
-                registrar.registrar_id,
-            ),
-        )
+        return _validate_authority_registrar_v1(self, registrar)
 
     def close_registration_v1(
         self,
@@ -270,15 +513,13 @@ class SecurityAuthorityV1:
 
         with self._lock:
             if self._closed or self._failed:
-                self._registration_open = False
-                self._registrar_id = _opaque_id_v1("closed_crv1_")
+                _close_authority_registration_v1(self)
                 self._record(SecurityAuditEventCodeV1.REGISTRY_FAILURE)
                 return True
             if not self._validate_registrar_locked(registrar):
                 self._record(SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED)
                 return False
-            self._registration_open = False
-            self._registrar_id = _opaque_id_v1("closed_crv1_")
+            _close_authority_registration_v1(self)
             return True
 
     def _ensure_available_locked(self) -> None:
@@ -309,10 +550,11 @@ class SecurityAuthorityV1:
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            self._mac_key = secrets.token_bytes(32)
+            _revoke_authority_registration_v1(self)
+            _rotate_authority_mac_key_v1(self)
             self._envelopes.clear()
             self._envelope_refs.clear()
-            self._capabilities.clear()
+            _clear_consumer_capability_state_v1(self)
             _clear_producer_state_v1(self)
             self._stream_refs.clear()
 
@@ -451,16 +693,7 @@ class SecurityAuthorityV1:
         self,
         issuer: object,
     ) -> bool:
-        if not isinstance(issuer, PrivateTestIssuerCapabilityV1):
-            return False
-        if issuer.authority_id != self._authority_id:
-            return False
-        expected = self._mac(
-            b"private-test-issuer-v1",
-            issuer.authority_id,
-            issuer.issuer_id,
-        )
-        return hmac.compare_digest(expected, issuer.authenticator)
+        return _validate_authority_test_issuer_v1(self, issuer)
 
     def _issue_private_root_for_test_v1(
         self,
@@ -637,7 +870,13 @@ class SecurityAuthorityV1:
             ",".join(sorted(item.value for item in egress_policies)),
         )
         capability = replace(capability, authenticator=authenticator)
-        self._capabilities[capability_id] = capability
+        if not _register_consumer_capability_v1(
+            self,
+            capability,
+            issuance_authority,
+        ):
+            self._record(SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED)
+            return None
         return capability
 
     def _issue_public_consumer_capability_v1(
@@ -719,7 +958,10 @@ class SecurityAuthorityV1:
             return None
         if capability.authority_id != self._authority_id:
             return None
-        registered = self._capabilities.get(capability.capability_id)
+        registered = _get_registered_consumer_capability_v1(
+            self,
+            capability.capability_id,
+        )
         if registered is None:
             return None
         expected = self._mac(
@@ -892,7 +1134,8 @@ class SecurityAuthorityV1:
                 producer_state = self._validate_producer_authority_locked(producer_ref)
                 if producer_state is None:
                     return False
-                capability = self._capabilities.get(
+                capability = _get_registered_consumer_capability_v1(
+                    self,
                     producer_state.reference.consumer_capability_id
                 )
                 if capability is None:
@@ -1092,7 +1335,8 @@ class SecurityAuthorityV1:
                 producer_state = self._validate_producer_authority_locked(writer_ref)
                 if producer_state is None:
                     return False
-                capability = self._capabilities.get(
+                capability = _get_registered_consumer_capability_v1(
+                    self,
                     producer_state.reference.consumer_capability_id
                 )
                 return (

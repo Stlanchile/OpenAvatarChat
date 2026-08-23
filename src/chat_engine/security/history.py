@@ -12,6 +12,21 @@ class SessionHistoryConsumerViewV1:
     """Expose legacy reads while binding every mutation to producer authority."""
 
     __slots__ = ("__history", "__producer_ref")
+    _READ_METHODS_V1 = frozenset(
+        {
+            "export_for_summary",
+            "get_accumulated_data",
+            "get_active_avatar_stream",
+            "get_active_avatar_streams",
+            "get_event",
+            "get_recent_dialog",
+            "get_recent_events",
+            "get_related_events",
+            "get_stream_start_time",
+            "is_avatar_speaking",
+            "was_avatar_speaking_at",
+        }
+    )
 
     def __init__(
         self,
@@ -25,7 +40,7 @@ class SessionHistoryConsumerViewV1:
         return "SessionHistoryConsumerViewV1(<bound>)"
 
     def __getattr__(self, name: str) -> Any:
-        if name.startswith("_"):
+        if name not in self._READ_METHODS_V1:
             raise AttributeError(name)
         return getattr(self.__history, name)
 

@@ -22,7 +22,10 @@ from chat_engine.data_models.internal.handler_definition_data import (
 )
 from chat_engine.data_models.runtime_data.data_bundle import DataBundle
 from chat_engine.security.audit_events import SecurityAuditEventCodeV1
-from chat_engine.security.envelope import SecurityClassificationV1
+from chat_engine.security.envelope import (
+    EgressPolicyV1,
+    SecurityClassificationV1,
+)
 
 
 def _derived_text(context, text: str, output_type: ChatDataType):
@@ -276,6 +279,118 @@ def test_registry_owned_lineage_survives_handler_local_tampering(
     assert (
         harness.classification_for_stream(private_sink.received[0].stream_id)
         is SecurityClassificationV1.CERTIFICATE_PRIVATE
+    )
+
+
+def test_reflected_capability_mutation_cannot_authorize_private_dispatch(
+    secure_session,
+):
+    session, harness = secure_session
+    observations: dict[str, bool] = {}
+
+    def attack_authority(context, _inputs):
+        submitter = object.__getattribute__(
+            context.data_submitter,
+            "_ChatDataSubmitterConsumerViewV1__submitter",
+        )
+        streamer_view = context.data_submitter.get_streamer(
+            ChatDataType.AVATAR_TEXT
+        )
+        streamer = object.__getattribute__(
+            streamer_view,
+            "_ChatStreamerConsumerViewV1__streamer",
+        )
+        capability = next(
+            sink.consumer_capability
+            for sink in streamer._data_sinks[ChatDataType.HUMAN_TEXT]
+            if sink.owner == "generic-capability-attacker"
+        )
+        authority = submitter._security_authority
+        observations["signing_key_not_exposed"] = not hasattr(
+            authority,
+            "_mac_key",
+        )
+        observations["capability_registry_not_exposed"] = not hasattr(
+            authority,
+            "_capabilities",
+        )
+
+        classifications = frozenset(
+            {
+                SecurityClassificationV1.PUBLIC_CHAT,
+                SecurityClassificationV1.CERTIFICATE_PRIVATE,
+            }
+        )
+        egress_policies = frozenset(
+            {
+                EgressPolicyV1.GENERIC,
+                EgressPolicyV1.INTERNAL_ONLY,
+            }
+        )
+        object.__setattr__(
+            capability,
+            "allowed_classifications",
+            classifications,
+        )
+        object.__setattr__(
+            capability,
+            "allowed_egress_policies",
+            egress_policies,
+        )
+        forged_authenticator = authority._mac(
+            b"consumer-capability-v1",
+            capability.authority_id,
+            capability.capability_id,
+            ",".join(sorted(item.value for item in classifications)),
+            ",".join(sorted(item.value for item in egress_policies)),
+        )
+        object.__setattr__(
+            capability,
+            "authenticator",
+            forged_authenticator,
+        )
+
+        private_ref = harness.issue_private_envelope()
+        observations["forged_private_capability_rejected"] = not (
+            authority.consumer_is_authorized_v1(
+                private_ref,
+                capability,
+                audit_denial=False,
+            )
+        )
+        object.__setattr__(authority, "_registration_open", True)
+        object.__setattr__(authority, "_registrar_id", "forged")
+        observations["registration_cannot_reopen"] = not (
+            authority._validate_registrar_locked(
+                authority._new_registrar_v1()
+            )
+        )
+
+    attacker = RecordingHandlerV1(
+        inputs=(ChatDataType.HUMAN_TEXT,),
+        outputs=(ChatDataType.AVATAR_TEXT,),
+        output_factory=attack_authority,
+    )
+    private_sink = RecordingHandlerV1(inputs=(ChatDataType.HUMAN_TEXT,))
+    prepare_handler(session, "generic-capability-attacker", attacker)
+    prepare_private_handler(harness, "private-capability-sink", private_sink)
+    session.start()
+
+    harness.dispatch_public(make_text_chat_data("capability-attack-trigger"))
+    wait_until(lambda: len(attacker.received) == 1)
+    harness.dispatch_private(make_text_chat_data("private-after-capability-attack"))
+    wait_until(lambda: len(private_sink.received) == 2)
+
+    assert observations == {
+        "capability_registry_not_exposed": True,
+        "forged_private_capability_rejected": True,
+        "registration_cannot_reopen": True,
+        "signing_key_not_exposed": True,
+    }
+    assert len(attacker.received) == 1
+    assert (
+        private_sink.received[-1].data.get_main_data()
+        == "private-after-capability-attack"
     )
 
 

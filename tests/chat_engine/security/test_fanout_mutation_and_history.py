@@ -17,6 +17,7 @@ from chat_engine.data_models.chat_signal_type import (
     ChatSignalSourceType,
     ChatSignalType,
 )
+from chat_engine.data_models.chat_stream import ChatStreamIdentity
 from chat_engine.data_models.chat_stream_config import ChatStreamConfig
 from chat_engine.data_models.internal.handler_definition_data import (
     ChatDataConsumeMode,
@@ -190,6 +191,59 @@ def test_private_handler_cannot_write_through_context_or_raw_history(
     assert canary not in repr(history.export_for_summary())
 
 
+def test_private_handler_cannot_mutate_live_generic_history_reads(
+    secure_session,
+):
+    session, harness = secure_session
+    public_text = "public-history-seed"
+    private_canary = "private-history-read-mutation-canary"
+    attack_enabled = False
+    observed_reads = []
+
+    def mutate_history_reads(context, _inputs):
+        if not attack_enabled:
+            return
+        context_events = context.session_history.get_recent_events()
+        raw_events = (
+            session.session_context.session_history.get_recent_events()
+        )
+        assert context_events
+        assert raw_events
+        context_events[-1].data = private_canary
+        raw_events[-1].data = private_canary
+        observed_reads.extend((context_events[-1], raw_events[-1]))
+
+    public_sink = RecordingHandlerV1(inputs=(ChatDataType.HUMAN_TEXT,))
+    private_attacker = RecordingHandlerV1(
+        inputs=(ChatDataType.HUMAN_TEXT,),
+        output_factory=mutate_history_reads,
+    )
+    prepare_handler(session, "public-history-seeder", public_sink)
+    prepare_private_handler(
+        harness,
+        "private-history-read-attacker",
+        private_attacker,
+    )
+    session.start()
+
+    harness.dispatch_public(make_text_chat_data(public_text))
+    wait_until(
+        lambda: (
+            len(session.session_context.session_history._events) == 2
+            and len(private_attacker.received) == 1
+        )
+    )
+    attack_enabled = True
+    harness.dispatch_private(make_text_chat_data(private_canary))
+    wait_until(lambda: len(observed_reads) == 2)
+
+    history = session.session_context.session_history
+    assert observed_reads[0].data == private_canary
+    assert observed_reads[1].data == private_canary
+    assert [event.data for event in history._events] == [None, public_text]
+    assert private_canary not in repr(history.export_for_summary())
+
+
 def test_denied_private_dispatch_creates_no_history_or_accumulator(
     secure_session,
 ):
@@ -277,7 +331,10 @@ def test_generic_stream_inspection_cannot_enumerate_private_metadata(
         inputs=(ChatDataType.HUMAN_TEXT,),
         output_factory=open_private_stream,
     )
-    generic_probe = RecordingHandlerV1(inputs=(ChatDataType.HUMAN_TEXT,))
+    generic_probe = RecordingHandlerV1(
+        inputs=(ChatDataType.HUMAN_TEXT,),
+        outputs=(ChatDataType.CLIENT_PLAYBACK,),
+    )
     prepare_private_handler(harness, "private-metadata-owner", private_handler)
     prepare_handler(session, "generic-stream-inspector", generic_probe)
     session.start()
@@ -317,6 +374,19 @@ def test_generic_stream_inspection_cannot_enumerate_private_metadata(
         "cancelable": [],
     }
     assert generic_manager.cancel_stream_chain(private_stream_ids[0]) == []
+    generic_output_streamer = generic_probe.context.data_submitter.get_streamer(
+        ChatDataType.CLIENT_PLAYBACK
+    )
+    assert generic_output_streamer.find_stream(private_stream_ids[0]) is None
+    forged_identity = ChatStreamIdentity(
+        data_type=ChatDataType.HUMAN_TEXT,
+        builder_id=private_stream_ids[0].builder_id,
+        stream_id=private_stream_ids[0].stream_id,
+        name="forged-private-stream",
+        producer_name="generic-stream-inspector",
+    )
+    assert generic_output_streamer.find_stream(forged_identity) is None
+    assert generic_output_streamer.cancel_stream(forged_identity) is False
     forged_streamer = generic_manager.create_lifecycle_streamer(
         data_type=ChatDataType.CLIENT_PLAYBACK,
         producer_name="generic-forged-private-parent",
