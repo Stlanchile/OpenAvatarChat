@@ -106,6 +106,9 @@ class AuthorizedDispatchV1:
     trusted_lineage_digest: bytes
     payload: Any
     authenticator: bytes
+    # Separate core-owned temporal carrier. It is not payload/stream
+    # metadata and is validated only by SessionWorkControllerV1.
+    work_item_v1: Any = None
 
     def __repr__(self) -> str:
         return "AuthorizedDispatchV1(<redacted>)"
@@ -138,6 +141,7 @@ class AuthorizedSignalEmissionV1:
     trusted_lineage_digest: bytes
     payload: Any
     authenticator: bytes
+    work_item_v1: Any = None
 
     def __repr__(self) -> str:
         return "AuthorizedSignalEmissionV1(<redacted>)"

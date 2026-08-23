@@ -11,6 +11,11 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from handlers.agent.tools.base_tool import BaseTool, ToolResult
+from chat_engine.security.work_fence import (
+    RegisteredWorkV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import SessionWorkRuntimeV1
 
 
 class ToolRegistry:
@@ -53,25 +58,80 @@ class ToolRegistry:
             ]
         return self._schemas_cache
 
-    def execute(self, name: str, args: Dict[str, Any]) -> ToolResult:
+    def execute(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        *,
+        _work_runtime_v1: SessionWorkRuntimeV1 | None = None,
+        _registered_work_v1: RegisteredWorkV1 | None = None,
+    ) -> ToolResult | None:
         """Execute a tool by name. Returns ToolResult on success or error."""
+        if (
+            _work_runtime_v1 is not None
+            and (
+                _registered_work_v1 is None
+                or not _work_runtime_v1.validate_work_v1(
+                    _registered_work_v1,
+                    WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                )
+            )
+        ):
+            return None
         tool = self._tools.get(name)
         if tool is None:
-            logger.error(f"[ToolRegistry] Unknown tool: {name}")
+            if _work_runtime_v1 is None:
+                logger.error(f"[ToolRegistry] Unknown tool: {name}")
+            else:
+                logger.error("[ToolRegistry] TOOL_NOT_FOUND")
+                if not _work_runtime_v1.validate_work_v1(
+                    _registered_work_v1,
+                    WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                ):
+                    return None
             return ToolResult(success=False, error=f"Unknown tool: {name}")
 
         start = time.time()
         try:
             result = tool.execute(args)
+            if (
+                _work_runtime_v1 is not None
+                and (
+                    _registered_work_v1 is None
+                    or not _work_runtime_v1.validate_work_v1(
+                        _registered_work_v1,
+                        WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                    )
+                )
+            ):
+                return None
             elapsed_ms = (time.time() - start) * 1000
             logger.info(
                 f"[ToolRegistry] {name} executed in {elapsed_ms:.0f}ms "
                 f"(success={result.success})"
             )
             return result
-        except Exception as e:
+        except Exception as error:
             elapsed_ms = (time.time() - start) * 1000
+            if _work_runtime_v1 is None:
+                logger.error(
+                    f"[ToolRegistry] {name} failed in "
+                    f"{elapsed_ms:.0f}ms: {error}"
+                )
+                return ToolResult(
+                    success=False,
+                    error=str(error),
+                )
+            if not _work_runtime_v1.validate_work_v1(
+                _registered_work_v1,
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+            ):
+                return None
             logger.error(
-                f"[ToolRegistry] {name} failed in {elapsed_ms:.0f}ms: {e}"
+                f"[ToolRegistry] {name} failed in "
+                f"{elapsed_ms:.0f}ms: TOOL_EXECUTION_FAILED"
             )
-            return ToolResult(success=False, error=str(e))
+            return ToolResult(
+                success=False,
+                error="tool execution failed",
+            )

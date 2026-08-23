@@ -10,16 +10,14 @@ Session Memory Manager — 统一记忆管理层
 - 感知事件写入时自动评估是否需要写回 OC
 - 提供面向 Prompt 编排的统一上下文查询
 """
-import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from loguru import logger
 
 from handlers.agent.memory.working_memory import WorkingMemory, DialogueTurn
 from handlers.agent.memory.perception_buffer import (
     PerceptionBuffer,
-    PerceptionEntry,
     WRITEBACK_IMPORTANCE_THRESHOLD,
 )
 from handlers.agent.memory.session_summary import SessionSummaryGenerator, SessionSummary
@@ -270,6 +268,14 @@ class SessionMemoryManager:
         model: str,
         task_brief: str = "",
         env_state: str = "",
+        *,
+        before_external_call: Callable[[], bool] | None = None,
+        after_external_call: Callable[[], bool] | None = None,
+        perform_if_live: Callable[
+            [Callable[[], None]],
+            bool,
+        ] | None = None,
+        redact_errors: bool = False,
     ):
         """
         检查并执行对话压缩 + post-compact rehydration。
@@ -282,24 +288,42 @@ class SessionMemoryManager:
 
         if self.config.compact_save_transcript:
             transcript = self.working_memory.get_full_transcript()
-            self.write_back_queue.enqueue(WriteBackItem(
-                item_type="transcript",
-                content=transcript,
-                importance=0.3,
-                metadata={"reason": "auto_compact"},
-            ))
+            def enqueue_transcript() -> None:
+                self.write_back_queue.enqueue(WriteBackItem(
+                    item_type="transcript",
+                    content=transcript,
+                    importance=0.3,
+                    metadata={"reason": "auto_compact"},
+                ))
+            if perform_if_live is not None:
+                if not perform_if_live(enqueue_transcript):
+                    return
+            else:
+                enqueue_transcript()
 
         summary = self.working_memory.compact(
             llm_client=llm_client,
             model=model,
             keep_recent=self.config.compact_keep_recent,
+            before_external_call=before_external_call,
+            after_external_call=after_external_call,
+            commit_if_live=perform_if_live,
+            redact_errors=redact_errors,
         )
         if summary:
             logger.info(
                 f"[SessionMemoryManager] auto-compact done: "
                 f"summary={len(summary)} chars"
             )
-            self._rehydrate(task_brief, env_state)
+            if perform_if_live is not None:
+                perform_if_live(
+                    lambda: self._rehydrate(
+                        task_brief,
+                        env_state,
+                    )
+                )
+            else:
+                self._rehydrate(task_brief, env_state)
 
     def _rehydrate(self, task_brief: str, env_state: str):
         """Post-compact rehydration: re-inject critical context that might be lost."""
@@ -332,9 +356,9 @@ class SessionMemoryManager:
         """手动触发写回队列 flush。"""
         return self.write_back_queue.flush()
 
-    def destroy(self):
+    def destroy(self, *, flush_write_back: bool = True):
         """会话结束时清理。"""
-        self.write_back_queue.shutdown()
+        self.write_back_queue.shutdown(flush=flush_write_back)
         self.working_memory.clear()
         self.perception_buffer.clear()
         self._summary_generator.clear()

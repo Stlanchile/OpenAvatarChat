@@ -369,6 +369,26 @@ class CertificateSessionAuthorityV1:
                 expires_at_epoch_seconds=expires_at_epoch,
             )
 
+    def _active_session_id_for_principal_v1(
+        self,
+        principal: AuthenticatedPrincipalV1,
+    ) -> str | None:
+        """Resolve an owner's current opaque id inside a serialized transition."""
+
+        with self._lock:
+            self._ensure_open_locked()
+            now_epoch, now_monotonic = self._read_clocks_locked()
+            self._cleanup_expired_locked(now_epoch, now_monotonic)
+            owner_material = self._validated_owner_material(
+                principal,
+                SessionAuthorityReasonV1.PARENT_AUTHORIZATION_INVALID,
+            )
+            owner_digest = self._owner_digest(owner_material)
+            session_id = self._session_ids_by_owner.get(owner_digest)
+            if session_id is None or session_id not in self._sessions:
+                return None
+            return session_id
+
     def get_session_ownership(
         self,
         principal: AuthenticatedPrincipalV1,

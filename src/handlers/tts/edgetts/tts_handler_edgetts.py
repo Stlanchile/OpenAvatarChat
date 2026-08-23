@@ -17,6 +17,11 @@ from chat_engine.data_models.chat_data_type import ChatDataType
 from chat_engine.contexts.session_context import SessionContext
 from chat_engine.data_models.runtime_data.data_bundle import DataBundle, DataBundleDefinition, DataBundleEntry
 from engine_utils.directory_info import DirectoryInfo
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
 
 class TTSConfig(HandlerBaseConfigModel, BaseModel):
     ref_audio_path: str = Field(default=None)
@@ -33,6 +38,7 @@ class TTSContext(HandlerContext):
         self.input_text = ''
         self.dump_audio = False
         self.audio_dump_file = None
+        self._secure_generation_v1 = None
 
 
 class HandlerTTS(HandlerBase, ABC):
@@ -106,6 +112,14 @@ class HandlerTTS(HandlerBase, ABC):
             text = inputs.data.get_main_data()
         else:
             return
+        if context.work_runtime_v1 is not None:
+            self._handle_fenced_v1(
+                context,
+                inputs,
+                text,
+                output_definition,
+            )
+            return
         if text is not None:
             text = re.sub(r"<\|.*?\|>", "", text)
             context.input_text += self.filter_text(text)
@@ -155,9 +169,140 @@ class HandlerTTS(HandlerBase, ABC):
             output = DataBundle(output_definition)
             output.set_main_data(np.zeros(shape=(1, 240), dtype=np.float32))
             context.submit_data(output, finish_stream=True)
-            logger.info(f"speech end")
+            logger.info("speech end")
+
+    def _handle_fenced_v1(
+        self,
+        context: TTSContext,
+        inputs: ChatData,
+        text,
+        output_definition: DataBundleDefinition,
+    ) -> None:
+        runtime = context.work_runtime_v1
+        parent = context.current_work_v1()
+        if runtime is None or parent is None:
+            return
+        synth_texts: list[str] = []
+        is_terminal = inputs.is_last_data
+
+        def update_text_buffer() -> None:
+            generation = parent.fence.session_epoch.generation
+            if context._secure_generation_v1 != generation:
+                context.input_text = ""
+                context._secure_generation_v1 = generation
+            if text is not None:
+                filtered = re.sub(r"<\|.*?\|>", "", text)
+                context.input_text += self.filter_text(filtered)
+            if not is_terminal:
+                sentences = re.split(
+                    r"(?<=[,.~!?，。！？])",
+                    context.input_text,
+                )
+                if len(sentences) > 1:
+                    synth_texts.extend(
+                        sentence
+                        for sentence in sentences[:-1]
+                        if sentence.strip()
+                    )
+                    context.input_text = sentences[-1]
+            else:
+                if context.input_text.strip():
+                    synth_texts.append(context.input_text)
+                context.input_text = ""
+
+        if not runtime.perform_if_live_v1(
+            parent,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            update_text_buffer,
+        ):
+            return
+
+        for sentence in synth_texts:
+            try:
+                work = runtime.register_child_work_v1(
+                    parent,
+                    WorkOperationKindV1.TTS_SYNTHESIS,
+                )
+            except WorkAdmissionDeniedV1:
+                return
+            try:
+                with context.activate_work_v1(
+                    work,
+                    context.current_work_envelope_v1(),
+                ):
+                    if not runtime.validate_work_v1(
+                        work,
+                        WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                    ):
+                        continue
+                    communicate = edge_tts.Communicate(
+                        sentence,
+                        self.voice,
+                    )
+                    audio_bytes = bytearray()
+                    for chunk in communicate.stream_sync():
+                        if not runtime.validate_work_v1(
+                            work,
+                            WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                        ):
+                            audio_bytes.clear()
+                            break
+                        if chunk["type"] == "audio":
+                            audio_bytes.extend(chunk["data"])
+                    if not audio_bytes or not runtime.validate_work_v1(
+                        work,
+                        WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                    ):
+                        continue
+                    output_audio = librosa.load(
+                        io.BytesIO(bytes(audio_bytes)),
+                        sr=None,
+                    )[0][np.newaxis, ...]
+                    output = DataBundle(output_definition)
+                    output.set_main_data(output_audio)
+                    runtime.perform_if_live_v1(
+                        work,
+                        WorkValidationBoundaryV1.BEFORE_EGRESS,
+                        lambda: context.submit_data(output),
+                    )
+            except Exception:
+                if runtime.validate_work_v1(
+                    work,
+                    WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                ):
+                    logger.error("EDGETTS_SYNTHESIS_FAILED")
+            finally:
+                runtime.release_work_v1(work)
+
+        if not is_terminal:
+            return
+        try:
+            terminal_work = runtime.register_child_work_v1(
+                parent,
+                WorkOperationKindV1.TTS_SYNTHESIS,
+            )
+        except WorkAdmissionDeniedV1:
+            return
+        try:
+            with context.activate_work_v1(
+                terminal_work,
+                context.current_work_envelope_v1(),
+            ):
+                output = DataBundle(output_definition)
+                output.set_main_data(
+                    np.zeros(shape=(1, 240), dtype=np.float32)
+                )
+                runtime.perform_if_live_v1(
+                    terminal_work,
+                    WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                    lambda: context.submit_data(
+                        output,
+                        finish_stream=True,
+                    ),
+                )
+        finally:
+            runtime.release_work_v1(terminal_work)
 
     def destroy_context(self, context: HandlerContext):
         context = cast(TTSContext, context)
         logger.info('destroy context')
-

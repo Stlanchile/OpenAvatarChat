@@ -5,18 +5,29 @@
 """
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, Future
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
-import base64
 import os
 import re
 import threading
 import time
 
-import cv2
 from loguru import logger
 import numpy as np
 
 from handlers.agent.agent_data_models import PerceptionData, EnvironmentEvent
+from chat_engine.security.work_fence import WorkValidationBoundaryV1
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
+)
+
+
+@dataclass(slots=True)
+class _PerceptionTaskV1:
+    round_id: int
+    frames: List[np.ndarray]
+    work_item_v1: WorkBoundItemV1 | None = None
 
 
 class AsyncPerceptionManager:
@@ -32,7 +43,12 @@ class AsyncPerceptionManager:
         self,
         vision_model: "VisionModelInterface",
         max_workers: int = 3,
-        on_result_callback: Optional[Callable[[int, Optional[PerceptionData]], None]] = None,
+        on_result_callback: Optional[
+            Callable[
+                [int, Optional[PerceptionData], WorkBoundItemV1 | None],
+                None,
+            ]
+        ] = None,
     ):
         """
         初始化异步管理器
@@ -55,6 +71,7 @@ class AsyncPerceptionManager:
         
         # 正在进行的任务
         self.pending_futures: Dict[int, Future] = {}
+        self.pending_tasks_v1: Dict[int, _PerceptionTaskV1] = {}
         self.pending_lock = threading.Lock()
         
         # 统计信息
@@ -74,7 +91,14 @@ class AsyncPerceptionManager:
         with self.pending_lock:
             return len(self.pending_futures)
     
-    def submit_task(self, round_id: int, frames: List[np.ndarray]) -> bool:
+    def submit_task(
+        self,
+        round_id: int,
+        frames: List[np.ndarray],
+        *,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ) -> bool:
         """
         提交异步感知任务
         
@@ -100,22 +124,57 @@ class AsyncPerceptionManager:
                 self.total_skipped += 1
                 return False
             
-            # 提交任务到线程池
-            future = self.executor.submit(self._worker, round_id, frames)
-            self.pending_futures[round_id] = future
-            self.total_submitted += 1
-            
-            logger.info(
-                f"[AsyncPerceptionManager] [Round-{round_id}] 📤 提交异步任务 "
-                f"(当前并发: {pending_count + 1}/{self.max_workers}, 帧数: {len(frames)})"
+            task = _PerceptionTaskV1(
+                round_id=round_id,
+                frames=frames,
+                work_item_v1=work_item_v1,
             )
+            submitted_futures: list[Future] = []
+
+            def submit_to_executor() -> None:
+                future = self.executor.submit(
+                    self._worker,
+                    task,
+                    work_runtime_v1,
+                )
+                self.pending_futures[round_id] = future
+                self.pending_tasks_v1[round_id] = task
+                self.total_submitted += 1
+                submitted_futures.append(future)
+
+            if work_runtime_v1 is None:
+                submit_to_executor()
+            elif (
+                work_item_v1 is None
+                or not work_runtime_v1.perform_if_live_v1(
+                    work_item_v1.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                    submit_to_executor,
+                )
+            ):
+                return False
+            if not submitted_futures:
+                return False
             
-            # 添加完成回调
-            future.add_done_callback(lambda f: self._on_future_done(round_id, f))
-            
-            return True
+        logger.info(
+            f"[AsyncPerceptionManager] [Round-{round_id}] 📤 提交异步任务 "
+            f"(当前并发: {pending_count + 1}/{self.max_workers}, "
+            f"帧数: {len(frames)})"
+        )
+        submitted_futures[0].add_done_callback(
+            lambda completed: self._on_future_done(
+                round_id,
+                completed,
+                work_runtime_v1,
+            )
+        )
+        return True
     
-    def _worker(self, round_id: int, frames: List[np.ndarray]) -> Optional[PerceptionData]:
+    def _worker(
+        self,
+        task: _PerceptionTaskV1,
+        work_runtime_v1: SessionWorkRuntimeV1 | None,
+    ) -> Optional[PerceptionData]:
         """
         工作线程：执行 API 调用
         
@@ -126,15 +185,55 @@ class AsyncPerceptionManager:
         Returns:
             Optional[PerceptionData]: 感知数据或 None
         """
+        round_id = task.round_id
+        work_item = task.work_item_v1
         try:
-            logger.debug(f"[AsyncPerceptionManager] [Round-{round_id}] 工作线程开始执行")
-            result = self.vision_model.generate_perception(frames, round_id=round_id)
+            if work_runtime_v1 is not None:
+                if (
+                    work_item is None
+                    or not work_runtime_v1.validate_work_v1(
+                        work_item.registered_work,
+                        WorkValidationBoundaryV1.QUEUE_DEQUEUE,
+                    )
+                    or not work_runtime_v1.validate_work_v1(
+                        work_item.registered_work,
+                        WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                    )
+                ):
+                    return None
+            logger.debug(
+                f"[AsyncPerceptionManager] [Round-{round_id}] "
+                "工作线程开始执行"
+            )
+            result = self.vision_model.generate_perception(
+                task.frames,
+                round_id=round_id,
+            )
+            if (
+                work_runtime_v1 is not None
+                and (
+                    work_item is None
+                    or not work_runtime_v1.validate_work_v1(
+                        work_item.registered_work,
+                        WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                    )
+                )
+            ):
+                return None
             return result
-        except Exception as e:
-            logger.error(f"[AsyncPerceptionManager] [Round-{round_id}] 工作线程异常: {e}")
+        except Exception:
+            logger.error(
+                f"[AsyncPerceptionManager] [Round-{round_id}] "
+                "PERCEPTION_INFERENCE_FAILED"
+            )
             return None
     
-    def _on_future_done(self, round_id: int, future: Future):
+    def _on_future_done(
+        self,
+        round_id: int,
+        future: Future,
+        work_runtime_v1: SessionWorkRuntimeV1 | None,
+    ):
         """
         Future 完成回调
         
@@ -145,20 +244,57 @@ class AsyncPerceptionManager:
         # 从 pending 中移除
         with self.pending_lock:
             self.pending_futures.pop(round_id, None)
+            task = self.pending_tasks_v1.pop(round_id, None)
         
         # 获取结果
         try:
             result = future.result()
-        except Exception as e:
-            logger.error(f"[AsyncPerceptionManager] [Round-{round_id}] 获取结果异常: {e}")
+        except Exception:
+            logger.error(
+                f"[AsyncPerceptionManager] [Round-{round_id}] "
+                "PERCEPTION_FUTURE_FAILED"
+            )
             result = None
-        
-        self.total_completed += 1
-        
-        # 处理结果（最新优先策略）
-        self._handle_result(round_id, result)
+
+        work_item = task.work_item_v1 if task is not None else None
+        try:
+            if work_runtime_v1 is not None and work_item is not None:
+                with work_runtime_v1.activate_work_v1(
+                    work_item.registered_work,
+                    work_item.envelope_ref,
+                ):
+                    def complete_live_callback() -> None:
+                        self.total_completed += 1
+                        self._handle_result(
+                            round_id,
+                            result,
+                            work_runtime_v1,
+                            work_item,
+                        )
+
+                    if not work_runtime_v1.perform_if_live_v1(
+                        work_item.registered_work,
+                        WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                        complete_live_callback,
+                    ):
+                        work_runtime_v1.log_late_drop_v1(
+                            work_item.registered_work,
+                            "PERCEPTION_CALLBACK",
+                        )
+            else:
+                self.total_completed += 1
+                self._handle_result(round_id, result, None, work_item)
+        finally:
+            if work_runtime_v1 is not None and work_item is not None:
+                work_item.release_once_v1(work_runtime_v1)
     
-    def _handle_result(self, round_id: int, result: Optional[PerceptionData]):
+    def _handle_result(
+        self,
+        round_id: int,
+        result: Optional[PerceptionData],
+        work_runtime_v1: SessionWorkRuntimeV1 | None,
+        work_item_v1: WorkBoundItemV1 | None,
+    ):
         """
         处理结果：最新优先策略
         
@@ -181,8 +317,17 @@ class AsyncPerceptionManager:
             
             # 结果为空也需要更新 last_sent_round，防止旧轮次覆盖
             if result is None:
-                logger.info(f"[AsyncPerceptionManager] [Round-{round_id}] ⚠️ 结果为空，但更新轮次标记")
-                self.last_sent_round = round_id
+                def mark_empty_complete() -> None:
+                    self.last_sent_round = round_id
+
+                if work_runtime_v1 is None:
+                    mark_empty_complete()
+                elif work_item_v1 is not None:
+                    work_runtime_v1.perform_if_live_v1(
+                        work_item_v1.registered_work,
+                        WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        mark_empty_complete,
+                    )
                 return
             
             # 立即发送结果
@@ -193,13 +338,30 @@ class AsyncPerceptionManager:
             
             if self.on_result_callback:
                 try:
-                    logger.info(f"[AsyncPerceptionManager] [Round-{round_id}] 📤 立即发送结果到 Manager")
-                    self.on_result_callback(round_id, result)
-                except Exception as e:
-                    logger.error(f"[AsyncPerceptionManager] [Round-{round_id}] 回调执行异常: {e}")
+                    self.on_result_callback(
+                        round_id,
+                        result,
+                        work_item_v1,
+                    )
+                except Exception:
+                    logger.error(
+                        f"[AsyncPerceptionManager] [Round-{round_id}] "
+                        "PERCEPTION_CALLBACK_FAILED"
+                    )
             
             # 更新已发送的最大轮次
-            self.last_sent_round = round_id
+            if work_runtime_v1 is None:
+                self.last_sent_round = round_id
+            elif work_item_v1 is not None:
+                work_runtime_v1.perform_if_live_v1(
+                    work_item_v1.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                    lambda: setattr(
+                        self,
+                        "last_sent_round",
+                        round_id,
+                    ),
+                )
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
@@ -455,13 +617,16 @@ class OpenAIVisionModel(VisionModelInterface):
             )
             time_end = time.time()
             logger.info(f"[OpenAI Vision Model] {round_tag} ✅ API 调用完成，耗时: {time_end - time_start:.2f}s")
-        except Exception as exc:
+        except Exception:
             time_end = time.time()
             elapsed = time_end - time_start
             if elapsed >= self.api_timeout - 0.5:
                 logger.warning(f"[OpenAI Vision Model] {round_tag} ⏱️ API 调用超时 ({elapsed:.2f}s >= {self.api_timeout}s)，跳过本轮")
             else:
-                logger.warning(f"[OpenAI Vision Model] {round_tag} API call failed ({elapsed:.2f}s): {exc}")
+                logger.warning(
+                    f"[OpenAI Vision Model] {round_tag} "
+                    f"API_CALL_FAILED ({elapsed:.2f}s)"
+                )
             return None
 
         content = ""
@@ -478,7 +643,6 @@ class OpenAIVisionModel(VisionModelInterface):
             else:
                 content = (raw_content or "").strip()
 
-        logger.info(f"[OpenAI Vision Model] {round_tag} 📝 Response: {content}")
         parsed = self._parse_xml_response(content)
         if not parsed or not parsed.get("scene_summary"):
             logger.warning(f"[OpenAI Vision Model] {round_tag} Empty/invalid XML response, returning None")
@@ -567,16 +731,17 @@ class OpenAIVisionModel(VisionModelInterface):
                     data_url = ImageUtils.format_image(frame)
                     ImageUtils.save_base64_image(data_url, debug_save_path)
                     logger.info(f"[OpenAI Vision Model] Debug: saved frame to {debug_save_path}")
-                except Exception as save_exc:
-                    logger.warning(f"[OpenAI Vision Model] Failed to save debug frame: {save_exc}")
+                except Exception:
+                    logger.warning(
+                        "[OpenAI Vision Model] "
+                        "DEBUG_FRAME_SAVE_FAILED"
+                    )
 
             # 直接使用 ImageUtils.format_image，与 llm_handler_openai_compatible 一致
             return ImageUtils.format_image(frame)
             
-        except Exception as exc:
-            logger.warning(f"Failed to encode frame: {exc}")
-            import traceback
-            logger.warning(traceback.format_exc())
+        except Exception:
+            logger.warning("PERCEPTION_FRAME_ENCODING_FAILED")
             return None
 
     def _parse_xml_response(self, content: str) -> Dict[str, Any]:

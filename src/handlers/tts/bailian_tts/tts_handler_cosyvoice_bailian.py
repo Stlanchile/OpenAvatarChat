@@ -1,10 +1,8 @@
-import io
 import os
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Set, cast
-import librosa
+from dataclasses import dataclass
+from typing import Dict, Optional, cast
 import numpy as np
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -24,6 +22,15 @@ from chat_engine.data_models.chat_signal_type import ChatSignalType
 from chat_engine.data_models.chat_signal import ChatSignal, SignalFilterRule
 from chat_engine.data_models.chat_stream import StreamKey, ChatStreamIdentity
 from chat_engine.data_models.chat_stream_config import ChatStreamConfig
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
+)
 
 
 class TTSConfig(HandlerBaseConfigModel, BaseModel):
@@ -42,15 +49,24 @@ class BailianTTSSession:
     output_stream_key: Optional[StreamKey] = None
     synthesizer: Optional[SpeechSynthesizer] = None
     cancelled: bool = False
+    work_item_v1: Optional[WorkBoundItemV1] = None
+    work_runtime_v1: Optional[SessionWorkRuntimeV1] = None
 
     def reset(self):
         self.cancelled = True
+        had_active_synthesizer = self.synthesizer is not None
         if self.synthesizer is not None:
             try:
                 self.synthesizer.streaming_cancel()
             except Exception:
                 pass
             self.synthesizer = None
+        if (
+            not had_active_synthesizer
+            and self.work_item_v1 is not None
+            and self.work_runtime_v1 is not None
+        ):
+            self.work_item_v1.release_once_v1(self.work_runtime_v1)
 
 
 class TTSContext(HandlerContext):
@@ -60,12 +76,16 @@ class TTSContext(HandlerContext):
         self.api_links: Dict[StreamKey, BailianTTSSession] = {}
         self.dump_audio = False
         self.audio_dump_file = None
+        self._secure_generation_v1 = None
 
     @classmethod
     def _create_session(cls, input_stream: ChatStreamIdentity) -> BailianTTSSession:
         return BailianTTSSession(input_stream_id=input_stream)
 
     def handle_text_stream(self, data: ChatData, handler: 'HandlerTTS'):
+        if self.work_runtime_v1 is not None:
+            self._handle_text_stream_fenced_v1(data, handler)
+            return
         input_stream = data.stream_id
         input_stream_key = input_stream.key
 
@@ -119,6 +139,192 @@ class TTSContext(HandlerContext):
             logger.error(e)
             session.reset()
             self.api_links.pop(input_stream_key, None)
+
+    def _handle_text_stream_fenced_v1(
+        self,
+        data: ChatData,
+        handler: "HandlerTTS",
+    ) -> None:
+        runtime = self.work_runtime_v1
+        parent = self.current_work_v1()
+        input_stream = data.stream_id
+        if (
+            runtime is None
+            or parent is None
+            or input_stream is None
+            or input_stream.key is None
+        ):
+            return
+        input_stream_key = input_stream.key
+        generation = parent.fence.session_epoch.generation
+        old_sessions: list[BailianTTSSession] = []
+
+        if self._secure_generation_v1 != generation:
+            def replace_generation() -> None:
+                old_sessions.extend(self.api_links.values())
+                self.api_links.clear()
+                self._secure_generation_v1 = generation
+
+            if not runtime.perform_if_live_v1(
+                parent,
+                WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                replace_generation,
+            ):
+                return
+            for old_session in old_sessions:
+                old_session.reset()
+
+        session = self.api_links.get(input_stream_key)
+        if (
+            session is not None
+            and (
+                session.work_item_v1 is None
+                or not runtime.validate_work_v1(
+                    session.work_item_v1.registered_work,
+                    WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                )
+            )
+        ):
+            session.reset()
+            runtime.perform_if_live_v1(
+                parent,
+                WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                lambda: self.api_links.pop(input_stream_key, None),
+            )
+            session = None
+
+        if session is None:
+            try:
+                work = runtime.register_child_work_v1(
+                    parent,
+                    WorkOperationKindV1.TTS_SYNTHESIS,
+                )
+            except WorkAdmissionDeniedV1:
+                return
+            work_item = WorkBoundItemV1(
+                payload=None,
+                registered_work=work,
+                envelope_ref=self.current_work_envelope_v1(),
+            )
+            session = self._create_session(input_stream)
+            session.work_item_v1 = work_item
+            session.work_runtime_v1 = runtime
+            try:
+                with self.activate_work_v1(
+                    work,
+                    work_item.envelope_ref,
+                ):
+                    streamer = self.data_submitter.get_streamer(
+                        ChatDataType.AVATAR_AUDIO
+                    )
+                    if streamer is None:
+                        work_item.release_once_v1(runtime)
+                        return
+                    output_stream_id = streamer.new_stream(
+                        sources=[session.input_stream_id],
+                        name="bailian_tts",
+                        config=ChatStreamConfig(cancelable=True),
+                    )
+                    if output_stream_id is None:
+                        work_item.release_once_v1(runtime)
+                        return
+                    session.output_stream_key = output_stream_id.key
+                    if not runtime.perform_if_live_v1(
+                        work,
+                        WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        lambda: self.api_links.__setitem__(
+                            input_stream_key,
+                            session,
+                        ),
+                    ):
+                        work_item.release_once_v1(runtime)
+                        return
+            except Exception:
+                work_item.release_once_v1(runtime)
+                raise
+
+        work_item = session.work_item_v1
+        if work_item is None:
+            return
+        work = work_item.registered_work
+        text = data.data.get_main_data()
+        if text is not None:
+            text = re.sub(r"<\|.*?\|>", "", text)
+        text_end = data.is_last_data
+
+        try:
+            with self.activate_work_v1(work, work_item.envelope_ref):
+                if not runtime.validate_work_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                ):
+                    return
+                if not text_end:
+                    if session.synthesizer is None:
+                        streamer = self.data_submitter.get_streamer(
+                            ChatDataType.AVATAR_AUDIO
+                        )
+                        if streamer is None:
+                            return
+                        callback = CosyvoiceCallBack(
+                            context=self,
+                            output_definition=streamer.data_definition,
+                            session=session,
+                        )
+                        synthesizer = SpeechSynthesizer(
+                            model=handler.model_name,
+                            voice=handler.voice,
+                            callback=callback,
+                            format=(
+                                AudioFormat.PCM_24000HZ_MONO_16BIT
+                            ),
+                        )
+                        if not runtime.perform_if_live_v1(
+                            work,
+                            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                            lambda: setattr(
+                                session,
+                                "synthesizer",
+                                synthesizer,
+                            ),
+                        ):
+                            try:
+                                synthesizer.streaming_cancel()
+                            except Exception:
+                                pass
+                            return
+                    session.synthesizer.streaming_call(text)
+                else:
+                    if session.synthesizer is not None:
+                        session.synthesizer.streaming_call(text)
+                        session.synthesizer.streaming_complete()
+                    else:
+                        runtime.perform_if_live_v1(
+                            work,
+                            WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                            lambda: self.api_links.pop(
+                                input_stream_key,
+                                None,
+                            ),
+                        )
+                        work_item.release_once_v1(runtime)
+                if not runtime.validate_work_v1(
+                    work,
+                    WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                ):
+                    return
+        except Exception:
+            logger.error("BAILIAN_TTS_SYNTHESIS_FAILED")
+            runtime.perform_if_live_v1(
+                work,
+                WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                lambda: (
+                    self.api_links.pop(input_stream_key, None)
+                    if self.api_links.get(input_stream_key) is session
+                    else None
+                ),
+            )
+            session.reset()
 
 
 class HandlerTTS(HandlerBase, ABC):
@@ -203,6 +409,37 @@ class HandlerTTS(HandlerBase, ABC):
             stream_key = signal.related_stream.key
             if stream_key is None:
                 return
+            if context.work_runtime_v1 is not None:
+                runtime = context.work_runtime_v1
+                work = context.current_work_v1()
+                removed: list[BailianTTSSession] = []
+
+                def remove_session() -> None:
+                    session = context.api_links.pop(
+                        stream_key,
+                        None,
+                    )
+                    if session is not None:
+                        removed.append(session)
+                        return
+                    for key, candidate in tuple(
+                        context.api_links.items()
+                    ):
+                        if candidate.output_stream_key == stream_key:
+                            context.api_links.pop(key, None)
+                            removed.append(candidate)
+                            return
+
+                if work is not None:
+                    runtime.perform_if_live_v1(
+                        work,
+                        WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        remove_session,
+                    )
+                for session in removed:
+                    session.reset()
+                    logger.info("TTS_SESSION_CANCELLED")
+                return
             # 检查是否为我们的输入流被取消
             session = context.api_links.pop(stream_key, None)
             if session:
@@ -217,14 +454,21 @@ class HandlerTTS(HandlerBase, ABC):
                     context.api_links.pop(key, None)
                     return
 
+    def drain_registered_work_v1(
+        self,
+        context: HandlerContext,
+    ) -> None:
+        context = cast(TTSContext, context)
+        for session in tuple(context.api_links.values()):
+            try:
+                session.reset()
+            except Exception:
+                logger.warning("BAILIAN_TTS_CANCEL_FAILED")
+
     def destroy_context(self, context: HandlerContext):
         context = cast(TTSContext, context)
         logger.info('destroy context')
-        for session in context.api_links.values():
-            try:
-                session.reset()
-            except Exception as e:
-                logger.opt(exception=e).warning("Failed to reset BailianTTS session on destroy")
+        self.drain_registered_work_v1(context)
         context.api_links.clear()
         if context.audio_dump_file is not None:
             try:
@@ -247,6 +491,60 @@ class CosyvoiceCallBack(ResultCallback):
     def is_cancelled(self) -> bool:
         return self.session.cancelled
 
+    @property
+    def _work_item_v1(self) -> WorkBoundItemV1 | None:
+        return self.session.work_item_v1
+
+    @property
+    def _work_runtime_v1(self) -> SessionWorkRuntimeV1 | None:
+        return self.session.work_runtime_v1
+
+    def _is_live_v1(
+        self,
+        boundary: WorkValidationBoundaryV1,
+    ) -> bool:
+        runtime = self._work_runtime_v1
+        item = self._work_item_v1
+        return (
+            runtime is None
+            or (
+                item is not None
+                and runtime.validate_work_v1(
+                    item.registered_work,
+                    boundary,
+                )
+            )
+        )
+
+    def _release_v1(self) -> None:
+        runtime = self._work_runtime_v1
+        item = self._work_item_v1
+        if runtime is not None and item is not None:
+            item.release_once_v1(runtime)
+
+    def _finish_session_state_v1(self) -> None:
+        runtime = self._work_runtime_v1
+        item = self._work_item_v1
+
+        def finish_state() -> None:
+            self.session.synthesizer = None
+            stream_key = self.session.input_stream_id.key
+            if (
+                stream_key is not None
+                and self.context.api_links.get(stream_key)
+                is self.session
+            ):
+                self.context.api_links.pop(stream_key, None)
+
+        if runtime is None:
+            finish_state()
+        elif item is not None:
+            runtime.perform_if_live_v1(
+                item.registered_work,
+                WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                finish_state,
+            )
+
     def on_open(self) -> None:
         logger.info('TTS: WebSocket connected')
 
@@ -262,46 +560,142 @@ class CosyvoiceCallBack(ResultCallback):
             return
         output = DataBundle(self.output_definition)
         output.set_main_data(np.zeros(shape=(1, 240), dtype=np.float32))
-        self.context.submit_data(output, finish_stream=True)
+        runtime = self._work_runtime_v1
+        item = self._work_item_v1
+        if runtime is None:
+            self.context.submit_data(output, finish_stream=True)
+        elif item is not None:
+            with self.context.activate_work_v1(
+                item.registered_work,
+                item.envelope_ref,
+            ):
+                runtime.perform_if_live_v1(
+                    item.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                    lambda: self.context.submit_data(
+                        output,
+                        finish_stream=True,
+                    ),
+                )
 
     def on_data(self, data: bytes) -> None:
         if self.is_cancelled:
             return
-        self.temp_bytes += data
-        if len(self.temp_bytes) > 24000:
-            output_audio = np.array(np.frombuffer(self.temp_bytes, dtype=np.int16)).astype(
-                np.float32) / 32767
+        runtime = self._work_runtime_v1
+        item = self._work_item_v1
+        if not self._is_live_v1(
+            WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK
+        ):
+            self.temp_bytes = b""
+            if runtime is not None and item is not None:
+                runtime.log_late_drop_v1(
+                    item.registered_work,
+                    "BAILIAN_TTS_DATA",
+                )
+            return
+        emit_bytes: list[bytes] = []
+
+        def buffer_audio() -> None:
+            self.temp_bytes += data
+            if len(self.temp_bytes) > 24000:
+                emit_bytes.append(self.temp_bytes)
+                self.temp_bytes = b""
+
+        if runtime is None:
+            buffer_audio()
+        elif item is None or not runtime.perform_if_live_v1(
+            item.registered_work,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            buffer_audio,
+        ):
+            return
+        if emit_bytes:
+            output_audio = np.array(np.frombuffer(emit_bytes[0], dtype=np.int16)).astype(
+                np.float32
+            ) / 32767
             output_audio = output_audio[np.newaxis, ...]
             output = DataBundle(self.output_definition)
             output.set_main_data(output_audio)
-            self.context.submit_data(output)
-            self.temp_bytes = b''
+            if runtime is None:
+                self.context.submit_data(output)
+            elif item is not None:
+                with self.context.activate_work_v1(
+                    item.registered_work,
+                    item.envelope_ref,
+                ):
+                    runtime.perform_if_live_v1(
+                        item.registered_work,
+                        WorkValidationBoundaryV1.BEFORE_EGRESS,
+                        lambda: self.context.submit_data(output),
+                    )
 
     def on_complete(self) -> None:
-        if self.is_cancelled:
-            self.temp_bytes = b''
-            logger.info('TTS: Synthesis cancelled, skipping output in on_complete')
-            return
-        if len(self.temp_bytes) > 0:
-            output_audio = np.array(np.frombuffer(self.temp_bytes, dtype=np.int16)).astype(np.float32) / 32767
-            output_audio = output_audio[np.newaxis, ...]
-            output = DataBundle(self.output_definition)
-            output.set_main_data(output_audio)
-            self.context.submit_data(output)
-            self.temp_bytes = b''
-        self._submit_end_frame()
-        logger.info('TTS: Synthesis complete')
+        try:
+            if self.is_cancelled or not self._is_live_v1(
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK
+            ):
+                self.temp_bytes = b""
+                return
+            runtime = self._work_runtime_v1
+            item = self._work_item_v1
+            remaining: list[bytes] = []
+
+            def take_remaining() -> None:
+                if self.temp_bytes:
+                    remaining.append(self.temp_bytes)
+                    self.temp_bytes = b""
+
+            if runtime is None:
+                take_remaining()
+            elif item is not None:
+                runtime.perform_if_live_v1(
+                    item.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    take_remaining,
+                )
+            if remaining:
+                output_audio = np.array(
+                    np.frombuffer(remaining[0], dtype=np.int16)
+                ).astype(np.float32) / 32767
+                output = DataBundle(self.output_definition)
+                output.set_main_data(output_audio[np.newaxis, ...])
+                if runtime is None:
+                    self.context.submit_data(output)
+                elif item is not None:
+                    with self.context.activate_work_v1(
+                        item.registered_work,
+                        item.envelope_ref,
+                    ):
+                        runtime.perform_if_live_v1(
+                            item.registered_work,
+                            WorkValidationBoundaryV1.BEFORE_EGRESS,
+                            lambda: self.context.submit_data(output),
+                        )
+            self._finish_session_state_v1()
+            self._submit_end_frame()
+            logger.info("TTS_SYNTHESIS_COMPLETE")
+        finally:
+            self._release_v1()
 
     def on_error(self, message) -> None:
-        if self.is_cancelled:
-            logger.info(f'TTS: Synthesis error after cancel (expected): {message}')
-            return
-        logger.error(f'TTS: Service error: {message}')
-        self._submit_end_frame()
+        del message
+        try:
+            if self.is_cancelled:
+                return
+            if not self._is_live_v1(
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK
+            ):
+                return
+            logger.error("BAILIAN_TTS_SERVICE_ERROR")
+            self._finish_session_state_v1()
+            self._submit_end_frame()
+        finally:
+            self._release_v1()
 
     def on_close(self) -> None:
         if self.is_cancelled:
-            self.temp_bytes = b''
-            logger.info('TTS: Synthesis cancelled, skipping output in on_close')
-            return
-        logger.info('TTS: WebSocket closed')
+            self.temp_bytes = b""
+        else:
+            self._finish_session_state_v1()
+        logger.info("BAILIAN_TTS_TRANSPORT_CLOSED")
+        self._release_v1()

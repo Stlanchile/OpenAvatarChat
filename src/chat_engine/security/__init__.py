@@ -23,8 +23,8 @@ from chat_engine.security.envelope import (
 from chat_engine.security.epochs import SessionEpochV1
 from chat_engine.security.session_work_controller import (
     COMPLETED_CLEANUP_TOMBSTONES_V1,
-    GenerationRetirementReasonV1,
     RETIRED_GENERATION_CLEANUP_TIMEOUT_SECONDS_V1,
+    GenerationRetirementReasonV1,
     SessionGenerationOverflowV1,
     SessionWorkControllerV1,
     WorkAdmissionDeniedV1,
@@ -38,16 +38,21 @@ from chat_engine.security.work_fence import (
     WorkOperationKindV1,
     WorkValidationBoundaryV1,
 )
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
+    WorkExecutionScopeV1,
+)
 
 __all__ = [
+    "COMPLETED_CLEANUP_TOMBSTONES_V1",
+    "RETIRED_GENERATION_CLEANUP_TIMEOUT_SECONDS_V1",
     "CleanupActionV1",
     "CleanupTokenV1",
-    "COMPLETED_CLEANUP_TOMBSTONES_V1",
     "ConsumerCapabilityV1",
     "EgressPolicyV1",
     "GenerationRetirementReasonV1",
     "GenerationRetirementV1",
-    "RETIRED_GENERATION_CLEANUP_TIMEOUT_SECONDS_V1",
     "RegisteredWorkV1",
     "RetentionPolicyV1",
     "RetiredGenerationCleanupFenceV1",
@@ -60,10 +65,13 @@ __all__ = [
     "SessionEpochV1",
     "SessionGenerationOverflowV1",
     "SessionWorkControllerV1",
+    "SessionWorkRuntimeV1",
     "TrustedLineageV1",
     "WorkAdmissionDeniedV1",
+    "WorkBoundItemV1",
     "WorkCancellationSignalV1",
     "WorkControllerFailureReasonV1",
+    "WorkExecutionScopeV1",
     "WorkFenceV1",
     "WorkLeaseV1",
     "WorkOperationKindV1",

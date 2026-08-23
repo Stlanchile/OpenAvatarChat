@@ -7,7 +7,7 @@ import json
 import threading
 import time
 from abc import ABC
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, cast
 
 import numpy as np
@@ -21,6 +21,13 @@ from chat_engine.data_models.chat_data.chat_data_model import ChatData
 from chat_engine.data_models.chat_data_type import ChatDataType
 from chat_engine.data_models.chat_engine_config_data import ChatEngineConfigModel, HandlerBaseConfigModel
 from chat_engine.data_models.runtime_data.data_bundle import DataBundle, DataBundleDefinition, DataBundleEntry
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    RegisteredWorkV1,
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import WorkBoundItemV1
 
 from handlers.agent.agent_data_models import PerceptionData, EnvironmentEvent
 from handlers.agent.perception.vision_model_interface import (
@@ -29,6 +36,8 @@ from handlers.agent.perception.vision_model_interface import (
     OpenAIVisionModel,
     AsyncPerceptionManager,
 )
+
+_PERCEPTION_HEARTBEAT_LIFECYCLE_SECONDS_V1 = 24 * 60 * 60
 
 
 class PerceptionConfig(HandlerBaseConfigModel, BaseModel):
@@ -112,6 +121,10 @@ class PerceptionContext(HandlerContext):
         self.frame_stall_threshold: float = 10.0  # 超过此秒数未收到帧则告警
         self.frame_resumed_after_stall: bool = False
         self._heartbeat_stop: threading.Event = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_work_lock_v1 = threading.Lock()
+        self._heartbeat_work_v1: Optional[RegisteredWorkV1] = None
+        self._secure_generation_v1: Optional[int] = None
 
 
 class PerceptionHandler(HandlerBase, ABC):
@@ -162,7 +175,14 @@ class PerceptionHandler(HandlerBase, ABC):
         context.async_manager = AsyncPerceptionManager(
             vision_model=context.vision_model,
             max_workers=context.config.max_concurrent_requests,
-            on_result_callback=lambda round_id, data: self._on_async_result(context, round_id, data),
+            on_result_callback=lambda round_id, data, work_item: (
+                self._on_async_result(
+                    context,
+                    round_id,
+                    data,
+                    work_item,
+                )
+            ),
         )
         
         logger.info(f"PerceptionContext created for session {context.session_id} "
@@ -191,6 +211,20 @@ class PerceptionHandler(HandlerBase, ABC):
         context = cast(PerceptionContext, handler_context)
         if context.vision_model:
             context.vision_model.warmup()
+        runtime = context.work_runtime_v1
+        if runtime is not None:
+            try:
+                heartbeat_work = runtime.register_root_work_v1(
+                    WorkOperationKindV1.PERCEPTION_HEARTBEAT,
+                    deadline_monotonic=(
+                        time.monotonic()
+                        + _PERCEPTION_HEARTBEAT_LIFECYCLE_SECONDS_V1
+                    ),
+                )
+            except WorkAdmissionDeniedV1:
+                heartbeat_work = None
+            with context._heartbeat_work_lock_v1:
+                context._heartbeat_work_v1 = heartbeat_work
         
         # 启动帧心跳监控线程
         heartbeat_thread = threading.Thread(
@@ -200,22 +234,135 @@ class PerceptionHandler(HandlerBase, ABC):
             name=f"perception-heartbeat-{context.session_id}",
         )
         heartbeat_thread.start()
+        context._heartbeat_thread = heartbeat_thread
+
+    @staticmethod
+    def _heartbeat_work_snapshot_v1(
+        context: PerceptionContext,
+    ) -> RegisteredWorkV1 | None:
+        with context._heartbeat_work_lock_v1:
+            return context._heartbeat_work_v1
+
+    @staticmethod
+    def _release_heartbeat_work_if_matches_v1(
+        context: PerceptionContext,
+        expected: RegisteredWorkV1,
+    ) -> None:
+        runtime = context.work_runtime_v1
+        should_release = False
+        with context._heartbeat_work_lock_v1:
+            if context._heartbeat_work_v1 is expected:
+                context._heartbeat_work_v1 = None
+                should_release = True
+        if should_release and runtime is not None:
+            runtime.release_work_v1(expected)
+
+    def _refresh_heartbeat_from_frame_v1(
+        self,
+        context: PerceptionContext,
+        parent: RegisteredWorkV1,
+    ) -> None:
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            return
+        existing = self._heartbeat_work_snapshot_v1(context)
+        if (
+            existing is not None
+            and existing.fence.session_epoch
+            == parent.fence.session_epoch
+            and runtime.validate_work_v1(
+                existing,
+                WorkValidationBoundaryV1.ADMISSION,
+            )
+        ):
+            return
+        try:
+            replacement = runtime.register_child_work_v1(
+                parent,
+                WorkOperationKindV1.PERCEPTION_HEARTBEAT,
+                deadline_monotonic=(
+                    time.monotonic()
+                    + _PERCEPTION_HEARTBEAT_LIFECYCLE_SECONDS_V1
+                ),
+            )
+        except WorkAdmissionDeniedV1:
+            return
+        replaced: list[RegisteredWorkV1 | None] = []
+
+        def swap_heartbeat() -> None:
+            with context._heartbeat_work_lock_v1:
+                replaced.append(context._heartbeat_work_v1)
+                context._heartbeat_work_v1 = replacement
+
+        if not runtime.perform_if_live_v1(
+            parent,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            swap_heartbeat,
+        ):
+            runtime.release_work_v1(replacement)
+            return
+        if replaced and replaced[0] is not None:
+            runtime.release_work_v1(replaced[0])
     
     def _frame_heartbeat_monitor(self, context: PerceptionContext):
         """后台线程：定期检查摄像头帧是否仍在到达"""
         check_interval = 5.0
-        while not context._heartbeat_stop.wait(timeout=check_interval):
+        while not context._heartbeat_stop.is_set():
+            runtime = context.work_runtime_v1
+            heartbeat_work = self._heartbeat_work_snapshot_v1(
+                context
+            )
+            if runtime is not None:
+                if heartbeat_work is None:
+                    context._heartbeat_stop.wait(timeout=0.1)
+                    continue
+                wait_deadline = time.monotonic() + check_interval
+                while not context._heartbeat_stop.is_set():
+                    remaining = wait_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if heartbeat_work.cancellation.wait(
+                        timeout=min(remaining, 0.1)
+                    ):
+                        break
+                if context._heartbeat_stop.is_set():
+                    break
+                if not runtime.validate_work_v1(
+                    heartbeat_work,
+                    WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                ):
+                    self._release_heartbeat_work_if_matches_v1(
+                        context,
+                        heartbeat_work,
+                    )
+                    continue
+            elif context._heartbeat_stop.wait(timeout=check_interval):
+                break
             if context.last_frame_time == 0.0:
                 continue
             
             gap = time.time() - context.last_frame_time
             if gap >= context.frame_stall_threshold and not context.frame_stall_warned:
-                context.frame_stall_warned = True
-                logger.warning(
-                    f"[Perception] ⚠️ 摄像头帧中断! 已 {gap:.1f}s 未收到新帧 "
-                    f"(阈值: {context.frame_stall_threshold}s, "
-                    f"已处理帧数: {context.frame_count})"
-                )
+                if runtime is None:
+                    context.frame_stall_warned = True
+                    logger.warning(
+                        f"[Perception] ⚠️ 摄像头帧中断! 已 {gap:.1f}s 未收到新帧 "
+                        f"(阈值: {context.frame_stall_threshold}s, "
+                        f"已处理帧数: {context.frame_count})"
+                    )
+                elif (
+                    heartbeat_work is not None
+                    and runtime.perform_if_live_v1(
+                        heartbeat_work,
+                        WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        lambda: setattr(
+                            context,
+                            "frame_stall_warned",
+                            True,
+                        ),
+                    )
+                ):
+                    logger.warning("PERCEPTION_FRAME_STALLED")
     
     def get_handler_detail(self, session_context: SessionContext,
                            context: HandlerContext) -> HandlerDetail:
@@ -264,6 +411,14 @@ class PerceptionHandler(HandlerBase, ABC):
         frame = inputs.data.get_main_data()
         if frame is None:
             logger.warning("[Perception] 收到空帧数据")
+            return
+
+        if context.work_runtime_v1 is not None:
+            self._handle_fenced_frame_v1(
+                context,
+                frame,
+                output_definitions,
+            )
             return
         
         current_time = time.time()
@@ -323,6 +478,78 @@ class PerceptionHandler(HandlerBase, ABC):
         
         # 更新上一帧
         context.previous_frame = frame
+
+    def _handle_fenced_frame_v1(
+        self,
+        context: PerceptionContext,
+        frame: np.ndarray,
+        output_definitions: Dict[ChatDataType, HandlerDataInfo],
+    ) -> None:
+        runtime = context.work_runtime_v1
+        work = context.current_work_v1()
+        if (
+            runtime is None
+            or work is None
+            or not runtime.validate_work_v1(
+                work,
+                WorkValidationBoundaryV1.ADMISSION,
+            )
+        ):
+            return
+        self._refresh_heartbeat_from_frame_v1(
+            context,
+            work,
+        )
+
+        should_generate: list[bool] = []
+
+        def mutate_frame_state() -> None:
+            generation = work.fence.session_epoch.generation
+            if context._secure_generation_v1 != generation:
+                context.frame_buffer.clear()
+                context.current_perception = None
+                context.previous_frame = None
+                context.last_event_times.clear()
+                context.last_summary_time = 0.0
+                context._secure_generation_v1 = generation
+
+            current_time = time.time()
+            if context.frame_stall_warned:
+                context.frame_stall_warned = False
+                context.frame_resumed_after_stall = True
+            context.last_frame_time = current_time
+
+            if context.fps_start_time == 0.0:
+                context.fps_start_time = current_time
+            context.fps_frame_count += 1
+            fps_elapsed = current_time - context.fps_start_time
+            if fps_elapsed >= context.fps_update_interval:
+                context.current_fps = (
+                    context.fps_frame_count / fps_elapsed
+                )
+                context.fps_start_time = current_time
+                context.fps_frame_count = 0
+
+            context.frame_count += 1
+            self._add_to_buffer(context, frame)
+            due = (
+                current_time - context.last_summary_time
+                >= context.config.summary_interval
+            )
+            should_generate.append(due)
+            context.previous_frame = frame
+
+        if not runtime.perform_if_live_v1(
+            work,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            mutate_frame_state,
+        ):
+            return
+        if should_generate and should_generate[0]:
+            self._generate_and_emit_perception(
+                context,
+                output_definitions,
+            )
     
     def _add_to_buffer(self, context: PerceptionContext, frame: np.ndarray):
         """添加帧到缓冲"""
@@ -345,6 +572,12 @@ class PerceptionHandler(HandlerBase, ABC):
     def _generate_and_emit_perception(self, context: PerceptionContext,
                                       output_definitions: Dict[ChatDataType, HandlerDataInfo]):
         """生成并发送感知数据（异步提交任务）"""
+        if context.work_runtime_v1 is not None:
+            self._generate_fenced_perception_v1(
+                context,
+                output_definitions,
+            )
+            return
         if not context.frame_buffer:
             logger.debug("[Perception] 帧缓冲为空，跳过摘要生成")
             return
@@ -391,9 +624,101 @@ class PerceptionHandler(HandlerBase, ABC):
             
         except Exception as e:
             logger.error(f"[Perception] ❌ 提交感知任务失败: {e}")
+
+    def _generate_fenced_perception_v1(
+        self,
+        context: PerceptionContext,
+        output_definitions: Dict[ChatDataType, HandlerDataInfo],
+    ) -> None:
+        runtime = context.work_runtime_v1
+        parent = context.current_work_v1()
+        if runtime is None or parent is None or context.async_manager is None:
+            return
+        try:
+            work = runtime.register_child_work_v1(
+                parent,
+                WorkOperationKindV1.PERCEPTION_INFERENCE,
+            )
+        except WorkAdmissionDeniedV1:
+            return
+
+        item = WorkBoundItemV1(
+            payload=dict(output_definitions),
+            registered_work=work,
+            envelope_ref=context.current_work_envelope_v1(),
+        )
+        prepared: list[tuple[int, List[np.ndarray]]] = []
+
+        def prepare_submission() -> None:
+            if not context.frame_buffer:
+                return
+            context.perception_round += 1
+            prepared.append(
+                (
+                    context.perception_round,
+                    context.frame_buffer.copy(),
+                )
+            )
+
+        try:
+            if not runtime.perform_if_live_v1(
+                work,
+                WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                prepare_submission,
+            ) or not prepared:
+                item.release_once_v1(runtime)
+                return
+            round_id, frames_snapshot = prepared[0]
+            if not runtime.validate_work_v1(
+                work,
+                WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+            ):
+                item.release_once_v1(runtime)
+                return
+            submitted = context.async_manager.submit_task(
+                round_id=round_id,
+                frames=frames_snapshot,
+                work_runtime_v1=runtime,
+                work_item_v1=item,
+            )
+            if not submitted:
+                runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    lambda: setattr(
+                        context,
+                        "perception_round",
+                        max(0, context.perception_round - 1),
+                    ),
+                )
+                item.release_once_v1(runtime)
+                return
+
+            runtime.perform_if_live_v1(
+                work,
+                WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                lambda: (
+                    context.frame_buffer.clear(),
+                    setattr(
+                        context,
+                        "last_summary_time",
+                        time.time(),
+                    ),
+                ),
+            )
+        except Exception:
+            item.release_once_v1(runtime)
+            logger.error(
+                "[Perception] PERCEPTION_SUBMISSION_FAILED"
+            )
     
-    def _on_async_result(self, context: PerceptionContext, round_id: int, 
-                         perception: Optional[PerceptionData]):
+    def _on_async_result(
+        self,
+        context: PerceptionContext,
+        round_id: int,
+        perception: Optional[PerceptionData],
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
         """
         异步任务完成回调
         
@@ -403,6 +728,17 @@ class PerceptionHandler(HandlerBase, ABC):
             perception: 感知数据（可能为 None 表示失败）
         """
         round_tag = f"[Round-{round_id}]"
+
+        if (
+            context.work_runtime_v1 is not None
+            and work_item_v1 is not None
+        ):
+            self._on_fenced_async_result_v1(
+                context,
+                perception,
+                work_item_v1,
+            )
+            return
         
         try:
             if perception is None:
@@ -439,9 +775,74 @@ class PerceptionHandler(HandlerBase, ABC):
             
         except Exception as e:
             logger.error(f"[Perception] {round_tag} ❌ 处理异步结果失败: {e}")
+
+    def _on_fenced_async_result_v1(
+        self,
+        context: PerceptionContext,
+        perception: Optional[PerceptionData],
+        work_item_v1: WorkBoundItemV1,
+    ) -> None:
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            return
+        work = work_item_v1.registered_work
+        if not runtime.validate_work_v1(
+            work,
+            WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+        ):
+            runtime.log_late_drop_v1(work, "PERCEPTION_RESULT")
+            return
+        if perception is None:
+            return
+        output_definitions = work_item_v1.payload
+        if not isinstance(output_definitions, dict):
+            return
+
+        if not runtime.perform_if_live_v1(
+            work,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            lambda: setattr(
+                context,
+                "current_perception",
+                perception,
+            ),
+        ):
+            return
+
+        output_def = output_definitions.get(
+            ChatDataType.PERCEPTION_CONTEXT
+        )
+        if output_def and output_def.definition:
+            output = DataBundle(output_def.definition)
+            output.set_main_data(
+                json.dumps(perception.to_dict(), ensure_ascii=False)
+            )
+            if not runtime.perform_if_live_v1(
+                work,
+                WorkValidationBoundaryV1.BEFORE_EGRESS,
+                lambda: context.submit_data(
+                    (ChatDataType.PERCEPTION_CONTEXT, output)
+                ),
+            ):
+                return
+
+        self._emit_detected_events(
+            context,
+            perception,
+            output_definitions,
+            "[fenced]",
+            work_item_v1=work_item_v1,
+        )
     
-    def _emit_detected_events(self, context: PerceptionContext, perception: PerceptionData,
-                              output_definitions: Dict[ChatDataType, HandlerDataInfo], round_tag: str):
+    def _emit_detected_events(
+        self,
+        context: PerceptionContext,
+        perception: PerceptionData,
+        output_definitions: Dict[ChatDataType, HandlerDataInfo],
+        round_tag: str,
+        *,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
         """
         检查并发送检测到的交互事件
         
@@ -465,6 +866,50 @@ class PerceptionHandler(HandlerBase, ABC):
             return
         
         for detected_event in triggerable_events:
+            if (
+                context.work_runtime_v1 is not None
+                and work_item_v1 is not None
+            ):
+                runtime = context.work_runtime_v1
+                work = work_item_v1.registered_work
+                env_event = EnvironmentEvent.from_detected_event(
+                    detected_event,
+                    urgency="high",
+                )
+                event_output = DataBundle(event_def.definition)
+                event_output.set_main_data(
+                    json.dumps(
+                        env_event.to_dict(),
+                        ensure_ascii=False,
+                    )
+                )
+
+                def publish_event() -> None:
+                    last_time = context.last_event_times.get(
+                        detected_event.event_type,
+                        0.0,
+                    )
+                    if (
+                        current_time - last_time
+                        < context.event_dedup_interval
+                    ):
+                        return
+                    context.last_event_times[
+                        detected_event.event_type
+                    ] = current_time
+                    context.submit_data(
+                        (
+                            ChatDataType.ENVIRONMENT_EVENT,
+                            event_output,
+                        )
+                    )
+
+                runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_EGRESS,
+                    publish_event,
+                )
+                continue
             # 事件去重检查
             last_time = context.last_event_times.get(detected_event.event_type, 0.0)
             if current_time - last_time < context.event_dedup_interval:
@@ -493,6 +938,19 @@ class PerceptionHandler(HandlerBase, ABC):
         
         # 停止心跳监控
         context._heartbeat_stop.set()
+        heartbeat_thread = context._heartbeat_thread
+        if (
+            heartbeat_thread is not None
+            and heartbeat_thread is not threading.current_thread()
+        ):
+            heartbeat_thread.join(timeout=1.0)
+        context._heartbeat_thread = None
+        heartbeat_work = self._heartbeat_work_snapshot_v1(context)
+        if heartbeat_work is not None:
+            self._release_heartbeat_work_if_matches_v1(
+                context,
+                heartbeat_work,
+            )
         
         # 关闭异步管理器（不等待，避免卡住）
         if context.async_manager:

@@ -5,6 +5,7 @@ WebSocket 输入端口会话委托
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -30,21 +31,28 @@ from .ws_binary_protocol import BinaryStreamAssembler, BinaryPacketSplitter
 from .ws_message_protocol import (
     parse_message, serialize_message,
     AvatarSessionInitialized, EchoHumanText, EchoAvatarText,
-    EchoAvatarAudio, AvatarHeartbeat, InterruptAccepted, InterruptAcceptedPayload, Error,
+    EchoAvatarAudio, AvatarHeartbeat, InterruptAccepted, Error,
     InterruptNotification, InterruptNotificationPayload,
     MessageHeader, EchoTextPayload, EchoAvatarAudioPayload, ErrorPayload, ErrorCode,
     InitializeAvatarSession, SendHumanAudio, SendHumanVideo,
     SendHumanText, TriggerHeartbeat, Interrupt, EndSpeech,
-    MotionDataMessage, MotionDataPayload, BinaryDataInfo, ChatSignalPayload, ChatSignalMessage, MessageType,
-    AudioFormat
+    MotionDataMessage, MotionDataPayload, BinaryDataInfo, ChatSignalPayload,
+    ChatSignalMessage, MessageType,
 )
 from .ws_opus_codec import (
     OpusEncoder, OpusDecoder,
     is_opus_available,
-    OpusStreamHeader,
     DEFAULT_OPUS_FRAME_SIZE_MS
 )
 from chat_engine.data_models.runtime_data.motion_data import MotionDataSerializer
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
+)
 
 
 @dataclass
@@ -172,6 +180,9 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         self.signal_emitter = None
         self.session_history = None  # SessionHistory for tracking client playback state
         self.stream_manager = None  # StreamManager for querying stream ancestry
+        self.work_runtime_v1: Optional[SessionWorkRuntimeV1] = None
+        self.work_consumer_capability_v1 = None
+        self._secure_generation_v1: Optional[int] = None
 
         self.signal_to_client_queue = asyncio.Queue()
 
@@ -259,6 +270,64 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
         return data
 
+    def _unwrap_output_item_v1(self, queued_item):
+        runtime = self.work_runtime_v1
+        if runtime is None:
+            return queued_item, None
+        if not isinstance(queued_item, WorkBoundItemV1):
+            return None, None
+        if not runtime.validate_work_v1(
+            queued_item.registered_work,
+            WorkValidationBoundaryV1.QUEUE_DEQUEUE,
+        ):
+            runtime.log_late_drop_v1(
+                queued_item.registered_work,
+                "WS_QUEUE_DEQUEUE",
+            )
+            return None, queued_item
+        return queued_item.payload, queued_item
+
+    def _work_scope_v1(self, item: WorkBoundItemV1 | None):
+        runtime = self.work_runtime_v1
+        if runtime is None or item is None:
+            return contextlib.nullcontext()
+        return runtime.activate_work_v1(
+            item.registered_work,
+            item.envelope_ref,
+        )
+
+    def _make_current_ws_item_v1(
+        self,
+        payload,
+    ) -> WorkBoundItemV1 | None:
+        if self.work_runtime_v1 is None or self.data_submitter is None:
+            return None
+        maker = getattr(
+            self.data_submitter,
+            "make_current_work_item_v1",
+            None,
+        )
+        if not callable(maker):
+            return None
+        return maker(payload, WorkOperationKindV1.WS_EGRESS)
+
+    def _perform_output_mutation_v1(
+        self,
+        work_item_v1: WorkBoundItemV1 | None,
+        action,
+    ) -> bool:
+        runtime = self.work_runtime_v1
+        if runtime is None:
+            action()
+            return True
+        if work_item_v1 is None:
+            return False
+        return runtime.perform_item_egress_if_live_v1(
+            work_item_v1,
+            self.work_consumer_capability_v1,
+            action,
+        )
+
     def put_data(self, modality: EngineChannelType, data: Union[np.ndarray, str],
                  timestamp: Optional[Tuple[int, int]] = None,
                  samplerate: Optional[int] = None,
@@ -313,9 +382,26 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             data=data_bundle,
             timestamp=timestamp,
         )
-        self.data_submitter.submit(chat_data, finish_stream=is_last_data)
+        submit_ingress = getattr(
+            self.data_submitter,
+            "submit_ingress_v1",
+            None,
+        )
+        if callable(submit_ingress):
+            submit_ingress(
+                chat_data,
+                finish_stream=is_last_data,
+            )
+        else:
+            self.data_submitter.submit(
+                chat_data,
+                finish_stream=is_last_data,
+            )
 
-        if loopback:
+        # In secure mode the ordinary HUMAN_TEXT handler fanout creates the
+        # exact-parent WS_EGRESS work item.  A raw local loopback would bypass
+        # both M2 and M3 and is therefore intentionally legacy-only.
+        if loopback and self.work_runtime_v1 is None:
             self.output_queues[modality].put_nowait(chat_data)
 
     def get_timestamp(self) -> Tuple[int, int]:
@@ -339,14 +425,89 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             )
         return self._playback_streamer
 
-    def clear_data(self):
-        """清空所有队列和状态"""
+    def _ensure_playback_started_v1(
+        self,
+        chat_data: ChatData,
+        stream_key_str: str,
+        work_item_v1: WorkBoundItemV1 | None,
+    ) -> bool:
+        if stream_key_str in self._active_playback_stream_keys:
+            if (
+                self.work_runtime_v1 is not None
+                and work_item_v1 is not None
+            ):
+                return self.work_runtime_v1.item_egress_is_allowed_v1(
+                    work_item_v1,
+                    self.work_consumer_capability_v1,
+                )
+            return True
+
+        def open_playback() -> None:
+            self._active_playback_stream_keys[stream_key_str] = {
+                "start_time": time.monotonic(),
+                "stream_key": stream_key_str,
+            }
+            streamer = self._get_playback_streamer()
+            if streamer is not None:
+                sources = (
+                    [chat_data.stream_id]
+                    if chat_data.stream_id
+                    else []
+                )
+                streamer.open_stream(
+                    sources=sources,
+                    name=f"playback:{stream_key_str}",
+                )
+
+        if self.work_runtime_v1 is None or work_item_v1 is None:
+            open_playback()
+            return True
+        return self.work_runtime_v1.perform_item_egress_if_live_v1(
+            work_item_v1,
+            self.work_consumer_capability_v1,
+            open_playback,
+        )
+
+    def drain_application_output_v1(self) -> None:
+        """Release queued application output without closing transport state."""
+
         for data_queue in self.output_queues.values():
             while not data_queue.empty():
                 try:
-                    data_queue.get_nowait()
+                    queued_item = data_queue.get_nowait()
+                    if (
+                        self.work_runtime_v1 is not None
+                        and isinstance(
+                            queued_item,
+                            WorkBoundItemV1,
+                        )
+                    ):
+                        queued_item.release_once_v1(
+                            self.work_runtime_v1
+                        )
                 except Exception:
                     pass
+        while not self.signal_to_client_queue.empty():
+            try:
+                queued_signal = (
+                    self.signal_to_client_queue.get_nowait()
+                )
+                if (
+                    self.work_runtime_v1 is not None
+                    and isinstance(
+                        queued_signal,
+                        WorkBoundItemV1,
+                    )
+                ):
+                    queued_signal.release_once_v1(
+                        self.work_runtime_v1
+                    )
+            except Exception:
+                break
+
+    def clear_data(self):
+        """清空所有队列和状态"""
+        self.drain_application_output_v1()
         self.text_buffer.clear()
         self.binary_stream_assembler.clear()
         self.motion_welcome_sent = False
@@ -397,70 +558,237 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             await self._close_connection(connection_id)
         logger.info(f"All connections closed for session {self.session_id}")
 
+    async def retire_transport_async_v1(self) -> None:
+        """Close application tasks and sockets after controller cleanup."""
+
+        self.quit.set()
+        current_task = asyncio.current_task()
+        tasks = tuple(
+            task
+            for task in self.primary_tasks
+            if task is not current_task
+        )
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.primary_tasks = []
+        await self._close_all_connections()
+        self.clear_data()
+
     async def _get_connection_snapshot(self) -> List[ConnectionInfo]:
         async with self.connection_lock:
             return list(self.connection_infos.values())
 
-    async def _broadcast_json(self, json_data: dict):
+    async def _broadcast_json(
+        self,
+        json_data: dict,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
+        owned_item = False
+        if self.work_runtime_v1 is not None and work_item_v1 is None:
+            work_item_v1 = self._make_current_ws_item_v1(json_data)
+            if work_item_v1 is None:
+                return
+            owned_item = True
         targets = await self._get_connection_snapshot()
         stale: List[int] = []
-        async with self.websocket_send_lock:
-            for info in targets:
-                try:
-                    await info.websocket.send_json(json_data)
-                except Exception as e:
-                    logger.warning(f"Failed to send json to connection {info.connection_id}: {e}")
-                    stale.append(info.connection_id)
-        for connection_id in stale:
-            await self._close_connection(connection_id)
+        try:
+            async with self.websocket_send_lock:
+                for info in targets:
+                    try:
+                        if (
+                            work_item_v1 is not None
+                            and self.work_runtime_v1 is not None
+                        ):
+                            sent = await (
+                                self.work_runtime_v1
+                                .perform_item_egress_async_if_live_v1(
+                                    work_item_v1,
+                                    self.work_consumer_capability_v1,
+                                    lambda: info.websocket.send_json(
+                                        json_data
+                                    ),
+                                )
+                            )
+                            if not sent:
+                                return
+                        else:
+                            await info.websocket.send_json(json_data)
+                    except Exception as exception:
+                        if self.work_runtime_v1 is None:
+                            logger.warning(
+                                "Failed to send json to connection "
+                                f"{info.connection_id}: {exception}"
+                            )
+                        else:
+                            logger.warning("WS_JSON_SEND_FAILED")
+                        stale.append(info.connection_id)
+            for connection_id in stale:
+                await self._close_connection(connection_id)
+        finally:
+            if (
+                owned_item
+                and work_item_v1 is not None
+                and self.work_runtime_v1 is not None
+            ):
+                work_item_v1.release_once_v1(self.work_runtime_v1)
 
-    async def _broadcast_bytes(self, data: bytes):
+    async def _broadcast_bytes(
+        self,
+        data: bytes,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
         if not data:
             return
+        owned_item = False
+        if self.work_runtime_v1 is not None and work_item_v1 is None:
+            work_item_v1 = self._make_current_ws_item_v1(data)
+            if work_item_v1 is None:
+                return
+            owned_item = True
         targets = await self._get_connection_snapshot()
         stale: List[int] = []
-        async with self.websocket_send_lock:
-            for info in targets:
-                try:
-                    await info.websocket.send_bytes(data)
-                except Exception as e:
-                    logger.warning(f"Failed to send bytes to connection {info.connection_id}: {e}")
-                    stale.append(info.connection_id)
-        for connection_id in stale:
-            await self._close_connection(connection_id)
+        try:
+            async with self.websocket_send_lock:
+                for info in targets:
+                    try:
+                        if (
+                            work_item_v1 is not None
+                            and self.work_runtime_v1 is not None
+                        ):
+                            sent = await (
+                                self.work_runtime_v1
+                                .perform_item_egress_async_if_live_v1(
+                                    work_item_v1,
+                                    self.work_consumer_capability_v1,
+                                    lambda: info.websocket.send_bytes(data),
+                                )
+                            )
+                            if not sent:
+                                return
+                        else:
+                            await info.websocket.send_bytes(data)
+                    except Exception as exception:
+                        if self.work_runtime_v1 is None:
+                            logger.warning(
+                                "Failed to send bytes to connection "
+                                f"{info.connection_id}: {exception}"
+                            )
+                        else:
+                            logger.warning("WS_BYTES_SEND_FAILED")
+                        stale.append(info.connection_id)
+            for connection_id in stale:
+                await self._close_connection(connection_id)
+        finally:
+            if (
+                owned_item
+                and work_item_v1 is not None
+                and self.work_runtime_v1 is not None
+            ):
+                work_item_v1.release_once_v1(self.work_runtime_v1)
 
     async def _send_bytes_to_connection(self, connection_id: int, data: bytes):
         if not data:
             return
+        work_item_v1 = None
+        if self.work_runtime_v1 is not None:
+            work_item_v1 = self._make_current_ws_item_v1(data)
+            if work_item_v1 is None:
+                return
         async with self.connection_lock:
             info = self.connection_infos.get(connection_id)
         if info is None:
+            if work_item_v1 is not None:
+                work_item_v1.release_once_v1(self.work_runtime_v1)
             return
         try:
             async with self.websocket_send_lock:
-                await info.websocket.send_bytes(data)
-        except Exception as e:
-            logger.warning(f"Failed to send bytes to connection {connection_id}: {e}")
+                if (
+                    work_item_v1 is not None
+                    and self.work_runtime_v1 is not None
+                ):
+                    await (
+                        self.work_runtime_v1
+                        .perform_item_egress_async_if_live_v1(
+                            work_item_v1,
+                            self.work_consumer_capability_v1,
+                            lambda: info.websocket.send_bytes(data),
+                        )
+                    )
+                else:
+                    await info.websocket.send_bytes(data)
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.warning(
+                    "Failed to send bytes to connection "
+                    f"{connection_id}: {exception}"
+                )
+            else:
+                logger.warning("WS_DIRECT_BYTES_SEND_FAILED")
             await self._close_connection(connection_id)
+        finally:
+            if (
+                work_item_v1 is not None
+                and self.work_runtime_v1 is not None
+            ):
+                work_item_v1.release_once_v1(self.work_runtime_v1)
 
     async def _send_message_to_connection(self, connection_id: int, message):
         if not message:
             return
         json_data = serialize_message(message)
+        work_item_v1 = None
+        if self.work_runtime_v1 is not None:
+            work_item_v1 = self._make_current_ws_item_v1(json_data)
+            if work_item_v1 is None:
+                return
         async with self.connection_lock:
             info = self.connection_infos.get(connection_id)
         if info is None:
+            if work_item_v1 is not None:
+                work_item_v1.release_once_v1(self.work_runtime_v1)
             return
         try:
             async with self.websocket_send_lock:
-                await info.websocket.send_json(json_data)
-        except Exception as e:
-            logger.warning(f"Failed to send bytes to connection {connection_id}: {e}")
+                if (
+                    work_item_v1 is not None
+                    and self.work_runtime_v1 is not None
+                ):
+                    await (
+                        self.work_runtime_v1
+                        .perform_item_egress_async_if_live_v1(
+                            work_item_v1,
+                            self.work_consumer_capability_v1,
+                            lambda: info.websocket.send_json(json_data),
+                        )
+                    )
+                else:
+                    await info.websocket.send_json(json_data)
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.warning(
+                    "Failed to send message to connection "
+                    f"{connection_id}: {exception}"
+                )
+            else:
+                logger.warning("WS_DIRECT_JSON_SEND_FAILED")
             await self._close_connection(connection_id)
+        finally:
+            if (
+                work_item_v1 is not None
+                and self.work_runtime_v1 is not None
+            ):
+                work_item_v1.release_once_v1(self.work_runtime_v1)
 
-    async def _broadcast_message(self, message):
+    async def _broadcast_message(
+        self,
+        message,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
         json_data = serialize_message(message)
-        await self._broadcast_json(json_data)
+        await self._broadcast_json(json_data, work_item_v1)
 
     async def _maybe_send_motion_welcome_to_connection(self, info: ConnectionInfo):
         if self.motion_welcome_payload and not info.motion_welcome_sent:
@@ -477,7 +805,13 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             )
             await self._send_message_to_connection(info.connection_id, motion_welcome_message)
             await self._send_bytes_to_connection(info.connection_id, self.motion_welcome_payload)
-            info.motion_welcome_sent = True
+            self._perform_ingress_mutation_v1(
+                lambda: setattr(
+                    info,
+                    "motion_welcome_sent",
+                    True,
+                )
+            )
 
     # ========================================================================
     # WebSocket 消息处理
@@ -485,12 +819,39 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
     async def _send_message(self, websocket: WebSocket, message):
         """发送 JSON 消息"""
+        work_item_v1 = None
         try:
             json_data = serialize_message(message)
+            if self.work_runtime_v1 is not None:
+                work_item_v1 = self._make_current_ws_item_v1(json_data)
+                if work_item_v1 is None:
+                    return
             async with self.websocket_send_lock:
-                await websocket.send_json(json_data)
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}")
+                if (
+                    work_item_v1 is not None
+                    and self.work_runtime_v1 is not None
+                ):
+                    await (
+                        self.work_runtime_v1
+                        .perform_item_egress_async_if_live_v1(
+                            work_item_v1,
+                            self.work_consumer_capability_v1,
+                            lambda: websocket.send_json(json_data),
+                        )
+                    )
+                else:
+                    await websocket.send_json(json_data)
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.error(f"Failed to send message: {exception}")
+            else:
+                logger.error("WS_MESSAGE_SEND_FAILED")
+        finally:
+            if (
+                work_item_v1 is not None
+                and self.work_runtime_v1 is not None
+            ):
+                work_item_v1.release_once_v1(self.work_runtime_v1)
 
     async def _send_error(self, websocket: WebSocket, request_id: str, code: str, message: str):
         """发送错误消息"""
@@ -503,7 +864,10 @@ class WsInputSessionDelegate(ClientSessionDelegate):
     async def _handle_initialize_session(self, websocket: WebSocket, msg: InitializeAvatarSession,
                                          connection_info: ConnectionInfo):
         """处理会话初始化"""
-        logger.info(f"Initialize session: session_id={self.session_id}")
+        if self.work_runtime_v1 is None:
+            logger.info(f"Initialize session: session_id={self.session_id}")
+        else:
+            logger.info("WS_INITIALIZE_SESSION")
 
         if connection_info.role != "primary":
             if not self.initialized:
@@ -572,47 +936,52 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             )
             return False
 
-        # 保存音频配置
-        self.audio_format = audio_format_upper
-        self.audio_sample_rate = audio_config.sample_rate
-        self.audio_channels = audio_config.channels
-        self.opus_frame_size_ms = audio_config.opus_frame_size_ms or DEFAULT_OPUS_FRAME_SIZE_MS
-
-        # 初始化 Opus 编解码器
+        opus_frame_size_ms = (
+            audio_config.opus_frame_size_ms
+            or DEFAULT_OPUS_FRAME_SIZE_MS
+        )
+        opus_decoder = None
+        opus_encoder = None
         if audio_format_upper == "OPUS":
             try:
-                self._opus_decoder = OpusDecoder(
+                opus_decoder = OpusDecoder(
                     sample_rate=16000,  # 解码后统一转为 16kHz 供 VAD/ASR 使用
                     channels=1
                 )
                 # 编码器使用 24kHz（TTS 输出采样率）
-                self._opus_encoder = OpusEncoder(
+                opus_encoder = OpusEncoder(
                     sample_rate=24000,
                     channels=1,
-                    frame_size_ms=self.opus_frame_size_ms
+                    frame_size_ms=opus_frame_size_ms,
                 )
-                logger.info(f"Opus codec initialized for session {self.session_id}")
-            except Exception as e:
-                logger.error(f"Failed to initialize Opus codec: {e}")
+                if self.work_runtime_v1 is None:
+                    logger.info(
+                        "Opus codec initialized for session "
+                        f"{self.session_id}"
+                    )
+            except Exception as exception:
+                if self.work_runtime_v1 is None:
+                    logger.error(
+                        f"Failed to initialize Opus codec: {exception}"
+                    )
+                    error_message = (
+                        "Failed to initialize Opus codec: "
+                        f"{exception}"
+                    )
+                else:
+                    logger.error("WS_OPUS_INITIALIZATION_FAILED")
+                    error_message = "Failed to initialize Opus codec"
                 await self._send_error(
                     websocket,
                     msg.header.request_id,
                     ErrorCode.AUDIO_FORMAT_ERROR,
-                    f"Failed to initialize Opus codec: {str(e)}"
+                    error_message,
                 )
                 return False
-        else:
-            self._opus_encoder = None
-            self._opus_decoder = None
-
-        logger.info(
-            f"Audio config: format={self.audio_format}, sample_rate={self.audio_sample_rate}, "
-            f"channels={self.audio_channels}, opus_frame_size_ms={self.opus_frame_size_ms}"
-        )
 
         requested_subscriptions = msg.payload.subscriptions
         if requested_subscriptions is None:
-            self.subscriptions = set(self.AVAILABLE_SUBSCRIPTIONS)
+            subscriptions = set(self.AVAILABLE_SUBSCRIPTIONS)
         else:
             normalized = {
                 str(item).lower()
@@ -621,14 +990,44 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             }
             unknown = normalized.difference(self.AVAILABLE_SUBSCRIPTIONS)
             if unknown:
-                logger.warning(f"Unknown subscriptions {unknown}, ignoring.")
+                if self.work_runtime_v1 is None:
+                    logger.warning(
+                        f"Unknown subscriptions {unknown}, ignoring."
+                    )
+                else:
+                    logger.warning("WS_SUBSCRIPTION_UNKNOWN")
             filtered = normalized.intersection(self.AVAILABLE_SUBSCRIPTIONS)
             if not filtered:
                 filtered = set(self.AVAILABLE_SUBSCRIPTIONS)
-            self.subscriptions = filtered
-        logger.info(f"Session {self.session_id} subscriptions: {self.subscriptions}")
+            subscriptions = filtered
 
-        self.initialized = True
+        def commit_initialization() -> None:
+            self.audio_format = audio_format_upper
+            self.audio_sample_rate = audio_config.sample_rate
+            self.audio_channels = audio_config.channels
+            self.opus_frame_size_ms = opus_frame_size_ms
+            self._opus_decoder = opus_decoder
+            self._opus_encoder = opus_encoder
+            self.subscriptions = subscriptions
+            self.initialized = True
+
+        if not self._perform_ingress_mutation_v1(
+            commit_initialization
+        ):
+            return False
+        if self.work_runtime_v1 is None:
+            logger.info(
+                f"Audio config: format={self.audio_format}, "
+                f"sample_rate={self.audio_sample_rate}, "
+                f"channels={self.audio_channels}, "
+                f"opus_frame_size_ms={self.opus_frame_size_ms}"
+            )
+            logger.info(
+                f"Session {self.session_id} subscriptions: "
+                f"{self.subscriptions}"
+            )
+        else:
+            logger.info("WS_SESSION_INITIALIZED")
 
         # 发送初始化完成消息
         response = AvatarSessionInitialized(
@@ -649,17 +1048,31 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
             if audio_format == "OPUS":
                 # Opus 解码
-                if self._opus_decoder is None:
+                decoder = self._opus_decoder
+                if decoder is None:
                     # 尝试创建临时解码器
                     if not is_opus_available():
                         raise ValueError("OPUS format requested but opuslib is not available")
-                    self._opus_decoder = OpusDecoder(sample_rate=16000, channels=1)
+                    decoder = OpusDecoder(
+                        sample_rate=16000,
+                        channels=1,
+                    )
+                    if not self._perform_ingress_mutation_v1(
+                        lambda: setattr(
+                            self,
+                            "_opus_decoder",
+                            decoder,
+                        )
+                    ):
+                        return
 
-                audio_array = self._opus_decoder.decode(audio_bytes)
-                logger.debug(
-                    f"Opus decoded: {len(audio_bytes)} bytes -> {audio_array.size} samples, "
-                    f"session={self.session_id}"
-                )
+                audio_array = decoder.decode(audio_bytes)
+                if self.work_runtime_v1 is None:
+                    logger.debug(
+                        f"Opus decoded: {len(audio_bytes)} bytes -> "
+                        f"{audio_array.size} samples, "
+                        f"session={self.session_id}"
+                    )
             else:
                 # PCM 格式
                 audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
@@ -673,13 +1086,22 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             )
 
             # logger.debug(f"Received audio stream: {audio_array.size} samples, format={audio_format}, session={self.session_id}")
-        except Exception as e:
-            logger.error(f"Failed to process audio data: {e}")
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.error(
+                    f"Failed to process audio data: {exception}"
+                )
+                error_message = (
+                    f"Failed to process audio data: {exception}"
+                )
+            else:
+                logger.error("WS_AUDIO_INPUT_FAILED")
+                error_message = "Failed to process audio data"
             await self._send_error(
                 websocket,
                 msg.header.request_id,
                 ErrorCode.AUDIO_FORMAT_ERROR,
-                f"Failed to process audio data: {str(e)}"
+                error_message,
             )
 
     async def _process_send_human_audio(self, websocket: WebSocket, msg: SendHumanAudio):
@@ -704,11 +1126,13 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 )
                 return
             metadata = PendingBinaryMeta(kind="audio", message=msg)
-            self.binary_stream_assembler.register(
-                request_id=msg.header.request_id,
-                expected_segments=msg.payload.segment_num,
-                expected_size=msg.payload.binary_size,
-                metadata=metadata
+            self._perform_ingress_mutation_v1(
+                lambda: self.binary_stream_assembler.register(
+                    request_id=msg.header.request_id,
+                    expected_segments=msg.payload.segment_num,
+                    expected_size=msg.payload.binary_size,
+                    metadata=metadata,
+                )
             )
         elif transport == "base64":
             if not msg.payload.data_base64:
@@ -760,11 +1184,13 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 )
                 return
             metadata = PendingBinaryMeta(kind="video", message=msg)
-            self.binary_stream_assembler.register(
-                request_id=msg.header.request_id,
-                expected_segments=msg.payload.segment_num,
-                expected_size=msg.payload.binary_size,
-                metadata=metadata
+            self._perform_ingress_mutation_v1(
+                lambda: self.binary_stream_assembler.register(
+                    request_id=msg.header.request_id,
+                    expected_segments=msg.payload.segment_num,
+                    expected_size=msg.payload.binary_size,
+                    metadata=metadata,
+                )
             )
         elif transport == "base64":
             if not msg.payload.data_base64:
@@ -835,18 +1261,28 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 video_array
             )
 
-            logger.debug(
-                f"Received video frame: {video_array.shape}, format={format_upper}, "
-                f"session={self.session_id}"
-            )
+            if self.work_runtime_v1 is None:
+                logger.debug(
+                    f"Received video frame: {video_array.shape}, "
+                    f"format={format_upper}, session={self.session_id}"
+                )
 
-        except Exception as e:
-            logger.error(f"Failed to process video data: {e}")
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.error(
+                    f"Failed to process video data: {exception}"
+                )
+                error_message = (
+                    f"Failed to process video data: {exception}"
+                )
+            else:
+                logger.error("WS_VIDEO_INPUT_FAILED")
+                error_message = "Failed to process video data"
             await self._send_error(
                 websocket,
                 msg.header.request_id,
                 ErrorCode.VIDEO_FORMAT_ERROR,
-                f"Failed to process video data: {str(e)}"
+                error_message,
             )
 
     def _handle_end_speech(self, msg: EndSpeech):
@@ -893,8 +1329,14 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             streamer.finish_current()
             logger.info(f"CLIENT_PLAYBACK stream closed: stream_key={stream_key}")
 
-    def _ensure_motion_serializer(self):
-        if self.motion_data_serializer is None:
+    def _ensure_motion_serializer(
+        self,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ) -> bool:
+        if self.motion_data_serializer is not None:
+            return True
+
+        def initialize_serializer() -> None:
             self.motion_data_serializer = MotionDataSerializer()
             self.motion_data_serializer.register_audio_data("avatar_audio")
             self.motion_data_serializer.register_data(
@@ -903,9 +1345,18 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 "float32"
             )
             logger.info("Motion data serializer initialized")
+        return self._perform_output_mutation_v1(
+            work_item_v1,
+            initialize_serializer,
+        )
 
-    async def _send_motion_welcome(self, definition):
-        self._ensure_motion_serializer()
+    async def _send_motion_welcome(
+        self,
+        definition,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
+        if not self._ensure_motion_serializer(work_item_v1):
+            return
         try:
             welcome_data = self.motion_data_serializer.serialize(definition)
 
@@ -920,21 +1371,48 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                     end_of_speech=True
                 )
             )
-            await self._broadcast_message(motion_welcome_message)
-            self.motion_welcome_payload = welcome_data
+            await self._broadcast_message(
+                motion_welcome_message,
+                work_item_v1,
+            )
             async with self.connection_lock:
-                for info in self.connection_infos.values():
+                connection_infos = tuple(
+                    self.connection_infos.values()
+                )
+            await self._broadcast_bytes(
+                welcome_data,
+                work_item_v1,
+            )
+
+            def commit_welcome_state() -> None:
+                self.motion_welcome_payload = welcome_data
+                self.motion_welcome_sent = True
+                for info in connection_infos:
                     info.motion_welcome_sent = True
-            await self._broadcast_bytes(welcome_data)
-            self.motion_welcome_sent = True
-            logger.info(f"Motion welcome message broadcast, size={len(welcome_data)} bytes")
-        except Exception as e:
-            logger.error(f"Failed to send welcome message: {e}")
+
+            if not self._perform_output_mutation_v1(
+                work_item_v1,
+                commit_welcome_state,
+            ):
+                return
+            logger.info("WS_MOTION_WELCOME_SENT")
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.error(
+                    f"Failed to send welcome message: {exception}"
+                )
+            else:
+                logger.error("WS_MOTION_WELCOME_FAILED")
             raise
 
-    async def _send_motion_data(self, chat_data: ChatData):
+    async def _send_motion_data(
+        self,
+        chat_data: ChatData,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
         try:
-            self._ensure_motion_serializer()
+            if not self._ensure_motion_serializer(work_item_v1):
+                return
             binary_data = self.motion_data_serializer.serialize(
                 chat_data.data, start_of_stream=chat_data.is_first_data, end_of_stream=chat_data.is_last_data)
 
@@ -947,20 +1425,12 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 logger.debug(f"Skipping cancelled avatar audio: stream_key={stream_key_str}")
                 return
 
-            # Track client playback via lifecycle-only CLIENT_PLAYBACK stream
-            if stream_key_str not in self._active_playback_stream_keys:
-                self._active_playback_stream_keys[stream_key_str] = {
-                    "start_time": time.monotonic(),
-                    "stream_key": stream_key_str,
-                }
-
-                # Open a CLIENT_PLAYBACK lifecycle stream derived from AVATAR_AUDIO stream
-                # This auto-emits STREAM_BEGIN signal and auto-records to SessionHistory
-                streamer = self._get_playback_streamer()
-                if streamer is not None:
-                    sources = [chat_data.stream_id] if chat_data.stream_id else []
-                    streamer.open_stream(sources=sources, name=f"playback:{stream_key_str}")
-                    logger.info(f"CLIENT_PLAYBACK stream opened: stream_key={stream_key_str}")
+            if not self._ensure_playback_started_v1(
+                chat_data,
+                stream_key_str,
+                work_item_v1,
+            ):
+                return
 
             request_id = str(uuid4())
             segments = BinaryPacketSplitter.split(
@@ -982,19 +1452,37 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 )
             )
 
-            await self._broadcast_message(json_msg)
-            for segment in segments:
-                await self._broadcast_bytes(segment)
-
-            logger.debug(
-                f"Motion data sent: stream_key={stream_key_str}, size={len(binary_data)}, "
-                f"segments={len(segments)}, end_of_speech={end_of_speech}"
+            await self._broadcast_message(
+                json_msg,
+                work_item_v1,
             )
-        except Exception as e:
-            logger.error(f"Failed to send motion data: {e}")
+            for segment in segments:
+                await self._broadcast_bytes(
+                    segment,
+                    work_item_v1,
+                )
+
+            if self.work_runtime_v1 is None:
+                logger.debug(
+                    f"Motion data sent: stream_key={stream_key_str}, "
+                    f"size={len(binary_data)}, "
+                    f"segments={len(segments)}, "
+                    f"end_of_speech={end_of_speech}"
+                )
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.error(
+                    f"Failed to send motion data: {exception}"
+                )
+            else:
+                logger.error("WS_MOTION_DATA_SEND_FAILED")
             raise
 
-    async def _send_avatar_audio(self, chat_data: ChatData):
+    async def _send_avatar_audio(
+        self,
+        chat_data: ChatData,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
         if "avatar_audio" not in self.subscriptions:
             return
 
@@ -1041,26 +1529,19 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 return
             end_of_speech = chat_data.is_last_data
 
-            # Track client playback via lifecycle-only CLIENT_PLAYBACK stream
-            if stream_key_str not in self._active_playback_stream_keys:
-                self._active_playback_stream_keys[stream_key_str] = {
-                    "start_time": time.monotonic(),
-                    "stream_key": stream_key_str,
-                }
-
-                # Open a CLIENT_PLAYBACK lifecycle stream derived from AVATAR_AUDIO stream
-                # This auto-emits STREAM_BEGIN signal and auto-records to SessionHistory
-                streamer = self._get_playback_streamer()
-                if streamer is not None:
-                    sources = [chat_data.stream_id] if chat_data.stream_id else []
-                    streamer.open_stream(sources=sources, name=f"playback:{stream_key_str}")
-                    logger.info(f"CLIENT_PLAYBACK stream opened: stream_key={stream_key_str}")
+            if not self._ensure_playback_started_v1(
+                chat_data,
+                stream_key_str,
+                work_item_v1,
+            ):
+                return
 
             # 根据会话配置决定输出格式
             output_format = self.audio_format
             opus_frame_size_ms = None
 
-            if output_format == "OPUS" and self._opus_encoder is not None:
+            encoder = self._opus_encoder
+            if output_format == "OPUS" and encoder is not None:
                 # Opus 编码
                 try:
                     # 确保数据是 int16
@@ -1072,23 +1553,44 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                             audio_np = audio_np.astype(np.int16)
 
                     # 如果编码器采样率与音频不匹配，需要重新创建编码器
-                    if self._opus_encoder.sample_rate != sample_rate:
-                        self._opus_encoder = OpusEncoder(
+                    if encoder.sample_rate != sample_rate:
+                        encoder = OpusEncoder(
                             sample_rate=sample_rate,
                             channels=channels,
                             frame_size_ms=self.opus_frame_size_ms
                         )
+                        if not self._perform_output_mutation_v1(
+                            work_item_v1,
+                            lambda: setattr(
+                                self,
+                                "_opus_encoder",
+                                encoder,
+                            ),
+                        ):
+                            return
 
                     # 编码音频，在音频流结束时刷新残留缓冲区
-                    binary_data = self._opus_encoder.encode(audio_np, flush=end_of_speech)
+                    binary_data = encoder.encode(
+                        audio_np,
+                        flush=end_of_speech,
+                    )
                     opus_frame_size_ms = self.opus_frame_size_ms
 
-                    logger.debug(
-                        f"Opus encoded avatar audio: {audio_np.size} samples -> {len(binary_data)} bytes, "
-                        f"flush={end_of_speech}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Opus encoding failed, falling back to PCM: {e}")
+                    if self.work_runtime_v1 is None:
+                        logger.debug(
+                            "Opus encoded avatar audio: "
+                            f"{audio_np.size} samples -> "
+                            f"{len(binary_data)} bytes, "
+                            f"flush={end_of_speech}"
+                        )
+                except Exception as exception:
+                    if self.work_runtime_v1 is None:
+                        logger.warning(
+                            "Opus encoding failed, falling back "
+                            f"to PCM: {exception}"
+                        )
+                    else:
+                        logger.warning("WS_OPUS_ENCODING_FAILED")
                     output_format = "PCM"
                     binary_data = self._prepare_pcm_audio(audio_np)
             else:
@@ -1122,14 +1624,25 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 )
             )
 
-            await self._broadcast_message(message)
-
-            logger.debug(
-                f"Echo avatar audio sent ({output_format}): stream_key={stream_key_str}"
-                f"size={binary_size}, sample_rate={sample_rate}, channels={channels}, end={end_of_speech}"
+            await self._broadcast_message(
+                message,
+                work_item_v1,
             )
-        except Exception as e:
-            logger.error(f"Failed to send avatar audio: {e}")
+
+            if self.work_runtime_v1 is None:
+                logger.debug(
+                    f"Echo avatar audio sent ({output_format}): "
+                    f"stream_key={stream_key_str}"
+                    f"size={binary_size}, sample_rate={sample_rate}, "
+                    f"channels={channels}, end={end_of_speech}"
+                )
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.error(
+                    f"Failed to send avatar audio: {exception}"
+                )
+            else:
+                logger.error("WS_AVATAR_AUDIO_SEND_FAILED")
             raise
 
     def _prepare_pcm_audio(self, audio_np: np.ndarray) -> bytes:
@@ -1152,20 +1665,45 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         """
         try:
             stream_key_str = msg.payload.stream_key
-
-            # 根据模式处理文本
-            if msg.payload.mode == "increment":
-                # 增量模式：累积文本
-                if stream_key_str not in self.text_buffer:
-                    self.text_buffer[stream_key_str] = ""
-                self.text_buffer[stream_key_str] += msg.payload.text
-                full_text = self.text_buffer[stream_key_str]
+            if self.work_runtime_v1 is None:
+                # 根据模式处理文本
+                if msg.payload.mode == "increment":
+                    if stream_key_str not in self.text_buffer:
+                        self.text_buffer[stream_key_str] = ""
+                    self.text_buffer[stream_key_str] += msg.payload.text
+                    full_text = self.text_buffer[stream_key_str]
+                else:
+                    full_text = msg.payload.text
+                    self.text_buffer[stream_key_str] = full_text
+                logger.debug(
+                    "Received text "
+                    f"(mode={msg.payload.mode}): "
+                    f"{msg.payload.text[:50]}..."
+                )
             else:
-                # 全量模式：直接使用
-                full_text = msg.payload.text
-                self.text_buffer[stream_key_str] = full_text
+                prepared: list[str] = []
 
-            logger.debug(f"Received text (mode={msg.payload.mode}): {msg.payload.text[:50]}...")
+                def update_text_buffer() -> None:
+                    if msg.payload.mode == "increment":
+                        current = self.text_buffer.get(
+                            stream_key_str,
+                            "",
+                        )
+                        current += msg.payload.text
+                        self.text_buffer[stream_key_str] = current
+                        prepared.append(current)
+                    else:
+                        self.text_buffer[
+                            stream_key_str
+                        ] = msg.payload.text
+                        prepared.append(msg.payload.text)
+
+                if not self._perform_ingress_mutation_v1(
+                    update_text_buffer
+                ) or not prepared:
+                    return
+                full_text = prepared[0]
+                logger.debug("WS_TEXT_INPUT_ACCEPTED")
 
             text_end = msg.payload.end_of_speech
 
@@ -1179,7 +1717,11 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 )
             )
             await self._broadcast_message(response)
-            logger.debug(f"Echo human text (end={text_end}): {full_text[:50]}...")
+            if self.work_runtime_v1 is None:
+                logger.debug(
+                    f"Echo human text (end={text_end}): "
+                    f"{full_text[:50]}..."
+                )
 
             # 只在 end_of_speech=True 时提交到引擎
             if msg.payload.end_of_speech:
@@ -1190,18 +1732,40 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 )
 
                 # 清理缓冲区
-                if stream_key_str in self.text_buffer:
-                    del self.text_buffer[stream_key_str]
+                if self.work_runtime_v1 is None:
+                    self.text_buffer.pop(stream_key_str, None)
+                    logger.info(
+                        "Submitted full text to engine: "
+                        f"{full_text[:50]}..."
+                    )
+                else:
+                    self._perform_ingress_mutation_v1(
+                        lambda: self.text_buffer.pop(
+                            stream_key_str,
+                            None,
+                        )
+                    )
+                    logger.info("WS_TEXT_INPUT_SUBMITTED")
 
-                logger.info(f"Submitted full text to engine: {full_text[:50]}...")
-
-        except Exception as e:
-            logger.error(f"Failed to process text data: {e}")
+        except Exception as exception:
+            if self.work_runtime_v1 is None:
+                logger.error(
+                    f"Failed to process text data: {exception}"
+                )
+            else:
+                logger.error("WS_TEXT_INPUT_FAILED")
 
     async def _handle_heartbeat(self, websocket: WebSocket, msg: TriggerHeartbeat,
                                 connection_info: ConnectionInfo):
         """处理心跳"""
-        connection_info.last_heartbeat_time = time.time()
+        if not self._perform_ingress_mutation_v1(
+            lambda: setattr(
+                connection_info,
+                "last_heartbeat_time",
+                time.time(),
+            )
+        ):
+            return
         # 发送心跳响应
         response = AvatarHeartbeat(
             header=MessageHeader(name="AvatarHeartbeat", request_id=msg.header.request_id)
@@ -1210,11 +1774,19 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
     async def _handle_interrupt(self, websocket: WebSocket, msg: Interrupt):
         """处理打断信号"""
-        logger.info(f"Interrupt signal received: session_id={self.session_id}")
+        if self.work_runtime_v1 is None:
+            logger.info(
+                f"Interrupt signal received: session_id={self.session_id}"
+            )
+        else:
+            logger.info("WS_INTERRUPT_ACCEPTED")
 
         # 重置 Opus 编码器，清空残留缓冲区
         if self._opus_encoder is not None:
-            self._opus_encoder.reset()
+            if not self._perform_ingress_mutation_v1(
+                self._opus_encoder.reset
+            ):
+                return
             logger.debug("Opus encoder reset due to interrupt")
 
         # 发送打断信号到引擎
@@ -1232,7 +1804,11 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         )
         await self._send_message(websocket, response)
 
-    async def _handle_server_interrupt_signal(self, signal: ChatSignal):
+    async def _handle_server_interrupt_signal(
+        self,
+        signal: ChatSignal,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
         """
         处理服务端发起的 INTERRUPT 语义信号。
 
@@ -1242,13 +1818,25 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         """
         signal_data = signal.signal_data or {}
         reason = signal_data.get("reason", "semantic_interrupt")
-        logger.info(f"Server interrupt signal received: reason={reason}")
+        if self.work_runtime_v1 is None:
+            logger.info(
+                f"Server interrupt signal received: reason={reason}"
+            )
+        else:
+            logger.info("WS_SERVER_INTERRUPT")
 
         if self._opus_encoder is not None:
-            self._opus_encoder.reset()
+            self._perform_output_mutation_v1(
+                work_item_v1,
+                self._opus_encoder.reset,
+            )
             logger.debug("Opus encoder reset due to server interrupt")
 
-    async def _handle_avatar_audio_cancel_signal(self, signal: ChatSignal):
+    async def _handle_avatar_audio_cancel_signal(
+        self,
+        signal: ChatSignal,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ):
         """
         处理 AVATAR_AUDIO 流取消信号（由 stream 系统的 cancel() 发出）。
 
@@ -1268,17 +1856,53 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             logger.debug("AVATAR_AUDIO cancel signal: could not identify stream_key, skipping")
             return
 
-        # Idempotent: skip if already processed
-        if stream_key_str in self._cancelled_stream_keys:
-            logger.debug(f"AVATAR_AUDIO cancel: stream_key={stream_key_str} already cancelled, skipping")
+        playback_active_holder = []
+        already_cancelled: list[bool] = []
+
+        def mark_cancelled() -> None:
+            if stream_key_str in self._cancelled_stream_keys:
+                already_cancelled.append(True)
+                return
+            self._cancelled_stream_keys.add(stream_key_str)
+            already_cancelled.append(False)
+            playback_active_holder.append(
+                stream_key_str
+                in self._active_playback_stream_keys
+            )
+            self._active_playback_stream_keys.pop(
+                stream_key_str,
+                None,
+            )
+
+        if self.work_runtime_v1 is None or work_item_v1 is None:
+            mark_cancelled()
+        elif not self.work_runtime_v1.perform_if_live_v1(
+            work_item_v1.registered_work,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            mark_cancelled,
+        ):
             return
+        if already_cancelled and already_cancelled[0]:
+            if self.work_runtime_v1 is None:
+                logger.debug(
+                    "AVATAR_AUDIO cancel already processed: "
+                    f"stream_key={stream_key_str}"
+                )
+            return
+        if self.work_runtime_v1 is None:
+            logger.info(
+                "Processing AVATAR_AUDIO cancel signal: "
+                f"stream_key={stream_key_str}"
+            )
+        else:
+            logger.info("WS_AVATAR_AUDIO_CANCELLED")
 
-        logger.info(f"Processing AVATAR_AUDIO cancel signal: stream_key={stream_key_str}")
-        self._cancelled_stream_keys.add(stream_key_str)
-
-        playback_active = stream_key_str in self._active_playback_stream_keys
+        playback_active = (
+            playback_active_holder[0]
+            if playback_active_holder
+            else False
+        )
         if playback_active:
-            self._active_playback_stream_keys.pop(stream_key_str, None)
 
             notification = InterruptNotification(
                 header=MessageHeader(name="InterruptNotification", request_id=str(uuid4())),
@@ -1289,15 +1913,217 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                     interrupted_at=time.time(),
                 )
             )
-            await self._broadcast_message(notification)
-            logger.info(f"InterruptNotification sent for cancelled AVATAR_AUDIO: stream_key={stream_key_str}")
+            await self._broadcast_message(
+                notification,
+                work_item_v1,
+            )
+            if self.work_runtime_v1 is None:
+                logger.info(
+                    "InterruptNotification sent for cancelled "
+                    f"AVATAR_AUDIO: stream_key={stream_key_str}"
+                )
 
             if self._opus_encoder is not None:
-                self._opus_encoder.reset()
+                self._perform_output_mutation_v1(
+                    work_item_v1,
+                    self._opus_encoder.reset,
+                )
 
     # ========================================================================
     # WebSocket 任务
     # ========================================================================
+
+    def _ingress_work_scope_v1(self):
+        if self.work_runtime_v1 is None:
+            return contextlib.nullcontext(None)
+        if self.data_submitter is None:
+            return contextlib.nullcontext(None)
+        scope_factory = getattr(
+            self.data_submitter,
+            "ingress_work_scope_v1",
+            None,
+        )
+        if not callable(scope_factory):
+            return contextlib.nullcontext(None)
+        return scope_factory()
+
+    def _perform_ingress_mutation_v1(self, action) -> bool:
+        if self.work_runtime_v1 is None:
+            action()
+            return True
+        return self.work_runtime_v1.perform_current_if_live_v1(
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            action,
+        )
+
+    def _ensure_secure_generation_state_v1(self) -> bool:
+        runtime = self.work_runtime_v1
+        if runtime is None:
+            return True
+        work = runtime.current_work_v1()
+        if work is None:
+            return False
+        generation = work.fence.session_epoch.generation
+        if self._secure_generation_v1 == generation:
+            return True
+
+        def reset_generation_state() -> None:
+            self.text_buffer.clear()
+            self.binary_stream_assembler.clear()
+            self.last_human_text = None
+            self.motion_welcome_sent = False
+            self.motion_welcome_payload = None
+            self._active_playback_stream_keys.clear()
+            self._cancelled_stream_keys.clear()
+            if (
+                self.initialized
+                and self.audio_format == "OPUS"
+                and is_opus_available()
+            ):
+                self._opus_decoder = OpusDecoder(
+                    sample_rate=16000,
+                    channels=1,
+                )
+                self._opus_encoder = OpusEncoder(
+                    sample_rate=24000,
+                    channels=1,
+                    frame_size_ms=self.opus_frame_size_ms,
+                )
+            self._secure_generation_v1 = generation
+
+        return runtime.perform_if_live_v1(
+            work,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            reset_generation_state,
+        )
+
+    async def _process_ws_input_message_v1(
+        self,
+        websocket: WebSocket,
+        connection_info: ConnectionInfo,
+        raw_msg,
+    ) -> bool:
+        """Process one already-received message under exact ingress ancestry."""
+
+        role = connection_info.role
+        if self.work_runtime_v1 is not None and not (
+            self.work_runtime_v1.validate_current_v1(
+                WorkValidationBoundaryV1.QUEUE_DEQUEUE
+            )
+        ):
+            return False
+        if not self._ensure_secure_generation_state_v1():
+            return False
+
+        if "text" in raw_msg:
+            if not self._perform_ingress_mutation_v1(
+                lambda: setattr(
+                    connection_info,
+                    "last_heartbeat_time",
+                    time.time(),
+                )
+            ):
+                return False
+            try:
+                json_data = json.loads(raw_msg["text"])
+                msg = parse_message(json_data)
+            except Exception:  # noqa: BLE001 - payload-free rejection
+                if self.work_runtime_v1 is None:
+                    logger.warning("Failed to parse WebSocket message.")
+                else:
+                    logger.warning("WS_MESSAGE_PARSE_FAILED")
+                return False
+            if msg is None:
+                logger.warning("WS_MESSAGE_PARSE_FAILED")
+                return False
+            if (
+                self.work_runtime_v1 is not None
+                and not self.work_runtime_v1.validate_current_v1(
+                    WorkValidationBoundaryV1.BEFORE_FOLLOW_ON_WORK
+                )
+            ):
+                return False
+
+            if isinstance(msg, InitializeAvatarSession):
+                success = await self._handle_initialize_session(
+                    websocket,
+                    msg,
+                    connection_info,
+                )
+                return role == "primary" and not success
+            if isinstance(msg, TriggerHeartbeat):
+                await self._handle_heartbeat(
+                    websocket,
+                    msg,
+                    connection_info,
+                )
+            elif role != "primary":
+                await self._send_error(
+                    websocket,
+                    msg.header.request_id,
+                    ErrorCode.INVALID_MESSAGE,
+                    "Only primary connection can send this message",
+                )
+            elif isinstance(msg, SendHumanAudio):
+                await self._process_send_human_audio(websocket, msg)
+            elif isinstance(msg, SendHumanVideo):
+                await self._process_send_human_video(websocket, msg)
+            elif isinstance(msg, SendHumanText):
+                await self._handle_text_data(websocket, msg)
+            elif isinstance(msg, Interrupt):
+                await self._handle_interrupt(websocket, msg)
+            elif isinstance(msg, EndSpeech):
+                self._perform_ingress_mutation_v1(
+                    lambda: self._handle_end_speech(msg)
+                )
+            return False
+
+        if "bytes" not in raw_msg:
+            return False
+        if not self._perform_ingress_mutation_v1(
+            lambda: setattr(
+                connection_info,
+                "last_heartbeat_time",
+                time.time(),
+            )
+        ):
+            return False
+        if role != "primary":
+            logger.warning(
+                "Listener connection received unexpected binary payload."
+            )
+            return False
+
+        assembled = []
+        if not self._perform_ingress_mutation_v1(
+            lambda: assembled.append(
+                self.binary_stream_assembler.append(raw_msg["bytes"])
+            )
+        ):
+            return False
+        result = assembled[0] if assembled else None
+        if result is None:
+            return False
+        state, complete_data = result
+        metadata = state.metadata
+        if isinstance(metadata, PendingBinaryMeta):
+            if metadata.kind == "audio":
+                await self._handle_audio_data(
+                    websocket,
+                    metadata.message,
+                    complete_data,
+                )
+            elif metadata.kind == "video":
+                await self._handle_video_data(
+                    websocket,
+                    metadata.message,
+                    complete_data,
+                )
+            else:
+                logger.warning("WS_BINARY_KIND_INVALID")
+        else:
+            logger.warning("WS_BINARY_METADATA_MISSING")
+        return False
 
     async def _ws_input_task(self, connection_info: ConnectionInfo):
         """接收任务 - 处理客户端消息"""
@@ -1309,74 +2135,26 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             try:
                 # 接收消息 (可能是 JSON 或二进制)
                 raw_msg = await asyncio.wait_for(websocket.receive(), timeout=0.1)
-
-                # 处理 JSON 消息
-                if "text" in raw_msg:
-                    # 更新心跳时间（收到任何消息都表示客户端活跃）
-                    connection_info.last_heartbeat_time = time.time()
-
-                    json_data = json.loads(raw_msg["text"])
-                    msg = parse_message(json_data)
-
-                    if msg is None:
-                        logger.warning(f"Failed to parse message: {json_data}")
+                with self._ingress_work_scope_v1() as scope:
+                    if self.work_runtime_v1 is not None and scope is None:
                         continue
-
-                    # 路由消息
-                    if isinstance(msg, InitializeAvatarSession):
-                        success = await self._handle_initialize_session(websocket, msg, connection_info)
-                        if role == "primary" and not success:
-                            break
-                    elif isinstance(msg, TriggerHeartbeat):
-                        await self._handle_heartbeat(websocket, msg, connection_info)
-                    elif role != "primary":
-                        await self._send_error(
-                            websocket,
-                            msg.header.request_id if msg else str(uuid4()),
-                            ErrorCode.INVALID_MESSAGE,
-                            "Only primary connection can send this message"
-                        )
-                    elif isinstance(msg, SendHumanAudio):
-                        await self._process_send_human_audio(websocket, msg)
-                    elif isinstance(msg, SendHumanVideo):
-                        await self._process_send_human_video(websocket, msg)
-                    elif isinstance(msg, SendHumanText):
-                        await self._handle_text_data(websocket, msg)
-                    elif isinstance(msg, Interrupt):
-                        await self._handle_interrupt(websocket, msg)
-                    elif isinstance(msg, EndSpeech):
-                        self._handle_end_speech(msg)
-
-                # 处理二进制消息
-                elif "bytes" in raw_msg:
-                    # 更新心跳时间（收到任何消息都表示客户端活跃）
-                    connection_info.last_heartbeat_time = time.time()
-
-                    if role != "primary":
-                        logger.warning("Listener connection received unexpected binary payload, ignoring.")
-                        continue
-
-                    binary_data = raw_msg["bytes"]
-
-                    result = self.binary_stream_assembler.append(binary_data)
-
-                    if result is not None:
-                        state, complete_data = result
-                        metadata = state.metadata
-                        if isinstance(metadata, PendingBinaryMeta):
-                            if metadata.kind == "audio":
-                                await self._handle_audio_data(websocket, metadata.message, complete_data)
-                            elif metadata.kind == "video":
-                                await self._handle_video_data(websocket, metadata.message, complete_data)
-                            else:
-                                logger.warning(f"Unknown binary metadata kind: {metadata.kind}")
-                        else:
-                            logger.warning("Missing metadata for completed binary transfer")
+                    if await self._process_ws_input_message_v1(
+                        websocket,
+                        connection_info,
+                        raw_msg,
+                    ):
+                        break
 
             except asyncio.TimeoutError:
                 continue
-            except Exception as e:
-                logger.error(f"Error in input task for session {self.session_id}: {e}")
+            except Exception as exception:
+                if self.work_runtime_v1 is None:
+                    logger.error(
+                        "Error in input task for session "
+                        f"{self.session_id}: {exception}"
+                    )
+                else:
+                    logger.error("WS_INPUT_TASK_FAILED")
                 break
 
         connection_info.quit.set()
@@ -1395,80 +2173,118 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         while not self.quit.is_set():
             try:
                 # 获取文本数据 (ASR 或 LLM 输出)
-                chat_data = await asyncio.wait_for(
+                queued_item = await asyncio.wait_for(
                     self.get_data(EngineChannelType.TEXT),
                     timeout=0.1
                 )
 
-                if chat_data is None:
+                if queued_item is None:
                     continue
-
-                # 提取文本内容和元数据
-                text = chat_data.data.get_main_data()
-
-                stream_key_str = chat_data.stream_id.stream_key_str if chat_data.stream_id else None
-
-                # 根据类型发送不同的回显消息
-                if chat_data.type == ChatDataType.HUMAN_TEXT:
-                    if "human_text" not in self.subscriptions:
+                chat_data, work_item = self._unwrap_output_item_v1(
+                    queued_item
+                )
+                try:
+                    if chat_data is None:
                         continue
-                    # HUMAN_TEXT: 引擎发来的是全量文本
-                    # 获取 human_text_end 标记（默认 True）
-                    text_end = chat_data.is_last_data
-
-                    # 收集附加元数据（统一处理）
-                    stream_metadata = self._extract_stream_metadata(
-                        chat_data,
-                        excluded_keys={'human_text_end'}
-                    )
-
-                    response = EchoHumanText(
-                        header=MessageHeader(name="EchoHumanText", request_id=str(uuid4())),
-                        payload=EchoTextPayload(
-                            stream_key=stream_key_str,
-                            mode="full_text",  # HUMAN_TEXT 始终是全量
-                            text=text,
-                            end_of_speech=text_end,
-                            metadata=stream_metadata,
+                    with self._work_scope_v1(work_item):
+                        await self._send_text_output_v1(
+                            chat_data,
+                            work_item,
                         )
-                    )
-                    await self._broadcast_message(response)
-                    logger.debug(f"Echo human text (end={text_end}): {text[:50]}...")
-                    self.last_human_text = text if not text_end else None
-
-                elif chat_data.type == ChatDataType.AVATAR_TEXT:
-                    if "avatar_text" not in self.subscriptions:
-                        continue
-                    # AVATAR_TEXT: 引擎发来的是增量文本
-                    # 获取 avatar_text_end 标记（默认 False）
-                    text_end = chat_data.is_last_data
-
-                    # 收集附加元数据（统一处理）
-                    stream_metadata = self._extract_stream_metadata(
-                        chat_data,
-                        excluded_keys={'avatar_text_end'}
-                    )
-
-                    response = EchoAvatarText(
-                        header=MessageHeader(name="EchoAvatarText", request_id=str(uuid4())),
-                        payload=EchoTextPayload(
-                            stream_key=stream_key_str,
-                            mode="increment",  # AVATAR_TEXT 始终是增量
-                            text=text,
-                            end_of_speech=text_end,
-                            metadata=stream_metadata,
+                finally:
+                    if (
+                        work_item is not None
+                        and self.work_runtime_v1 is not None
+                    ):
+                        work_item.release_once_v1(
+                            self.work_runtime_v1
                         )
-                    )
-                    await self._broadcast_message(response)
-                    logger.debug(f"Echo avatar text (end={text_end}): {text[:50]}...")
 
             except asyncio.TimeoutError:
                 continue
-            except Exception as e:
-                logger.error(f"Error in output task for session {self.session_id}: {e}")
+            except Exception as exception:
+                if self.work_runtime_v1 is None:
+                    logger.error(
+                        "Error in output task for session "
+                        f"{self.session_id}: {exception}"
+                    )
+                else:
+                    logger.error("WS_TEXT_OUTPUT_TASK_FAILED")
                 break
 
         logger.info(f"Text output task ended for session {self.session_id}")
+
+    async def _send_text_output_v1(
+        self,
+        chat_data: ChatData,
+        work_item_v1: WorkBoundItemV1 | None,
+    ) -> None:
+        text = chat_data.data.get_main_data()
+        stream_key_str = (
+            chat_data.stream_id.stream_key_str
+            if chat_data.stream_id
+            else None
+        )
+        text_end = chat_data.is_last_data
+        if chat_data.type == ChatDataType.HUMAN_TEXT:
+            if "human_text" not in self.subscriptions:
+                return
+            stream_metadata = self._extract_stream_metadata(
+                chat_data,
+                excluded_keys={"human_text_end"},
+            )
+            response = EchoHumanText(
+                header=MessageHeader(
+                    name="EchoHumanText",
+                    request_id=str(uuid4()),
+                ),
+                payload=EchoTextPayload(
+                    stream_key=stream_key_str,
+                    mode="full_text",
+                    text=text,
+                    end_of_speech=text_end,
+                    metadata=stream_metadata,
+                ),
+            )
+            await self._broadcast_message(
+                response,
+                work_item_v1,
+            )
+            if self.work_runtime_v1 is None:
+                self.last_human_text = text if not text_end else None
+            elif work_item_v1 is not None:
+                self.work_runtime_v1.perform_if_live_v1(
+                    work_item_v1.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    lambda: setattr(
+                        self,
+                        "last_human_text",
+                        text if not text_end else None,
+                    ),
+                )
+            return
+        if chat_data.type != ChatDataType.AVATAR_TEXT:
+            return
+        if "avatar_text" not in self.subscriptions:
+            return
+        stream_metadata = self._extract_stream_metadata(
+            chat_data,
+            excluded_keys={"avatar_text_end"},
+        )
+        response = EchoAvatarText(
+            header=MessageHeader(
+                name="EchoAvatarText",
+                request_id=str(uuid4()),
+            ),
+            payload=EchoTextPayload(
+                stream_key=stream_key_str,
+                mode="increment",
+                text=text,
+                end_of_speech=text_end,
+                metadata=stream_metadata,
+            ),
+        )
+        await self._broadcast_message(response, work_item_v1)
 
     async def _ws_motion_output_task(self):
         """输出任务 - 发送 Motion Data"""
@@ -1476,28 +2292,71 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
         while not self.quit.is_set():
             try:
-                chat_data = await asyncio.wait_for(
+                queued_item = await asyncio.wait_for(
                     self.get_data(EngineChannelType.MOTION_DATA),
                     timeout=0.1
                 )
 
-                if chat_data is None:
+                if queued_item is None:
                     continue
+                chat_data, work_item = self._unwrap_output_item_v1(
+                    queued_item
+                )
+                try:
+                    if chat_data is None:
+                        continue
+                    with self._work_scope_v1(work_item):
+                        if "motion_data" not in self.subscriptions:
+                            if (
+                                self.work_runtime_v1 is None
+                                or work_item is None
+                            ):
+                                self.motion_welcome_sent = False
+                            else:
+                                self.work_runtime_v1.perform_if_live_v1(
+                                    work_item.registered_work,
+                                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                                    lambda: setattr(
+                                        self,
+                                        "motion_welcome_sent",
+                                        False,
+                                    ),
+                                )
+                            continue
 
-                if "motion_data" not in self.subscriptions:
-                    self.motion_welcome_sent = False
-                    continue
+                        if not self.motion_welcome_sent:
+                            await self._send_motion_welcome(
+                                chat_data.data.definition,
+                                work_item,
+                            )
 
-                if not self.motion_welcome_sent:
-                    await self._send_motion_welcome(chat_data.data.definition)
-
-                if chat_data.type == ChatDataType.AVATAR_MOTION_DATA:
-                    await self._send_motion_data(chat_data)
+                        if (
+                            chat_data.type
+                            == ChatDataType.AVATAR_MOTION_DATA
+                        ):
+                            await self._send_motion_data(
+                                chat_data,
+                                work_item,
+                            )
+                finally:
+                    if (
+                        work_item is not None
+                        and self.work_runtime_v1 is not None
+                    ):
+                        work_item.release_once_v1(
+                            self.work_runtime_v1
+                        )
 
             except asyncio.TimeoutError:
                 continue
-            except Exception as e:
-                logger.error(f"Error in motion output task for session {self.session_id}: {e}")
+            except Exception as exception:
+                if self.work_runtime_v1 is None:
+                    logger.error(
+                        "Error in motion output task for session "
+                        f"{self.session_id}: {exception}"
+                    )
+                else:
+                    logger.error("WS_MOTION_OUTPUT_TASK_FAILED")
                 break
 
         logger.info(f"Motion output task ended for session {self.session_id}")
@@ -1508,26 +2367,50 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
         while not connection_info.quit.is_set() and not self.quit.is_set():
             try:
-                await asyncio.sleep(1.0)
+                with self._ingress_work_scope_v1() as scope:
+                    if (
+                        self.work_runtime_v1 is not None
+                        and scope is None
+                    ):
+                        break
+                    # Timer work is registered before sleeping.  A timer that
+                    # wakes after retirement therefore cannot attach its
+                    # callback output to the new generation.
+                    await asyncio.sleep(1.0)
+                    if (
+                        self.work_runtime_v1 is not None
+                        and not self.work_runtime_v1.validate_current_v1(
+                            WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK
+                        )
+                    ):
+                        continue
 
-                # 检查心跳超时
-                elapsed = time.time() - connection_info.last_heartbeat_time
-                if elapsed > self.heartbeat_timeout:
-                    logger.warning(
-                        f"Heartbeat timeout for session {self.session_id} role={connection_info.role}: {elapsed:.1f}s"
+                    elapsed = (
+                        time.time()
+                        - connection_info.last_heartbeat_time
                     )
-                    await self._send_error(
-                        connection_info.websocket,
-                        str(uuid4()),
-                        ErrorCode.HEARTBEAT_TIMEOUT,
-                        f"Heartbeat timeout after {elapsed:.1f} seconds"
+                    if elapsed > self.heartbeat_timeout:
+                        logger.warning(
+                            "WebSocket heartbeat timeout."
+                        )
+                        await self._send_error(
+                            connection_info.websocket,
+                            str(uuid4()),
+                            ErrorCode.HEARTBEAT_TIMEOUT,
+                            "Heartbeat timeout",
+                        )
+                        self._perform_ingress_mutation_v1(
+                            connection_info.quit.set
+                        )
+                        break
+
+            except Exception as exception:
+                if self.work_runtime_v1 is None:
+                    logger.error(
+                        f"Error in heartbeat monitor: {exception}"
                     )
-                    connection_info.quit.set()
-
-                    break
-
-            except Exception as e:
-                logger.error(f"Error in heartbeat monitor: {e}")
+                else:
+                    logger.error("WS_HEARTBEAT_MONITOR_FAILED")
                 break
 
         logger.info("Heartbeat monitor ended")
@@ -1538,24 +2421,48 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
         while not self.quit.is_set():
             try:
-                chat_data = await asyncio.wait_for(
+                queued_item = await asyncio.wait_for(
                     self.get_data(EngineChannelType.AUDIO),
                     timeout=0.1
                 )
 
-                if chat_data is None:
+                if queued_item is None:
                     continue
-
-                if chat_data.type != ChatDataType.AVATAR_AUDIO:
-                    logger.debug(f"Skip non-avatar audio data type: {chat_data.type}")
-                    continue
-
-                await self._send_avatar_audio(chat_data)
+                chat_data, work_item = self._unwrap_output_item_v1(
+                    queued_item
+                )
+                try:
+                    if chat_data is None:
+                        continue
+                    with self._work_scope_v1(work_item):
+                        if (
+                            chat_data.type
+                            != ChatDataType.AVATAR_AUDIO
+                        ):
+                            continue
+                        await self._send_avatar_audio(
+                            chat_data,
+                            work_item,
+                        )
+                finally:
+                    if (
+                        work_item is not None
+                        and self.work_runtime_v1 is not None
+                    ):
+                        work_item.release_once_v1(
+                            self.work_runtime_v1
+                        )
 
             except asyncio.TimeoutError:
                 continue
-            except Exception as e:
-                logger.error(f"Error in audio output task for session {self.session_id}: {e}")
+            except Exception as exception:
+                if self.work_runtime_v1 is None:
+                    logger.error(
+                        "Error in audio output task for session "
+                        f"{self.session_id}: {exception}"
+                    )
+                else:
+                    logger.error("WS_AUDIO_OUTPUT_TASK_FAILED")
                 break
 
         logger.info(f"Audio output task ended for session {self.session_id}")
@@ -1568,60 +2475,102 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
         while not self.quit.is_set():
             try:
-                signal: ChatSignal = await asyncio.wait_for(
+                queued_signal = await asyncio.wait_for(
                     self.signal_to_client_queue.get(),
                     timeout=0.1
                 )
 
-                if signal is None:
+                if queued_signal is None:
                     continue
-
-                # Special handling for INTERRUPT signals from server (SemanticTurnDetector)
-                # Send InterruptNotification to client for precise audio stop
-                if signal.type == ChatSignalType.INTERRUPT:
-                    if signal.source_type == ChatSignalSourceType.HANDLER:
-                        await self._handle_server_interrupt_signal(signal)
-                    # CLIENT-sourced INTERRUPTs originated from this WS client;
-                    # forwarding them back would cause the client to re-send
-                    # Interrupt messages, creating an infinite loop.
-                    continue
-
-                # Special handling for STREAM_CANCEL signals on AVATAR_AUDIO
-                # Mark the speech as cancelled and notify client to stop playback
-                if (signal.type == ChatSignalType.STREAM_CANCEL
-                    and signal.related_stream is not None
-                        and signal.related_stream.data_type == ChatDataType.AVATAR_AUDIO):
-                    await self._handle_avatar_audio_cancel_signal(signal)
-                    continue
-
-                # Forward other signals as generic ChatSignalMessage
-                signal_payload = ChatSignalPayload(
-                    type=signal.type,
-                    source_type=signal.source_type,
-                    signal_data=signal.signal_data,
+                signal, work_item = self._unwrap_output_item_v1(
+                    queued_signal
                 )
-                if signal.related_stream is not None:
-                    signal_payload.stream_type = signal.related_stream.data_type.value
-                    signal_payload.stream_producer = signal.related_stream.producer_name
-                    signal_payload.stream_key = signal.related_stream.stream_key_str
-
-                    if self.stream_manager is not None:
-                        try:
-                            self._enrich_signal_payload(signal, signal_payload)
-                        except Exception as e:
-                            logger.warning(f"Failed to enrich signal payload for {signal.type}: {e}")
-
-                message = ChatSignalMessage(
-                    header=MessageHeader(name=MessageType.CHAT_SIGNAL, request_id=str(uuid4())),
-                    payload=signal_payload
-                )
-                await self._broadcast_message(message)
+                try:
+                    if signal is None:
+                        continue
+                    with self._work_scope_v1(work_item):
+                        await self._send_signal_output_v1(
+                            signal,
+                            work_item,
+                        )
+                finally:
+                    if (
+                        work_item is not None
+                        and self.work_runtime_v1 is not None
+                    ):
+                        work_item.release_once_v1(
+                            self.work_runtime_v1
+                        )
             except asyncio.TimeoutError:
                 continue
-            except Exception as e:
-                logger.error(f"Error in signal output task for session {self.session_id}: {e}")
+            except Exception as exception:
+                if self.work_runtime_v1 is None:
+                    logger.error(
+                        "Error in signal output task for session "
+                        f"{self.session_id}: {exception}"
+                    )
+                else:
+                    logger.error("WS_SIGNAL_OUTPUT_TASK_FAILED")
                 break
         logger.info(f"Signal output task ended for session {self.session_id}")
+
+    async def _send_signal_output_v1(
+        self,
+        signal: ChatSignal,
+        work_item_v1: WorkBoundItemV1 | None,
+    ) -> None:
+        if signal.type == ChatSignalType.INTERRUPT:
+            if signal.source_type == ChatSignalSourceType.HANDLER:
+                await self._handle_server_interrupt_signal(
+                    signal,
+                    work_item_v1,
+                )
+            return
+        if (
+            signal.type == ChatSignalType.STREAM_CANCEL
+            and signal.related_stream is not None
+            and signal.related_stream.data_type
+            == ChatDataType.AVATAR_AUDIO
+        ):
+            await self._handle_avatar_audio_cancel_signal(
+                signal,
+                work_item_v1,
+            )
+            return
+
+        signal_payload = ChatSignalPayload(
+            type=signal.type,
+            source_type=signal.source_type,
+            signal_data=signal.signal_data,
+        )
+        if signal.related_stream is not None:
+            signal_payload.stream_type = (
+                signal.related_stream.data_type.value
+            )
+            signal_payload.stream_producer = (
+                signal.related_stream.producer_name
+            )
+            signal_payload.stream_key = (
+                signal.related_stream.stream_key_str
+            )
+            if self.stream_manager is not None:
+                try:
+                    self._enrich_signal_payload(
+                        signal,
+                        signal_payload,
+                    )
+                except Exception:
+                    logger.warning(
+                        "WS_SIGNAL_ENRICHMENT_FAILED"
+                    )
+        message = ChatSignalMessage(
+            header=MessageHeader(
+                name=MessageType.CHAT_SIGNAL,
+                request_id=str(uuid4()),
+            ),
+            payload=signal_payload,
+        )
+        await self._broadcast_message(message, work_item_v1)
 
     async def serve_websocket(self, websocket: WebSocket) -> bool:
         """服务 WebSocket 连接，返回是否需要销毁整个 Session"""
@@ -1637,19 +2586,26 @@ class WsInputSessionDelegate(ClientSessionDelegate):
     async def _serve_primary_connection(self, info: ConnectionInfo) -> bool:
         """启动主连接任务，结束时返回 True 用于销毁 Session"""
 
-        # 重置状态
-        self.quit.clear()
-        self.motion_welcome_sent = False
-        self.motion_welcome_payload = None
-        self.binary_stream_assembler.clear()
-        self.subscriptions = set(self.AVAILABLE_SUBSCRIPTIONS)
+        def reset_primary_state() -> None:
+            self.quit.clear()
+            self.motion_welcome_sent = False
+            self.motion_welcome_payload = None
+            self.binary_stream_assembler.clear()
+            self.subscriptions = set(self.AVAILABLE_SUBSCRIPTIONS)
+            self.audio_format = "PCM"
+            self.audio_sample_rate = 16000
+            self.audio_channels = 1
+            self._opus_encoder = None
+            self._opus_decoder = None
 
-        # 重置音频配置
-        self.audio_format = "PCM"
-        self.audio_sample_rate = 16000
-        self.audio_channels = 1
-        self._opus_encoder = None
-        self._opus_decoder = None
+        if self.work_runtime_v1 is None:
+            reset_primary_state()
+        else:
+            with self._ingress_work_scope_v1() as scope:
+                if scope is None or not self._perform_ingress_mutation_v1(
+                    reset_primary_state
+                ):
+                    return True
 
         self.primary_tasks = [
             asyncio.create_task(self._ws_input_task(info)),

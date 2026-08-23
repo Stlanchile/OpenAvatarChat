@@ -1,8 +1,9 @@
 import copy
 import weakref
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 from loguru import logger
@@ -30,6 +31,16 @@ from chat_engine.security.dispatch import (
 )
 from chat_engine.security.envelope import SecurityClassificationV1
 from chat_engine.security.payload_isolation import ChatDataIsolationPlanV1
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
+    WorkExecutionScopeV1,
+)
 
 
 @dataclass
@@ -78,7 +89,7 @@ class StreamDebugConfig:
                 prefix = sym['tree_last'] if i == len(parents) - 1 else sym['tree_branch']
                 lines.append(f"   │  {prefix} {p}")
         else:
-            lines.append(f"   ├─ parents: (none)")
+            lines.append("   ├─ parents: (none)")
         
         # Ancestors section (excluding parents)
         ancestors_only = [a for a in stream.ancestor_streams if a.key not in stream.source_streams]
@@ -95,7 +106,7 @@ class StreamDebugConfig:
                 prefix = sym['tree_last'] if i == len(stream.cancelable_ancestors) - 1 else sym['tree_branch']
                 lines.append(f"      {prefix} {c}")
         else:
-            lines.append(f"   └─ cancelable chain: (none)")
+            lines.append("   └─ cancelable chain: (none)")
         
         logger.info("\n".join(lines))
 
@@ -181,7 +192,7 @@ class StreamDebugConfig:
                 prefix = sym['tree_last'] if i == len(stream.cancelable_ancestors) - 1 else sym['tree_branch']
                 lines.append(f"   {prefix} {c}")
         else:
-            lines.append(f"   targets: (none)")
+            lines.append("   targets: (none)")
         logger.info("\n".join(lines))
 
     def log_cancel_chain_complete(
@@ -615,7 +626,8 @@ class ChatStreamer:
                  data_name: Optional[str] = None,
                  config: Optional[ChatStreamConfig] = None,
                  security_authority: SecurityAuthorityV1 | None = None,
-                 producer_authority: ProducerAuthorityReferenceV1 | None = None):
+                 producer_authority: ProducerAuthorityReferenceV1 | None = None,
+                 work_runtime_v1: SessionWorkRuntimeV1 | None = None):
         self._input_stream_ids: Dict[StreamKey, InputStreamStats] = {}
         self._input_security_refs: Dict[str, InputSecurityStatsV1] = {}
         self._streamer_id: int = -1
@@ -632,6 +644,7 @@ class ChatStreamer:
         self._default_config: ChatStreamConfig = ChatStreamConfig() if config is None else config
         self._security_authority = security_authority
         self._producer_authority = producer_authority
+        self._work_runtime_v1 = work_runtime_v1
         # Keep ended upstream streams for a short grace period so downstream
         # outputs (e.g., HUMAN_TEXT) can still reference them for ref_streams.
         self._ended_input_retention = 3.0  # seconds
@@ -1140,6 +1153,7 @@ class ChatStreamer:
         data: ChatData,
         sinks,
         stream_ref: SecurityStreamReferenceV1 | None,
+        work_parent_fence_v1=None,
     ):
         if self._security_authority is None:
             for sink in sinks:
@@ -1175,9 +1189,40 @@ class ChatStreamer:
                 # In particular, an unauthorized ONCE sink must not suppress a
                 # later authorized sink.
                 continue
+            bound_work_item = None
+            if self._work_runtime_v1 is not None:
+                try:
+                    bound_work_item = (
+                        self._work_runtime_v1.make_child_item_v1(
+                            authorized,
+                            WorkOperationKindV1.GENERIC_ASYNC,
+                            parent=work_parent_fence_v1,
+                            envelope_ref=stream_ref.envelope_ref,
+                        )
+                    )
+                    authorized = replace(
+                        authorized,
+                        work_item_v1=bound_work_item,
+                    )
+                except WorkAdmissionDeniedV1:
+                    continue
             try:
-                sink.sink_queue.put(authorized)
+                if bound_work_item is None:
+                    sink.sink_queue.put(authorized)
+                elif not self._work_runtime_v1.perform_if_live_v1(
+                    bound_work_item.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_EGRESS,
+                    lambda: sink.sink_queue.put(authorized),
+                ):
+                    bound_work_item.release_once_v1(
+                        self._work_runtime_v1
+                    )
+                    continue
             except Exception:
+                if bound_work_item is not None:
+                    bound_work_item.release_once_v1(
+                        self._work_runtime_v1
+                    )
                 self._security_authority._record(
                     SecurityAuditEventCodeV1.DISPATCH_DENIED,
                     envelope_id=stream_ref.envelope_ref.envelope_id,
@@ -1200,7 +1245,42 @@ class ChatStreamer:
                     finish_stream: Optional[bool] = None,
                     stream_meta: Optional[Dict] = None,
                     *,
-                    _trusted_root_envelope_ref: SecurityEnvelopeReferenceV1 | None = None):
+                    _trusted_root_envelope_ref: SecurityEnvelopeReferenceV1 | None = None,
+                    _work_parent_fence_v1=None):
+        if (
+            self._work_runtime_v1 is not None
+            and _work_parent_fence_v1 is None
+        ):
+            try:
+                ingress = self._work_runtime_v1.register_root_work_v1(
+                    WorkOperationKindV1.GENERIC_ASYNC
+                )
+            except WorkAdmissionDeniedV1:
+                return
+            try:
+                with self._work_runtime_v1.activate_work_v1(
+                    ingress,
+                    _trusted_root_envelope_ref,
+                ):
+                    self._work_runtime_v1.perform_if_live_v1(
+                        ingress,
+                        WorkValidationBoundaryV1.BEFORE_EGRESS,
+                        lambda: self.stream_data(
+                            data,
+                            missing_stream_callback=(
+                                missing_stream_callback
+                            ),
+                            finish_stream=finish_stream,
+                            stream_meta=stream_meta,
+                            _trusted_root_envelope_ref=(
+                                _trusted_root_envelope_ref
+                            ),
+                            _work_parent_fence_v1=ingress.fence,
+                        ),
+                    )
+            finally:
+                self._work_runtime_v1.release_work_v1(ingress)
+            return
         self._cleanup_input_streams()
         source_streams = [
             value.stream_id for value in self._input_stream_ids.values()
@@ -1264,6 +1344,7 @@ class ChatStreamer:
             chat_data,
             sinks,
             stream.security_stream_ref,
+            work_parent_fence_v1=_work_parent_fence_v1,
         )
         if chat_data.is_last_data:
             self.finish_current()
@@ -1303,7 +1384,8 @@ class StreamManager:
     def __init__(self, signal_manager: SignalManager,
                  recycle_ttl: float = 10.0,
                  cleanup_interval: float = 1.0,
-                 security_authority: SecurityAuthorityV1 | None = None):
+                 security_authority: SecurityAuthorityV1 | None = None,
+                 work_runtime_v1: SessionWorkRuntimeV1 | None = None):
         """
         Initialize stream manager.
         
@@ -1315,6 +1397,7 @@ class StreamManager:
         """
         self._signal_manager = signal_manager
         self._security_authority = security_authority
+        self._work_runtime_v1 = work_runtime_v1
         self._stream_storage = StreamStorage(
             recycle_ttl=recycle_ttl,
             cleanup_interval=cleanup_interval
@@ -1368,6 +1451,7 @@ class StreamManager:
             config=config,
             security_authority=self._security_authority,
             producer_authority=producer_authority,
+            work_runtime_v1=self._work_runtime_v1,
         )
         builder._streamer_id = self._next_streamer_id
         self._next_streamer_id += 1
@@ -1598,7 +1682,8 @@ class StreamManagerConsumerViewV1:
                 producer_name=producer_name,
                 config=config,
                 _producer_authority=self.__producer_authority,
-            )
+            ),
+            self.__manager._work_runtime_v1,
         )
 
     def find_stream(self, stream_id: ChatStreamIdentity):
@@ -1766,10 +1851,27 @@ class ChatStreamConsumerViewV1:
 class ChatStreamerConsumerViewV1:
     """Handler output API without mutable lineage or authority registries."""
 
-    __slots__ = ("__streamer",)
+    __slots__ = ("__streamer", "__work_runtime_v1")
 
-    def __init__(self, streamer: ChatStreamer):
+    def __init__(
+        self,
+        streamer: ChatStreamer,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
+    ):
         self.__streamer = streamer
+        self.__work_runtime_v1 = work_runtime_v1
+
+    def __perform_with_result_v1(self, action):
+        runtime = self.__work_runtime_v1
+        if runtime is None:
+            return action()
+        result = []
+        if not runtime.perform_current_if_live_v1(
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            lambda: result.append(action()),
+        ):
+            return None
+        return result[0] if result else None
 
     @property
     def data_type(self) -> ChatDataType:
@@ -1808,10 +1910,12 @@ class ChatStreamerConsumerViewV1:
         name: str | None = None,
         config: ChatStreamConfig | None = None,
     ) -> ChatStreamIdentity:
-        return self.__streamer.new_stream(
-            sources=sources,
-            name=name,
-            config=config,
+        return self.__perform_with_result_v1(
+            lambda: self.__streamer.new_stream(
+                sources=sources,
+                name=name,
+                config=config,
+            )
         )
 
     def new_stream_from_input(
@@ -1820,10 +1924,12 @@ class ChatStreamerConsumerViewV1:
         name: str | None = None,
         config: ChatStreamConfig | None = None,
     ) -> ChatStreamIdentity:
-        return self.__streamer.new_stream_from_input(
-            input_stream=input_stream,
-            name=name,
-            config=config,
+        return self.__perform_with_result_v1(
+            lambda: self.__streamer.new_stream_from_input(
+                input_stream=input_stream,
+                name=name,
+                config=config,
+            )
         )
 
     def open_stream(
@@ -1833,11 +1939,13 @@ class ChatStreamerConsumerViewV1:
         config: ChatStreamConfig | None = None,
         meta: Dict[str, Any] | None = None,
     ) -> ChatStreamIdentity | None:
-        return self.__streamer.open_stream(
-            sources=sources,
-            name=name,
-            config=config,
-            meta=meta,
+        return self.__perform_with_result_v1(
+            lambda: self.__streamer.open_stream(
+                sources=sources,
+                name=name,
+                config=config,
+                meta=meta,
+            )
         )
 
     def stream_data(
@@ -1849,21 +1957,43 @@ class ChatStreamerConsumerViewV1:
         finish_stream: bool | None = None,
         stream_meta: Dict | None = None,
     ) -> None:
-        self.__streamer.stream_data(
-            data,
-            missing_stream_callback=missing_stream_callback,
-            finish_stream=finish_stream,
-            stream_meta=stream_meta,
+        runtime = self.__work_runtime_v1
+        if runtime is None:
+            self.__streamer.stream_data(
+                data,
+                missing_stream_callback=missing_stream_callback,
+                finish_stream=finish_stream,
+                stream_meta=stream_meta,
+            )
+            return
+        scope = runtime.current_scope_v1()
+        if scope is None:
+            return
+        runtime.perform_if_live_v1(
+            scope.registered_work,
+            WorkValidationBoundaryV1.BEFORE_EGRESS,
+            lambda: self.__streamer.stream_data(
+                data,
+                missing_stream_callback=missing_stream_callback,
+                finish_stream=finish_stream,
+                stream_meta=stream_meta,
+                _trusted_root_envelope_ref=scope.envelope_ref,
+                _work_parent_fence_v1=scope.registered_work.fence,
+            ),
         )
 
     def cancel_current(self) -> None:
-        self.__streamer.cancel_current()
+        self.__perform_with_result_v1(self.__streamer.cancel_current)
 
     def cancel_stream(self, stream_id: ChatStreamIdentity) -> bool:
-        return self.__streamer.cancel_stream(stream_id)
+        return bool(
+            self.__perform_with_result_v1(
+                lambda: self.__streamer.cancel_stream(stream_id)
+            )
+        )
 
     def finish_current(self) -> None:
-        self.__streamer.finish_current()
+        self.__perform_with_result_v1(self.__streamer.finish_current)
 
     def find_stream(
         self,
@@ -1888,12 +2018,14 @@ class ChatDataSubmitter:
         auto_update_input_stream: bool = True,
         security_authority: SecurityAuthorityV1 | None = None,
         producer_authority: ProducerAuthorityReferenceV1 | None = None,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
     ):
         self.streamers: Dict[ChatDataType, List[ChatStreamer]] = {}
         self.streamer_name_map: Dict[str, ChatStreamer] = {}
         self.auto_update_input_stream = auto_update_input_stream
         self._security_authority = security_authority
         self._producer_authority = producer_authority
+        self._work_runtime_v1 = work_runtime_v1
         # Type mapping for override support: original_type -> actual_type
         self._output_type_mapping: Dict[ChatDataType, ChatDataType] = {}
 
@@ -1979,17 +2111,203 @@ class ChatDataSubmitter:
     def get_streamer_by_name(self, name: str):
         return self.streamer_name_map.get(name, None)
 
-    def submit(self, data: Union[StreamableData, Tuple[ChatDataType, StreamableData]],
-               finish_stream: Optional[bool] = None):
+    def submit(
+        self,
+        data: Union[
+            StreamableData,
+            Tuple[ChatDataType, StreamableData],
+        ],
+        finish_stream: Optional[bool] = None,
+    ):
+        runtime = self._work_runtime_v1
+        if runtime is None:
+            return self._submit_active_scope_v1(
+                data,
+                finish_stream=finish_stream,
+            )
+        scope = runtime.current_scope_v1()
+        if scope is None:
+            return None
+        result = []
+        allowed = runtime.perform_if_live_v1(
+            scope.registered_work,
+            WorkValidationBoundaryV1.BEFORE_EGRESS,
+            lambda: result.append(
+                self._submit_active_scope_v1(
+                    data,
+                    finish_stream=finish_stream,
+                )
+            ),
+        )
+        return result[0] if allowed and result else None
+
+    def submit_ingress_v1(
+        self,
+        data: Union[
+            StreamableData,
+            Tuple[ChatDataType, StreamableData],
+        ],
+        finish_stream: Optional[bool] = None,
+    ):
+        """Register legitimate transport ingress before core submission."""
+
+        runtime = self._work_runtime_v1
+        if runtime is None:
+            return self.submit(data, finish_stream=finish_stream)
+        if runtime.current_scope_v1() is not None:
+            # Callback-derived ingress remains descended from its exact
+            # server-owned parent instead of consulting the latest epoch.
+            return self.submit(data, finish_stream=finish_stream)
+        with self.ingress_work_scope_v1():
+            return self.submit(data, finish_stream=finish_stream)
+
+    @contextmanager
+    def ingress_work_scope_v1(
+        self,
+    ) -> Iterator[WorkExecutionScopeV1 | None]:
+        """Create one legitimate current-generation transport ingress scope."""
+
+        runtime = self._work_runtime_v1
+        if runtime is None:
+            yield None
+            return
+        try:
+            ingress = runtime.register_root_work_v1(
+                WorkOperationKindV1.GENERIC_ASYNC
+            )
+        except WorkAdmissionDeniedV1:
+            yield None
+            return
+        try:
+            envelope_ref = None
+            if self._security_authority is not None:
+                parent_refs = self.active_security_parent_refs_v1()
+                envelope_ref = (
+                    self._security_authority.envelope_for_producer_v1(
+                        self._producer_authority,
+                        parent_refs,
+                    )
+                )
+                if envelope_ref is None:
+                    yield None
+                    return
+            with runtime.activate_work_v1(
+                ingress,
+                envelope_ref,
+            ) as scope:
+                yield scope
+        finally:
+            runtime.release_work_v1(ingress)
+
+    def make_current_work_item_v1(
+        self,
+        payload: Any,
+        operation_kind: WorkOperationKindV1,
+        *,
+        envelope_ref: SecurityEnvelopeReferenceV1 | None = None,
+    ) -> WorkBoundItemV1 | None:
+        """Bind callback-derived output to the exact active ingress parent."""
+
+        runtime = self._work_runtime_v1
+        if runtime is None:
+            return None
+        scope = runtime.current_scope_v1()
+        if scope is None:
+            return None
+        try:
+            return runtime.make_child_item_v1(
+                payload,
+                operation_kind,
+                parent=scope.registered_work,
+                envelope_ref=(
+                    envelope_ref
+                    if envelope_ref is not None
+                    else scope.envelope_ref
+                ),
+            )
+        except WorkAdmissionDeniedV1:
+            return None
+
+    def submit_ingress_with_egress_item_v1(
+        self,
+        data: Union[
+            StreamableData,
+            Tuple[ChatDataType, StreamableData],
+        ],
+        egress_payload: Any,
+        egress_kind: WorkOperationKindV1,
+        *,
+        finish_stream: bool | None = None,
+    ) -> WorkBoundItemV1 | None:
+        """Submit ingress and mint loopback work before releasing its root."""
+
+        runtime = self._work_runtime_v1
+        if runtime is None:
+            self.submit(data, finish_stream=finish_stream)
+            return None
+        if runtime.current_scope_v1() is not None:
+            envelope_ref = self.submit(
+                data,
+                finish_stream=finish_stream,
+            )
+            if self._security_authority is not None and envelope_ref is None:
+                return None
+            return self.make_current_work_item_v1(
+                egress_payload,
+                egress_kind,
+                envelope_ref=envelope_ref,
+            )
+        with self.ingress_work_scope_v1() as scope:
+            if scope is None:
+                return None
+            envelope_ref = self.submit(
+                data,
+                finish_stream=finish_stream,
+            )
+            if self._security_authority is not None and envelope_ref is None:
+                return None
+            return self.make_current_work_item_v1(
+                egress_payload,
+                egress_kind,
+                envelope_ref=envelope_ref,
+            )
+
+    def _submit_active_scope_v1(
+        self,
+        data: Union[
+            StreamableData,
+            Tuple[ChatDataType, StreamableData],
+        ],
+        finish_stream: Optional[bool] = None,
+    ):
         if data is None:
             return
         trusted_submission_envelope_ref = None
+        work_parent_fence_v1 = None
+        current_envelope_ref_v1 = None
+        if self._work_runtime_v1 is not None:
+            scope = self._work_runtime_v1.current_scope_v1()
+            if scope is None:
+                return
+            work_parent_fence_v1 = scope.registered_work.fence
+            current_envelope_ref_v1 = scope.envelope_ref
         if self._security_authority is not None:
-            trusted_parents = self.active_security_parent_refs_v1()
+            trusted_parents = list(
+                self.active_security_parent_refs_v1()
+            )
+            if (
+                current_envelope_ref_v1 is not None
+                and all(
+                    parent.envelope_id
+                    != current_envelope_ref_v1.envelope_id
+                    for parent in trusted_parents
+                )
+            ):
+                trusted_parents.append(current_envelope_ref_v1)
             trusted_submission_envelope_ref = (
                 self._security_authority.envelope_for_producer_v1(
                     self._producer_authority,
-                    trusted_parents,
+                    tuple(trusted_parents),
                 )
             )
             if trusted_submission_envelope_ref is None:
@@ -2005,7 +2323,10 @@ class ChatDataSubmitter:
             streamers = self.get_streamers(data_type)
         elif isinstance(data, (DataBundle, np.ndarray)):
             if data_type is None:
-                msg = f"Bare DataBundle is supported only if handler outputs single chat data type."
+                msg = (
+                    "Bare DataBundle is supported only if handler outputs "
+                    "single chat data type."
+                )
                 raise ValueError(msg)
         elif isinstance(data, tuple) and len(data) == 2:
             chat_data_type, raw_data = data
@@ -2032,6 +2353,7 @@ class ChatDataSubmitter:
                     _trusted_root_envelope_ref=(
                         trusted_submission_envelope_ref
                     ),
+                    _work_parent_fence_v1=work_parent_fence_v1,
                 )
             except SecurityStreamRejectedV1:
                 if self._security_authority is not None:
@@ -2040,6 +2362,7 @@ class ChatDataSubmitter:
                     )
                     continue
                 raise
+        return trusted_submission_envelope_ref
 
 
 class ChatDataSubmitterConsumerViewV1:
@@ -2060,12 +2383,59 @@ class ChatDataSubmitterConsumerViewV1:
     ) -> None:
         self.__submitter.submit(data, finish_stream=finish_stream)
 
+    def submit_ingress_v1(
+        self,
+        data: Union[
+            StreamableData,
+            Tuple[ChatDataType, StreamableData],
+        ],
+        finish_stream: bool | None = None,
+    ) -> None:
+        self.__submitter.submit_ingress_v1(
+            data,
+            finish_stream=finish_stream,
+        )
+
+    def ingress_work_scope_v1(self):
+        return self.__submitter.ingress_work_scope_v1()
+
+    def make_current_work_item_v1(
+        self,
+        payload: Any,
+        operation_kind: WorkOperationKindV1,
+    ) -> WorkBoundItemV1 | None:
+        return self.__submitter.make_current_work_item_v1(
+            payload,
+            operation_kind,
+        )
+
+    def submit_ingress_with_egress_item_v1(
+        self,
+        data: Union[
+            StreamableData,
+            Tuple[ChatDataType, StreamableData],
+        ],
+        egress_payload: Any,
+        egress_kind: WorkOperationKindV1,
+        *,
+        finish_stream: bool | None = None,
+    ) -> WorkBoundItemV1 | None:
+        return self.__submitter.submit_ingress_with_egress_item_v1(
+            data,
+            egress_payload,
+            egress_kind,
+            finish_stream=finish_stream,
+        )
+
     def get_streamers(
         self,
         data_type: ChatDataType,
     ) -> List[ChatStreamerConsumerViewV1]:
         return [
-            ChatStreamerConsumerViewV1(streamer)
+            ChatStreamerConsumerViewV1(
+                streamer,
+                self.__submitter._work_runtime_v1,
+            )
             for streamer in self.__submitter.get_streamers(data_type)
         ]
 
@@ -2075,7 +2445,10 @@ class ChatDataSubmitterConsumerViewV1:
     ) -> ChatStreamerConsumerViewV1 | None:
         streamer = self.__submitter.get_streamer(data_type)
         return (
-            ChatStreamerConsumerViewV1(streamer)
+            ChatStreamerConsumerViewV1(
+                streamer,
+                self.__submitter._work_runtime_v1,
+            )
             if streamer is not None
             else None
         )
@@ -2086,7 +2459,10 @@ class ChatDataSubmitterConsumerViewV1:
     ) -> ChatStreamerConsumerViewV1 | None:
         streamer = self.__submitter.get_streamer_by_name(name)
         return (
-            ChatStreamerConsumerViewV1(streamer)
+            ChatStreamerConsumerViewV1(
+                streamer,
+                self.__submitter._work_runtime_v1,
+            )
             if streamer is not None
             else None
         )

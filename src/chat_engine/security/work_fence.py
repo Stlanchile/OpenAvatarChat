@@ -13,28 +13,40 @@ from chat_engine.security.epochs import SessionEpochV1
 
 
 class WorkOperationKindV1(str, Enum):
-    """Closed Milestone 3A operation kinds.
+    """Closed Milestone 3 operation kinds.
 
-    Later milestones may add subsystem-specific kinds without changing the
-    fence or controller model.
+    Milestone 3B adds only the production async-subsystem kinds required to
+    fence existing public-chat work. Certificate capture/OCR/query/speech
+    operation kinds intentionally remain absent.
     """
 
     GENERIC_ASYNC = "GENERIC_ASYNC"
     GENERIC_EXTERNAL_CALL = "GENERIC_EXTERNAL_CALL"
     GENERIC_STATE_MUTATION = "GENERIC_STATE_MUTATION"
     GENERIC_EGRESS = "GENERIC_EGRESS"
+    PERCEPTION_INFERENCE = "PERCEPTION_INFERENCE"
+    PERCEPTION_HEARTBEAT = "PERCEPTION_HEARTBEAT"
+    CHAT_AGENT_LLM = "CHAT_AGENT_LLM"
+    CHAT_AGENT_PROACTIVE = "CHAT_AGENT_PROACTIVE"
+    TOOL_EXECUTION = "TOOL_EXECUTION"
+    TTS_SYNTHESIS = "TTS_SYNTHESIS"
+    WS_EGRESS = "WS_EGRESS"
+    RTC_EGRESS = "RTC_EGRESS"
 
 
 class WorkValidationBoundaryV1(str, Enum):
-    """Conceptual validation boundaries shared by future integrations."""
+    """Central validation boundaries used by production integrations."""
 
     ADMISSION = "ADMISSION"
     QUEUE_DEQUEUE = "QUEUE_DEQUEUE"
     BEFORE_EXTERNAL_CALL = "BEFORE_EXTERNAL_CALL"
     AFTER_RETURN_OR_CALLBACK = "AFTER_RETURN_OR_CALLBACK"
     BEFORE_STATE_MUTATION = "BEFORE_STATE_MUTATION"
+    BEFORE_MEMORY_WRITE = "BEFORE_MEMORY_WRITE"
     BEFORE_PRIVATE_STORE_WRITE = "BEFORE_PRIVATE_STORE_WRITE"
+    BEFORE_FOLLOW_ON_WORK = "BEFORE_FOLLOW_ON_WORK"
     BEFORE_EGRESS = "BEFORE_EGRESS"
+    BEFORE_COMPLETION = "BEFORE_COMPLETION"
 
 
 class WorkCancellationSignalV1:

@@ -1,6 +1,4 @@
-from dataclasses import Field, dataclass, field
-import logging
-from torch.multiprocessing import Process, Queue
+from torch.multiprocessing import Queue
 import torch.multiprocessing as mp
 
 import os
@@ -27,7 +25,14 @@ spawn_context = mp.get_context('spawn')
 
 
 class TTSCosyVoiceProcessor(spawn_context.Process):
-    def __init__(self, handler_root: str, config: any, input_queue: Queue, output_queue: Queue):
+    def __init__(
+        self,
+        handler_root: str,
+        config: any,
+        input_queue: Queue,
+        output_queue: Queue,
+        cancelled_work_v1=None,
+    ):
         super().__init__()
         self.handler_root = handler_root
         self.model = None
@@ -42,7 +47,103 @@ class TTSCosyVoiceProcessor(spawn_context.Process):
 
         self.input_queue = input_queue
         self.output_queue = output_queue
+        self.cancelled_work_v1 = cancelled_work_v1
         self.dump_audio = False
+
+    def _process_task_v1(self, task_input):
+        input_text = task_input['text']
+        key = task_input['key']
+        session_id = task_input['session_id']
+        work_ref_v1 = task_input.get("work_ref_v1")
+
+        def is_cancelled_v1() -> bool:
+            return (
+                work_ref_v1 is not None
+                and self.cancelled_work_v1 is not None
+                and self.cancelled_work_v1.get(
+                    work_ref_v1,
+                    False,
+                )
+            )
+
+        try:
+            if is_cancelled_v1():
+                return
+            if len(input_text) < 1:
+                logger.info('ignore empty input_text')
+            elif self.model is None and self.api_url is not None:
+                response = requests.get(
+                    self.api_url,
+                    data={
+                        'tts_text': input_text,
+                        'spk_id': self.spk_id,
+                    },
+                    stream=True,
+                )
+                if response.status_code != 200:
+                    logger.warning("COSYVOICE_REMOTE_REQUEST_FAILED")
+                else:
+                    for audio_bytes in response.iter_content(
+                        chunk_size=16000
+                    ):
+                        if is_cancelled_v1():
+                            break
+                        tts_speech = np.array(
+                            np.frombuffer(
+                                audio_bytes,
+                                dtype=np.int16,
+                            )
+                        ).astype(np.float32) / 32767
+                        output_audio = librosa.resample(
+                            tts_speech,
+                            orig_sr=22050,
+                            target_sr=self.sample_rate,
+                        )
+                        self.output_queue.put({
+                            'key': key,
+                            'tts_speech': output_audio[np.newaxis, ...],
+                            'session_id': session_id,
+                        })
+            else:
+                response = None
+                if self.model:
+                    if self.ref_audio_buffer is not None:
+                        response = self.model.inference_zero_shot(
+                            input_text,
+                            self.ref_audio_text,
+                            self.ref_audio_buffer,
+                            stream=True,
+                        )
+                    elif self.spk_id:
+                        response = self.model.inference_sft(
+                            input_text,
+                            self.spk_id,
+                            stream=True,
+                        )
+                    else:
+                        logger.error("COSYVOICE_MODEL_CONFIG_INVALID")
+                if response is not None:
+                    for tts_speech in response:
+                        if is_cancelled_v1():
+                            break
+                        tts_audio = tts_speech['tts_speech'].numpy()
+                        if self.dump_audio:
+                            self.audio_dump_file.write(
+                                tts_audio.tobytes()
+                            )
+                        self.output_queue.put({
+                            'key': key,
+                            'tts_speech': tts_audio,
+                            'session_id': session_id,
+                        })
+        except Exception:
+            logger.error("COSYVOICE_WORKER_TASK_FAILED")
+        finally:
+            self.output_queue.put({
+                'key': key,
+                'tts_speech': None,
+                'session_id': session_id,
+            })
 
     def run(self):
         logger.remove()
@@ -94,79 +195,7 @@ class TTSCosyVoiceProcessor(spawn_context.Process):
             try:
                 logger.debug('wait for tts task in')
                 input = self.input_queue.get(timeout=5)
-                logger.debug(f'get tts task in {input}')
+                logger.debug("received tts task")
             except Exception:
                 continue
-            input_text = input['text']
-            key = input['key']
-            session_id = input['session_id']
-            if (len(input_text) < 1):
-                # ignore
-                logger.info('ignore empty input_text')
-            elif self.model is None and self.api_url is not None:
-                # if you start cosyvoice tts server through CosyVoice/runtime/python/fastapi/server.py
-                response = requests.get(self.api_url, data={
-                    'tts_text': input_text,
-                    'spk_id': self.spk_id
-                }, stream=True)
-                if response.status_code != 200:
-                    logger.info(f"Request failed with status code {response.status_code}")
-                    continue
-                tts_audio = b''
-                for r in response.iter_content(chunk_size=16000):
-                    tts_audio = r
-                    tts_speech = np.array(np.frombuffer(tts_audio, dtype=np.int16)).astype(np.float32) / 32767
-                    logger.debug(f'audio response {tts_speech.shape}')
-
-                    output_audio = librosa.resample(tts_speech, orig_sr=22050, target_sr=self.sample_rate)
-                    logger.debug(f'audio response resample {output_audio.shape}')
-                    out_audio = output_audio[np.newaxis, ...]
-                    output = {
-                        'key': key,
-                        'tts_speech': out_audio,
-                        'session_id': session_id
-                    }
-                    self.output_queue.put(output)
-            # if self.api_key is not None:
-            #     self.model.streaming_call(input_text)
-
-            #     for tts_audio in self.callback_instance.get_data_generator():
-            #         tts_speech = np.array(np.frombuffer(tts_audio, dtype=np.int16)).astype(np.float32)/32767
-            #         logger.info('audio response', tts_speech.shape)
-
-            #         output_audio = librosa.resample(tts_speech, orig_sr=self.sample_rate, target_sr=24000)
-            #         out_audio = output_audio[np.newaxis, ...]
-            #         yield out_audio
-            else:
-                response = None
-                if self.model:
-                    if self.ref_audio_buffer is not None:
-                        response = self.model.inference_zero_shot(
-                            input_text, self.ref_audio_text, self.ref_audio_buffer, stream=True)
-                    elif self.spk_id:
-                        response = self.model.inference_sft(input_text, self.spk_id, stream=True)
-                    else:
-                        logger.error('cosyvoice need a ref_audio or spk_id')
-                        return
-
-                for tts_speech in response:
-                    tts_audio = tts_speech['tts_speech'].numpy()
-                    logger.debug(f'tts sample rate {self.model.sample_rate}')
-                    # librosa.resample(tts_audio, orig_sr=self.model.sample_rate, target_sr=24000)
-                    tts_audio = tts_audio
-                    # tts_audio = torchaudio.transforms.Resample(orig_freq=22050, new_freq=24000)(tts_audio)
-                    if self.dump_audio:
-                        dump_audio = tts_audio
-                        self.audio_dump_file.write(dump_audio.tobytes())
-                    output = {
-                        'key': key,
-                        'tts_speech': tts_audio,
-                        'session_id': session_id
-                    }
-                    self.output_queue.put(output)
-            output = {
-                'key': key,
-                'tts_speech': None,
-                'session_id': session_id
-            }
-            self.output_queue.put(output)
+            self._process_task_v1(input)

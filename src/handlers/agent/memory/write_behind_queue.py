@@ -12,7 +12,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List
+from typing import Dict
 
 from loguru import logger
 
@@ -59,7 +59,7 @@ class WriteBackQueue(ABC):
         ...
 
     @abstractmethod
-    def shutdown(self):
+    def shutdown(self, *, flush: bool = True):
         """关闭队列，释放资源。"""
         ...
 
@@ -84,7 +84,7 @@ class LocalWriteBackQueue(WriteBackQueue):
             self._total_enqueued += 1
         logger.info(
             f"[WriteBackQueue:Local] enqueued [{item.item_type}] "
-            f"importance={item.importance:.2f}: {item.content[:80]}..."
+            f"importance={item.importance:.2f}"
         )
 
     def flush(self) -> int:
@@ -101,20 +101,23 @@ class LocalWriteBackQueue(WriteBackQueue):
             f"[WriteBackQueue:Local] flushed {count} items "
             f"(by type: {dict(by_type)}; total flushed all-time: {self._total_flushed})"
         )
-        # Per-item lines look like duplicates when many auto-compact snapshots
-        # share the same [COMPACT SUMMARY] prefix (log truncates to 60 chars).
-        for item in items:
-            logger.debug(
-                f"[WriteBackQueue:Local] flush item [{item.item_type}] "
-                f"{item.content[:120]}..."
-            )
         return count
 
     def pending_count(self) -> int:
         return len(self._queue)
 
-    def shutdown(self):
-        self.flush()
+    def shutdown(self, *, flush: bool = True):
+        if flush:
+            self.flush()
+            return
+        with self._lock:
+            dropped = len(self._queue)
+            self._queue.clear()
+        if dropped:
+            logger.info(
+                "[WriteBackQueue:Local] discarded {} pending items",
+                dropped,
+            )
 
     def get_stats(self) -> Dict:
         return {

@@ -1,6 +1,6 @@
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional
 
 from chat_engine.contexts.session_clock import SessionClock
@@ -15,6 +15,15 @@ from chat_engine.security.dispatch import (
     SecurityStreamReferenceV1,
 )
 from chat_engine.security.payload_isolation import isolate_signal_for_consumer_v1
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,9 +59,11 @@ class SignalManager:
         self,
         session_clock: SessionClock,
         security_authority: SecurityAuthorityV1 | None = None,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
     ):
         self.session_clock = session_clock
         self._security_authority = security_authority
+        self._work_runtime_v1 = work_runtime_v1
         self.running_flags = [False]
         self.signal_queue = queue.Queue()
         self.signal_distribute_thread: Optional[threading.Thread] = None
@@ -93,12 +104,26 @@ class SignalManager:
             except RuntimeError:
                 pass
         self.signal_distribute_thread = None
+        self.drain_registered_work_v1()
+        self.clear_listeners()
+
+    def drain_registered_work_v1(self) -> None:
+        """Discard queued signals while releasing their work-owned leases."""
+
         while True:
             try:
-                self.signal_queue.get_nowait()
+                queued_signal = self.signal_queue.get_nowait()
             except queue.Empty:
                 break
-        self.clear_listeners()
+            if self._work_runtime_v1 is None:
+                continue
+            work_item = (
+                queued_signal
+                if isinstance(queued_signal, WorkBoundItemV1)
+                else getattr(queued_signal, "work_item_v1", None)
+            )
+            if isinstance(work_item, WorkBoundItemV1):
+                work_item.release_once_v1(self._work_runtime_v1)
 
     def get_emitter(
         self,
@@ -141,6 +166,37 @@ class SignalManager:
         self.signal_listeners.clear()
 
     def enqueue_signal_v1(
+        self,
+        signal: ChatSignal,
+        *,
+        source_name: str | None,
+        producer_authority: ProducerAuthorityReferenceV1 | None,
+    ) -> None:
+        runtime = self._work_runtime_v1
+        if runtime is not None and runtime.current_work_v1() is None:
+            try:
+                ingress = runtime.register_root_work_v1(
+                    WorkOperationKindV1.GENERIC_ASYNC
+                )
+            except WorkAdmissionDeniedV1:
+                return
+            try:
+                with runtime.activate_work_v1(ingress):
+                    self._enqueue_signal_in_scope_v1(
+                        signal,
+                        source_name=source_name,
+                        producer_authority=producer_authority,
+                    )
+            finally:
+                runtime.release_work_v1(ingress)
+            return
+        self._enqueue_signal_in_scope_v1(
+            signal,
+            source_name=source_name,
+            producer_authority=producer_authority,
+        )
+
+    def _enqueue_signal_in_scope_v1(
         self,
         signal: ChatSignal,
         *,
@@ -228,7 +284,36 @@ class SignalManager:
             payload=signal_snapshot,
         )
         if authorized is not None:
-            self.signal_queue.put_nowait(authorized)
+            runtime = self._work_runtime_v1
+            if runtime is None:
+                self.signal_queue.put_nowait(authorized)
+                return
+            scope = runtime.current_scope_v1()
+            if scope is None:
+                return
+            try:
+                item = runtime.make_child_item_v1(
+                    authorized,
+                    WorkOperationKindV1.GENERIC_ASYNC,
+                    parent=scope.registered_work,
+                    envelope_ref=envelope_ref,
+                )
+            except WorkAdmissionDeniedV1:
+                return
+            authorized = replace(
+                authorized,
+                work_item_v1=item,
+            )
+            try:
+                if not runtime.perform_if_live_v1(
+                    item.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_EGRESS,
+                    lambda: self.signal_queue.put_nowait(authorized),
+                ):
+                    item.release_once_v1(runtime)
+            except Exception:
+                item.release_once_v1(runtime)
+                raise
 
     def signal_distribute_thread_func(
         self,
@@ -244,92 +329,174 @@ class SignalManager:
                 queued_item = signal_queue.get(block=True, timeout=0.5)
             except queue.Empty:
                 continue
-
-            validated_emission = None
-            if self._security_authority is not None:
-                # Mandatory first security-relevant action after signal dequeue.
-                validated_emission = (
-                    self._security_authority
-                    .validate_dequeued_signal_emission_v1(queued_item)
+            runtime = self._work_runtime_v1
+            if runtime is None:
+                self._distribute_signal_item_v1(
+                    queued_item,
+                    signal_listeners,
                 )
-                if validated_emission is None:
+                continue
+            item = getattr(queued_item, "work_item_v1", None)
+            if not isinstance(item, WorkBoundItemV1):
+                self._distribute_signal_item_v1(
+                    queued_item,
+                    signal_listeners,
+                )
+                continue
+            try:
+                if not runtime.validate_work_v1(
+                    item.registered_work,
+                    WorkValidationBoundaryV1.QUEUE_DEQUEUE,
+                ):
+                    runtime.log_late_drop_v1(
+                        item.registered_work,
+                        "QUEUE_DEQUEUE",
+                    )
                     continue
-                signal = validated_emission.payload
-                if not isinstance(signal, ChatSignal):
+                with runtime.activate_work_v1(
+                    item.registered_work,
+                    item.envelope_ref,
+                ):
+                    self._distribute_signal_item_v1(
+                        queued_item,
+                        signal_listeners,
+                    )
+            finally:
+                item.release_once_v1(runtime)
+
+    def _distribute_signal_item_v1(
+        self,
+        queued_item,
+        signal_listeners: Dict[
+            SignalFilterRule,
+            List[_SignalListenerRegistrationV1],
+        ],
+    ) -> None:
+        validated_emission = None
+        if self._security_authority is not None:
+            # M3 dequeue validation happens before this method.  M2
+            # authentication remains the first payload-relevant action.
+            validated_emission = (
+                self._security_authority
+                .validate_dequeued_signal_emission_v1(queued_item)
+            )
+            if validated_emission is None:
+                return
+            if (
+                self._work_runtime_v1 is not None
+                and self._work_runtime_v1.current_work_v1() is None
+            ):
+                self._security_authority._record(
+                    SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED,
+                    dispatch_id=validated_emission.emission_id,
+                )
+                return
+            if self._work_runtime_v1 is not None:
+                scope = self._work_runtime_v1.current_scope_v1()
+                if (
+                    scope is None
+                    or scope.envelope_ref
+                    != validated_emission.envelope_ref
+                ):
                     self._security_authority._record(
                         SecurityAuditEventCodeV1.DISPATCH_DENIED,
                         dispatch_id=validated_emission.emission_id,
                     )
-                    continue
-                signal.type = validated_emission.trusted_signal_type
-                signal.source_type = validated_emission.trusted_source_type
-                signal.source_name = validated_emission.trusted_source_name
-                if validated_emission.stream_ref is not None:
-                    trusted_identity = validated_emission.stream_ref.identity
-                    signal.related_stream = ChatStreamIdentity(
-                        data_type=trusted_identity.data_type,
-                        builder_id=trusted_identity.builder_id,
-                        stream_id=trusted_identity.stream_id,
-                        name=trusted_identity.name,
-                        producer_name=trusted_identity.producer_name,
-                    )
-                else:
-                    signal.related_stream = None
+                    return
+            signal = validated_emission.payload
+            if not isinstance(signal, ChatSignal):
+                self._security_authority._record(
+                    SecurityAuditEventCodeV1.DISPATCH_DENIED,
+                    dispatch_id=validated_emission.emission_id,
+                )
+                return
+            signal.type = validated_emission.trusted_signal_type
+            signal.source_type = validated_emission.trusted_source_type
+            signal.source_name = validated_emission.trusted_source_name
+            if validated_emission.stream_ref is not None:
+                trusted_identity = validated_emission.stream_ref.identity
+                signal.related_stream = ChatStreamIdentity(
+                    data_type=trusted_identity.data_type,
+                    builder_id=trusted_identity.builder_id,
+                    stream_id=trusted_identity.stream_id,
+                    name=trusted_identity.name,
+                    producer_name=trusted_identity.producer_name,
+                )
             else:
-                signal = queued_item
+                signal.related_stream = None
+        else:
+            signal = queued_item
 
-            signal_stream_type = signal.related_stream.data_type if signal.related_stream is not None else None
-            filter_keys = [
-                SignalFilterRule(signal.type, signal.source_type, None),
-                SignalFilterRule(None, signal.source_type, None),
-                SignalFilterRule(signal.type, None, None),
-                SignalFilterRule(None, None, None),
+        signal_stream_type = (
+            signal.related_stream.data_type
+            if signal.related_stream is not None
+            else None
+        )
+        filter_keys = [
+            SignalFilterRule(signal.type, signal.source_type, None),
+            SignalFilterRule(None, signal.source_type, None),
+            SignalFilterRule(signal.type, None, None),
+            SignalFilterRule(None, None, None),
+        ]
+        if signal_stream_type is not None:
+            filter_keys += [
+                SignalFilterRule(
+                    signal.type,
+                    signal.source_type,
+                    signal_stream_type,
+                ),
+                SignalFilterRule(
+                    None,
+                    signal.source_type,
+                    signal_stream_type,
+                ),
+                SignalFilterRule(
+                    signal.type,
+                    None,
+                    signal_stream_type,
+                ),
+                SignalFilterRule(None, None, signal_stream_type),
             ]
-            if signal_stream_type is not None:
-                filter_keys += [
-                    SignalFilterRule(signal.type, signal.source_type, signal_stream_type),
-                    SignalFilterRule(None, signal.source_type, signal_stream_type),
-                    SignalFilterRule(signal.type, None, signal_stream_type),
-                    SignalFilterRule(None, None, signal_stream_type),
-                ]
-            for filter_key in filter_keys:
-                for registration in signal_listeners.get(filter_key, []):
-                    if self._security_authority is not None:
-                        capability = registration.consumer_capability
-                        if capability is None or not (
-                            self._security_authority.consumer_is_authorized_v1(
-                                validated_emission.envelope_ref,
-                                capability,
-                            )
-                        ):
-                            continue
-                        producer_authority = (
-                            registration.producer_authority
+        for filter_key in filter_keys:
+            for registration in signal_listeners.get(filter_key, []):
+                if self._security_authority is not None:
+                    capability = registration.consumer_capability
+                    if capability is None or not (
+                        self._security_authority.consumer_is_authorized_v1(
+                            validated_emission.envelope_ref,
+                            capability,
                         )
-                        if (
-                            producer_authority is not None
-                            and not self._security_authority.record_signal_for_producer_v1(
-                                producer_authority,
-                                capability,
-                                validated_emission.envelope_ref,
-                                dispatch_id=(
-                                    validated_emission.emission_id
-                                ),
-                            )
-                        ):
-                            continue
-                        listener_signal = isolate_signal_for_consumer_v1(signal)
-                        try:
-                            registration.listener(listener_signal)
-                        except Exception:
-                            # Never log a private signal or exception text.
-                            self._security_authority._record(
-                                SecurityAuditEventCodeV1.DISPATCH_DENIED,
-                                envelope_id=(
-                                    validated_emission.envelope_ref.envelope_id
-                                ),
-                                consumer_capability_id=capability.capability_id,
-                                dispatch_id=validated_emission.emission_id,
-                            )
-                    else:
-                        registration.listener(signal)
+                    ):
+                        continue
+                    producer_authority = registration.producer_authority
+                    if (
+                        producer_authority is not None
+                        and not self._security_authority
+                        .record_signal_for_producer_v1(
+                            producer_authority,
+                            capability,
+                            validated_emission.envelope_ref,
+                            dispatch_id=validated_emission.emission_id,
+                        )
+                    ):
+                        continue
+                    listener_signal = isolate_signal_for_consumer_v1(
+                        signal
+                    )
+                    try:
+                        registration.listener(listener_signal)
+                    except Exception:
+                        # Never log a private signal or exception text.
+                        self._security_authority._record(
+                            SecurityAuditEventCodeV1.DISPATCH_DENIED,
+                            envelope_id=(
+                                validated_emission
+                                .envelope_ref.envelope_id
+                            ),
+                            consumer_capability_id=(
+                                capability.capability_id
+                            ),
+                            dispatch_id=validated_emission.emission_id,
+                        )
+                else:
+                    registration.listener(signal)

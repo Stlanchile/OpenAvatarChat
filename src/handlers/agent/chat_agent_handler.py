@@ -30,6 +30,12 @@ from chat_engine.data_models.chat_signal import ChatSignal, SignalFilterRule
 from chat_engine.data_models.chat_signal_type import ChatSignalType
 from chat_engine.data_models.chat_stream_config import ChatStreamConfig
 from chat_engine.data_models.runtime_data.data_bundle import DataBundle, DataBundleDefinition, DataBundleEntry
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    RegisteredWorkV1,
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
 
 from handlers.agent.agent_data_models import PerceptionData, EnvironmentEvent
 from handlers.agent.memory.session_memory_manager import SessionMemoryManager, MemoryConfig
@@ -48,6 +54,9 @@ from handlers.agent.prompt.prompt_compiler import (
 
 
 # ── 主动消息触发配置 ──
+
+_PROACTIVE_LIFECYCLE_SECONDS_V1 = 24 * 60 * 60
+
 
 class EventTriggerConfig(BaseModel):
     """单个事件类型的触发配置"""
@@ -279,6 +288,11 @@ class ChatAgentContext(HandlerContext):
         # Serialize _generate_response — the idle-trigger thread and the
         # pipeline thread must never call it concurrently.
         self._generate_lock: threading.Lock = threading.Lock()
+        self._idle_thread: Optional[threading.Thread] = None
+        self._secure_generation_v1: Optional[int] = None
+        self._idle_lifecycle_lock_v1 = threading.Lock()
+        self._idle_lifecycle_work_v1: Optional[RegisteredWorkV1] = None
+        self._idle_loop_enabled_v1 = False
 
 
 class ChatAgentHandler(HandlerBase, ABC):
@@ -349,6 +363,21 @@ class ChatAgentHandler(HandlerBase, ABC):
             or proactive_cfg.pending_confirmation_trigger.enabled
         )
         if need_loop:
+            context._idle_loop_enabled_v1 = True
+            runtime = context.work_runtime_v1
+            if runtime is not None:
+                try:
+                    lifecycle_work = runtime.register_root_work_v1(
+                        WorkOperationKindV1.CHAT_AGENT_PROACTIVE,
+                        deadline_monotonic=(
+                            time.monotonic()
+                            + _PROACTIVE_LIFECYCLE_SECONDS_V1
+                        ),
+                    )
+                except WorkAdmissionDeniedV1:
+                    lifecycle_work = None
+                with context._idle_lifecycle_lock_v1:
+                    context._idle_lifecycle_work_v1 = lifecycle_work
             t = threading.Thread(
                 target=self._idle_trigger_loop,
                 args=(context,),
@@ -356,11 +385,85 @@ class ChatAgentHandler(HandlerBase, ABC):
                 name=f"chat-idle-{context.session_id}",
             )
             t.start()
+            context._idle_thread = t
             logger.info(
                 f"[ChatAgent] 主动触发循环已启动 "
                 f"(idle={proactive_cfg.idle_trigger.enabled}, "
                 f"pending_confirm={proactive_cfg.pending_confirmation_trigger.enabled})"
             )
+
+    @staticmethod
+    def _idle_lifecycle_snapshot_v1(
+        context: ChatAgentContext,
+    ) -> RegisteredWorkV1 | None:
+        with context._idle_lifecycle_lock_v1:
+            return context._idle_lifecycle_work_v1
+
+    @staticmethod
+    def _release_idle_lifecycle_if_matches_v1(
+        context: ChatAgentContext,
+        expected: RegisteredWorkV1,
+    ) -> None:
+        runtime = context.work_runtime_v1
+        should_release = False
+        with context._idle_lifecycle_lock_v1:
+            if context._idle_lifecycle_work_v1 is expected:
+                context._idle_lifecycle_work_v1 = None
+                should_release = True
+        if should_release and runtime is not None:
+            runtime.release_work_v1(expected)
+
+    def _refresh_idle_lifecycle_from_ingress_v1(
+        self,
+        context: ChatAgentContext,
+        parent: RegisteredWorkV1,
+    ) -> None:
+        """Install a generation anchor only from exact live ingress ancestry."""
+
+        if not context._idle_loop_enabled_v1:
+            return
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            return
+        existing = self._idle_lifecycle_snapshot_v1(context)
+        if (
+            existing is not None
+            and existing.fence.session_epoch
+            == parent.fence.session_epoch
+            and runtime.validate_work_v1(
+                existing,
+                WorkValidationBoundaryV1.ADMISSION,
+            )
+        ):
+            return
+        try:
+            replacement = runtime.register_child_work_v1(
+                parent,
+                WorkOperationKindV1.CHAT_AGENT_PROACTIVE,
+                deadline_monotonic=(
+                    time.monotonic()
+                    + _PROACTIVE_LIFECYCLE_SECONDS_V1
+                ),
+            )
+        except WorkAdmissionDeniedV1:
+            return
+        replaced: list[RegisteredWorkV1 | None] = []
+
+        def swap_lifecycle() -> None:
+            with context._idle_lifecycle_lock_v1:
+                replaced.append(context._idle_lifecycle_work_v1)
+                context._idle_lifecycle_work_v1 = replacement
+            context._proactive_wake.set()
+
+        if not runtime.perform_if_live_v1(
+            parent,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            swap_lifecycle,
+        ):
+            runtime.release_work_v1(replacement)
+            return
+        if replaced and replaced[0] is not None:
+            runtime.release_work_v1(replaced[0])
 
     def get_handler_detail(self, session_context: SessionContext,
                            context: HandlerContext) -> HandlerDetail:
@@ -391,14 +494,51 @@ class ChatAgentHandler(HandlerBase, ABC):
 
         if signal.type == ChatSignalType.STREAM_CANCEL and signal.related_stream:
             stream_key = signal.related_stream.stream_key_str
-            if stream_key is not None and stream_key in context.active_stream_keys:
-                context.active_stream_keys.discard(stream_key)
-                logger.info(f"[ChatAgent] Removed stream {stream_key} from active set")
+            if stream_key is not None:
+                if context.work_runtime_v1 is None:
+                    if stream_key not in context.active_stream_keys:
+                        return
+                    context.active_stream_keys.discard(
+                        stream_key
+                    )
+                else:
+                    if not context.work_runtime_v1\
+                        .perform_current_if_live_v1(
+                        WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        lambda: context.active_stream_keys.discard(
+                            stream_key
+                        ),
+                    ):
+                        return
+                if context.work_runtime_v1 is None:
+                    logger.info(
+                        f"[ChatAgent] Removed stream {stream_key} "
+                        "from active set"
+                    )
+                else:
+                    logger.info("CHAT_AGENT_STREAM_CANCELLED")
             return
 
         if signal.type == ChatSignalType.ENVIRONMENT_EVENT:
             event = EnvironmentEvent.from_dict(signal.signal_data or {})
             importance = self._event_importance(event)
+            if context.work_runtime_v1 is not None:
+                def record_event() -> None:
+                    if context.memory:
+                        context.memory.record_perception(
+                            content=event.description,
+                            category="event",
+                            importance=importance,
+                            metadata=event.to_dict(),
+                            event_type=event.event_type,
+                        )
+                    context.pending_events.append(event)
+
+                context.work_runtime_v1.perform_current_if_live_v1(
+                    WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                    record_event,
+                )
+                return
             if context.memory:
                 context.memory.record_perception(
                     content=event.description,
@@ -414,6 +554,33 @@ class ChatAgentHandler(HandlerBase, ABC):
     def handle(self, context: HandlerContext, inputs: ChatData,
                output_definitions: Dict[ChatDataType, HandlerDataInfo]):
         context = cast(ChatAgentContext, context)
+
+        if context.work_runtime_v1 is not None:
+            work = context.current_work_v1()
+            runtime = context.work_runtime_v1
+            if (
+                work is None
+                or not runtime.validate_work_v1(
+                    work,
+                    WorkValidationBoundaryV1.ADMISSION,
+                )
+            ):
+                return
+            self._refresh_idle_lifecycle_from_ingress_v1(
+                context,
+                work,
+            )
+            generation = work.fence.session_epoch.generation
+            if context._secure_generation_v1 != generation:
+                if not runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    lambda: self._reset_generation_state_v1(
+                        context,
+                        generation,
+                    ),
+                ):
+                    return
 
         logger.debug(
             f"[ChatAgent] 收到输入: type={inputs.type.value}, is_last={inputs.is_last_data}"
@@ -431,6 +598,20 @@ class ChatAgentHandler(HandlerBase, ABC):
             self._handle_human_text(context, inputs, output_definitions)
             return
 
+    @staticmethod
+    def _reset_generation_state_v1(
+        context: ChatAgentContext,
+        generation: int,
+    ) -> None:
+        context.input_buffer = ""
+        context.pending_events.clear()
+        context.responded_events.clear()
+        context.cached_perception = None
+        context.active_stream_keys.clear()
+        context.is_generating = False
+        context._idle_triggered = False
+        context._secure_generation_v1 = generation
+
     # ── PERCEPTION_CONTEXT ──
 
     def _handle_perception_context(self, context: ChatAgentContext, inputs: ChatData):
@@ -442,8 +623,42 @@ class ChatAgentHandler(HandlerBase, ABC):
             try:
                 data = json.loads(data)
             except json.JSONDecodeError:
-                logger.warning(f"Failed to parse perception data as JSON: {data[:100]}")
+                if context.work_runtime_v1 is None:
+                    logger.warning(
+                        "Failed to parse perception data as JSON: "
+                        f"{data[:100]}"
+                    )
+                else:
+                    logger.warning(
+                        "PERCEPTION_CONTEXT_PARSE_FAILED"
+                    )
                 return
+        if context.work_runtime_v1 is not None:
+            perception = None
+            if isinstance(data, dict):
+                perception = PerceptionData.from_dict(data)
+            elif isinstance(data, PerceptionData):
+                perception = data
+            if perception is None:
+                return
+            runtime = context.work_runtime_v1
+            work = context.current_work_v1()
+
+            def commit_perception() -> None:
+                context.cached_perception = perception
+                if context.memory:
+                    context.memory.record_perception(
+                        content=perception.scene_summary,
+                        category="scene",
+                        importance=0.3,
+                    )
+
+            runtime.perform_if_live_v1(
+                work,
+                WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                commit_perception,
+            )
+            return
         if isinstance(data, dict):
             context.cached_perception = PerceptionData.from_dict(data)
         elif isinstance(data, PerceptionData):
@@ -476,7 +691,74 @@ class ChatAgentHandler(HandlerBase, ABC):
             return
 
         event = EnvironmentEvent.from_dict(data)
-        trigger_cfg = context.config.proactive.event_triggers.get(event.event_type)
+        importance = self._event_importance(event)
+        if context.work_runtime_v1 is not None:
+            runtime = context.work_runtime_v1
+            parent_work = context.current_work_v1()
+            accepted: list[tuple[EventTriggerConfig, bool]] = []
+
+            def admit_and_record_event() -> None:
+                trigger = (
+                    context.config.proactive.event_triggers.get(
+                        event.event_type
+                    )
+                )
+                if (
+                    trigger is None
+                    or not trigger.enabled
+                    or self._should_skip_event(
+                        context,
+                        event,
+                        trigger.cooldown,
+                    )
+                ):
+                    return
+                if context.memory:
+                    context.memory.record_perception(
+                        content=event.description,
+                        category="event",
+                        importance=importance,
+                        metadata=event.to_dict(),
+                        event_type=event.event_type,
+                    )
+                context.output_definitions = output_definitions
+                accepted.append(
+                    (
+                        trigger,
+                        event.should_interrupt()
+                        or (
+                            event.should_respond_immediately()
+                            and not context.is_generating
+                        ),
+                    )
+                )
+
+            if not runtime.perform_if_live_v1(
+                parent_work,
+                WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                admit_and_record_event,
+            ) or not accepted:
+                return
+            trigger_cfg, respond_now = accepted[0]
+            if respond_now:
+                self._handle_proactive_response(
+                    context,
+                    [event],
+                    output_definitions,
+                    [trigger_cfg],
+                    parent_work_v1=parent_work,
+                )
+            else:
+                runtime.perform_if_live_v1(
+                    parent_work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    lambda: context.pending_events.append(event),
+                )
+            return
+
+        trigger_cfg = context.config.proactive.event_triggers.get(
+            event.event_type
+        )
 
         if trigger_cfg is None or not trigger_cfg.enabled:
             logger.debug(f"[ChatAgent] 事件类型未配置或已禁用: {event.event_type}")
@@ -491,7 +773,6 @@ class ChatAgentHandler(HandlerBase, ABC):
             f"(confidence: {event.confidence:.2f}, urgency: {event.urgency})"
         )
 
-        importance = self._event_importance(event)
         if context.memory:
             context.memory.record_perception(
                 content=event.description,
@@ -525,9 +806,22 @@ class ChatAgentHandler(HandlerBase, ABC):
         events: List[EnvironmentEvent],
         output_definitions: Dict[ChatDataType, HandlerDataInfo],
         trigger_cfgs: Optional[List[Optional[EventTriggerConfig]]] = None,
+        *,
+        parent_work_v1: RegisteredWorkV1 | None = None,
+        existing_work_v1: RegisteredWorkV1 | None = None,
     ):
         """对一组事件产出一次合并回复。"""
         if not events:
+            return
+        if context.work_runtime_v1 is not None:
+            self._handle_proactive_response_fenced_v1(
+                context,
+                events,
+                output_definitions,
+                trigger_cfgs,
+                parent_work_v1=parent_work_v1,
+                existing_work_v1=existing_work_v1,
+            )
             return
 
         acquired = context._generate_lock.acquire(timeout=0.5)
@@ -573,6 +867,123 @@ class ChatAgentHandler(HandlerBase, ABC):
         finally:
             context._generate_lock.release()
 
+    def _handle_proactive_response_fenced_v1(
+        self,
+        context: ChatAgentContext,
+        events: List[EnvironmentEvent],
+        output_definitions: Dict[ChatDataType, HandlerDataInfo],
+        trigger_cfgs: Optional[
+            List[Optional[EventTriggerConfig]]
+        ],
+        *,
+        parent_work_v1: RegisteredWorkV1 | None,
+        existing_work_v1: RegisteredWorkV1 | None,
+    ) -> None:
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            return
+        work = existing_work_v1
+        owns_work = False
+        if work is None:
+            parent = parent_work_v1 or context.current_work_v1()
+            if parent is None:
+                # Callback-derived proactive work must never consult the
+                # latest epoch.  Legitimate idle timers pre-register their
+                # own root before waiting and pass it as existing_work_v1.
+                return
+            try:
+                work = runtime.register_child_work_v1(
+                    parent,
+                    WorkOperationKindV1.CHAT_AGENT_PROACTIVE,
+                )
+                owns_work = True
+            except WorkAdmissionDeniedV1:
+                return
+
+        envelope_ref = context.current_work_envelope_v1()
+        acquired = False
+        try:
+            with context.activate_work_v1(work, envelope_ref):
+                acquired = context._generate_lock.acquire(timeout=0.5)
+                if not acquired:
+                    return
+                if not runtime.validate_work_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                ):
+                    return
+                if not runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    lambda: setattr(context, "is_generating", True),
+                ):
+                    return
+
+                cfgs = trigger_cfgs or [None] * len(events)
+                hints = [
+                    cfg.hint
+                    if cfg is not None and cfg.hint
+                    else event.description
+                    for event, cfg in zip(events, cfgs)
+                ]
+                prompt_inputs = []
+                if not runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                    lambda: prompt_inputs.append(
+                        self._build_prompt_input(
+                            context,
+                            trigger_type="event",
+                            response_hint="\n".join(hints),
+                        )
+                    ),
+                ):
+                    return
+
+                def record_system_events() -> None:
+                    if context.memory:
+                        for event in events:
+                            context.memory.record_system_event(
+                                content=(
+                                    f"[环境事件: {event.event_type}] "
+                                    f"{event.description}"
+                                ),
+                                trigger_type="event",
+                            )
+
+                if not runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                    record_system_events,
+                ):
+                    return
+                self._generate_response(
+                    context,
+                    prompt_inputs[0],
+                    output_definitions,
+                    work_v1=work,
+                )
+
+                def finish_proactive_state() -> None:
+                    now = time.time()
+                    for event in events:
+                        context.responded_events[
+                            event.event_type
+                        ] = now
+                    context.last_interaction_time = now
+                    context._idle_triggered = False
+
+                runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                    finish_proactive_state,
+                )
+        finally:
+            if acquired:
+                context._generate_lock.release()
+            if owns_work and work is not None:
+                runtime.release_work_v1(work)
+
     # ── HUMAN_TEXT (用户输入主流程) ──
 
     def _handle_human_text(
@@ -580,6 +991,13 @@ class ChatAgentHandler(HandlerBase, ABC):
         inputs: ChatData,
         output_definitions: Dict[ChatDataType, HandlerDataInfo],
     ):
+        if context.work_runtime_v1 is not None:
+            self._handle_human_text_fenced_v1(
+                context,
+                inputs,
+                output_definitions,
+            )
+            return
         if context.responded_events:
             context.responded_events.clear()
         if context.pending_events:
@@ -639,6 +1057,118 @@ class ChatAgentHandler(HandlerBase, ABC):
             if acquired:
                 context._generate_lock.release()
 
+    def _handle_human_text_fenced_v1(
+        self,
+        context: ChatAgentContext,
+        inputs: ChatData,
+        output_definitions: Dict[ChatDataType, HandlerDataInfo],
+    ) -> None:
+        runtime = context.work_runtime_v1
+        parent = context.current_work_v1()
+        if runtime is None or parent is None:
+            return
+        text = inputs.data.get_main_data()
+        completed_text: list[str] = []
+
+        def update_input_state() -> None:
+            context.responded_events.clear()
+            context.pending_events.clear()
+            if isinstance(text, str):
+                context.input_buffer += text
+            if not inputs.is_last_data:
+                return
+            full_text = context.input_buffer.strip()
+            context.input_buffer = ""
+            if full_text:
+                completed_text.append(full_text)
+
+        if not runtime.perform_if_live_v1(
+            parent,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            update_input_state,
+        ):
+            return
+        if not inputs.is_last_data or not completed_text:
+            return
+
+        try:
+            work = runtime.register_child_work_v1(
+                parent,
+                WorkOperationKindV1.CHAT_AGENT_LLM,
+            )
+        except WorkAdmissionDeniedV1:
+            return
+
+        envelope_ref = context.current_work_envelope_v1()
+        acquired = False
+        try:
+            with context.activate_work_v1(work, envelope_ref):
+                acquired = context._generate_lock.acquire(timeout=10.0)
+                if not acquired:
+                    logger.warning(
+                        "CHAT_AGENT_GENERATION_LOCK_TIMEOUT"
+                    )
+                    return
+                if not runtime.validate_work_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                ):
+                    return
+
+                full_text = completed_text[0]
+
+                def begin_generation() -> None:
+                    context.is_generating = True
+                    context.last_interaction_time = time.time()
+                    context._idle_triggered = False
+                    context.output_definitions = output_definitions
+                    if context.memory:
+                        perception_snapshot = (
+                            context.cached_perception.scene_summary
+                            if context.cached_perception
+                            else None
+                        )
+                        context.memory.record_user_input(
+                            content=full_text,
+                            trigger_type="user",
+                            perception_snapshot=perception_snapshot,
+                        )
+
+                if not runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                    begin_generation,
+                ):
+                    return
+
+                prompt_inputs = []
+                if not runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                    lambda: prompt_inputs.append(
+                        self._build_prompt_input(
+                            context,
+                            trigger_type="user",
+                        )
+                    ),
+                ):
+                    return
+
+                self._generate_response(
+                    context,
+                    prompt_inputs[0],
+                    output_definitions,
+                    work_v1=work,
+                )
+                self._process_pending_events(
+                    context,
+                    parent_work_v1=work,
+                )
+        finally:
+            if acquired:
+                context._generate_lock.release()
+            runtime.release_work_v1(work)
+
     # ── 构建 PromptInput ──
 
     def _build_prompt_input(
@@ -697,7 +1227,19 @@ class ChatAgentHandler(HandlerBase, ABC):
         context: ChatAgentContext,
         prompt_input: PromptInput,
         output_definitions: Dict[ChatDataType, HandlerDataInfo],
+        *,
+        work_v1: RegisteredWorkV1 | None = None,
     ):
+        if context.work_runtime_v1 is not None:
+            if work_v1 is None:
+                return
+            self._generate_response_fenced_v1(
+                context,
+                prompt_input,
+                output_definitions,
+                work_v1,
+            )
+            return
         output_definition = output_definitions.get(ChatDataType.AVATAR_TEXT).definition
         streamer = context.data_submitter.get_streamer(ChatDataType.AVATAR_TEXT)
 
@@ -763,6 +1305,166 @@ class ChatAgentHandler(HandlerBase, ABC):
         context.is_generating = False
         context.last_interaction_time = time.time()
 
+    def _generate_response_fenced_v1(
+        self,
+        context: ChatAgentContext,
+        prompt_input: PromptInput,
+        output_definitions: Dict[ChatDataType, HandlerDataInfo],
+        work_v1: RegisteredWorkV1,
+    ) -> None:
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            return
+        output_info = output_definitions.get(
+            ChatDataType.AVATAR_TEXT
+        )
+        if output_info is None or output_info.definition is None:
+            return
+        output_definition = output_info.definition
+        streamer = context.data_submitter.get_streamer(
+            ChatDataType.AVATAR_TEXT
+        )
+        if streamer is None:
+            return
+
+        if context.llm_client is None:
+            output = DataBundle(output_definition)
+            output.set_main_data(
+                "抱歉，我暂时无法处理您的请求，请稍后再试。"
+            )
+            runtime.perform_if_live_v1(
+                work_v1,
+                WorkValidationBoundaryV1.BEFORE_EGRESS,
+                lambda: streamer.stream_data(
+                    output,
+                    finish_stream=True,
+                ),
+            )
+            runtime.perform_if_live_v1(
+                work_v1,
+                WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                lambda: setattr(context, "is_generating", False),
+            )
+            return
+
+        stream_keys: list[str | None] = []
+
+        def prepare_stream() -> None:
+            current = streamer.current_stream
+            stream_key = (
+                current.identity.stream_key_str
+                if current is not None
+                else None
+            )
+            if stream_key is None:
+                stream = streamer.new_stream(
+                    sources=[],
+                    config=ChatStreamConfig(cancelable=True),
+                )
+                stream_key = (
+                    stream.stream_key_str
+                    if stream is not None
+                    else None
+                )
+            if stream_key:
+                context.active_stream_keys.add(stream_key)
+            stream_keys.append(stream_key)
+
+        if not runtime.perform_if_live_v1(
+            work_v1,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            prepare_stream,
+        ):
+            return
+        stream_key = stream_keys[0] if stream_keys else None
+        compiled = context.compiler.compile(prompt_input)
+        messages = compiled.full_messages
+        logger.info(
+            "[ChatAgent] PromptCompiler prepared secure generation "
+            f"(messages={compiled.message_count})"
+        )
+
+        try:
+            full_response = self._agent_loop(
+                context,
+                messages,
+                output_definition,
+                streamer,
+                stream_key,
+                work_v1=work_v1,
+            )
+            if full_response is None:
+                return
+
+            if full_response and context.memory:
+                if not runtime.perform_if_live_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                    lambda: context.memory.record_assistant_response(
+                        full_response
+                    ),
+                ):
+                    return
+                self._check_compact(
+                    context,
+                    work_v1=work_v1,
+                )
+        except Exception:
+            if not runtime.validate_work_v1(
+                work_v1,
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+            ):
+                runtime.log_late_drop_v1(
+                    work_v1,
+                    "CHAT_AGENT_EXCEPTION_AFTER_RETIREMENT",
+                )
+                return
+            logger.error("CHAT_AGENT_LLM_FAILED")
+            output = DataBundle(output_definition)
+            output.set_main_data(
+                "抱歉，我暂时无法处理您的请求，请稍后再试。"
+            )
+            runtime.perform_if_live_v1(
+                work_v1,
+                WorkValidationBoundaryV1.BEFORE_EGRESS,
+                lambda: streamer.stream_data(
+                    output,
+                    finish_stream=True,
+                ),
+            )
+            return
+        finally:
+            if stream_key:
+                runtime.perform_if_live_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    lambda: context.active_stream_keys.discard(
+                        stream_key
+                    ),
+                )
+
+        end_output = DataBundle(output_definition)
+        end_output.set_main_data("")
+        if not runtime.perform_if_live_v1(
+            work_v1,
+            WorkValidationBoundaryV1.BEFORE_EGRESS,
+            lambda: streamer.stream_data(
+                end_output,
+                finish_stream=True,
+            ),
+        ):
+            return
+
+        def finish_generation() -> None:
+            context.is_generating = False
+            context.last_interaction_time = time.time()
+
+        runtime.perform_if_live_v1(
+            work_v1,
+            WorkValidationBoundaryV1.BEFORE_COMPLETION,
+            finish_generation,
+        )
+
     @staticmethod
     def _apply_llm_extra_body(context: ChatAgentContext, kwargs: dict) -> None:
         """百炼 OpenAI 兼容接口需通过 extra_body 传 enable_thinking"""
@@ -773,6 +1475,31 @@ class ChatAgentHandler(HandlerBase, ABC):
         extra["enable_thinking"] = context.config.enable_thinking
         kwargs["extra_body"] = extra
 
+    @staticmethod
+    def _watch_llm_cancellation_v1(
+        work_v1: RegisteredWorkV1,
+        response,
+    ) -> threading.Event:
+        """Close a blocking stream when controller cancellation fires."""
+
+        stop = threading.Event()
+
+        def close_on_cancel() -> None:
+            while not stop.is_set():
+                if work_v1.cancellation.wait(timeout=0.1):
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return
+
+        threading.Thread(
+            target=close_on_cancel,
+            name="chat_agent_llm_cancel_v1",
+            daemon=True,
+        ).start()
+        return stop
+
     def _agent_loop(
         self,
         context: ChatAgentContext,
@@ -780,6 +1507,8 @@ class ChatAgentHandler(HandlerBase, ABC):
         output_definition,
         streamer,
         stream_key: Optional[str],
+        *,
+        work_v1: RegisteredWorkV1 | None = None,
     ) -> Optional[str]:
         """Multi-step agent loop: LLM call → tool_use → feedback → repeat.
 
@@ -806,11 +1535,57 @@ class ChatAgentHandler(HandlerBase, ABC):
 
             self._apply_llm_extra_body(context, kwargs)
 
+            runtime = context.work_runtime_v1
+            if (
+                runtime is not None
+                and (
+                    work_v1 is None
+                    or not runtime.validate_work_v1(
+                        work_v1,
+                        WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                    )
+                )
+            ):
+                return None
             response = context.llm_client.chat.completions.create(**kwargs)
+            if (
+                runtime is not None
+                and (
+                    work_v1 is None
+                    or not runtime.validate_work_v1(
+                        work_v1,
+                        WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                    )
+                )
+            ):
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                return None
 
-            full_text, tool_calls, cancelled = self._stream_response(
-                context, response, output_definition, streamer, stream_key,
+            cancellation_watcher = (
+                self._watch_llm_cancellation_v1(
+                    work_v1,
+                    response,
+                )
+                if runtime is not None and work_v1 is not None
+                else None
             )
+            try:
+                full_text, tool_calls, cancelled = (
+                    self._stream_response(
+                        context,
+                        response,
+                        output_definition,
+                        streamer,
+                        stream_key,
+                        work_v1=work_v1,
+                    )
+                )
+            finally:
+                if cancellation_watcher is not None:
+                    cancellation_watcher.set()
 
             if cancelled:
                 logger.info("[ChatAgent] Stream cancelled during agent loop")
@@ -837,15 +1612,28 @@ class ChatAgentHandler(HandlerBase, ABC):
                 }
                 for tc in tool_calls
             ]
-            messages.append(assistant_msg)
+            if runtime is None:
+                messages.append(assistant_msg)
+            elif work_v1 is None or not runtime.perform_if_live_v1(
+                work_v1,
+                WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                lambda: messages.append(assistant_msg),
+            ):
+                return None
 
             interrupted_during_tools = False
             for tc in tool_calls:
                 if stream_key and stream_key not in context.active_stream_keys:
-                    logger.info(
-                        f"[ChatAgent] Interrupted before tool '{tc['name']}', "
-                        f"skipping remaining {len(tool_calls)} tool call(s)"
-                    )
+                    if runtime is None:
+                        logger.info(
+                            "[ChatAgent] Interrupted before tool "
+                            f"'{tc['name']}', skipping remaining "
+                            f"{len(tool_calls)} tool call(s)"
+                        )
+                    else:
+                        logger.info(
+                            "CHAT_AGENT_TOOL_EXECUTION_INTERRUPTED"
+                        )
                     interrupted_during_tools = True
                     break
 
@@ -853,20 +1641,66 @@ class ChatAgentHandler(HandlerBase, ABC):
                 try:
                     args = json.loads(tc["arguments"]) if tc["arguments"] else {}
                 except json.JSONDecodeError:
-                    logger.warning(
-                        f"[ChatAgent] Failed to parse tool args: {tc['arguments'][:100]}"
-                    )
+                    if runtime is None:
+                        logger.warning(
+                            "[ChatAgent] Failed to parse tool args: "
+                            f"{tc['arguments'][:100]}"
+                        )
+                    else:
+                        logger.warning(
+                            "CHAT_AGENT_TOOL_ARGS_PARSE_FAILED"
+                        )
 
-                result = registry.execute(tc["name"], args)
-                messages.append({
+                if runtime is None:
+                    result = registry.execute(tc["name"], args)
+                else:
+                    if (
+                        work_v1 is None
+                        or not runtime.validate_work_v1(
+                            work_v1,
+                            WorkValidationBoundaryV1.BEFORE_FOLLOW_ON_WORK,
+                        )
+                    ):
+                        return None
+                    try:
+                        tool_work = runtime.register_child_work_v1(
+                            work_v1,
+                            WorkOperationKindV1.TOOL_EXECUTION,
+                        )
+                    except WorkAdmissionDeniedV1:
+                        return None
+                    try:
+                        with context.activate_work_v1(
+                            tool_work,
+                            context.current_work_envelope_v1(),
+                        ):
+                            result = registry.execute(
+                                tc["name"],
+                                args,
+                                _work_runtime_v1=runtime,
+                                _registered_work_v1=tool_work,
+                            )
+                    finally:
+                        runtime.release_work_v1(tool_work)
+                if result is None:
+                    return None
+                tool_message = {
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result.to_content_str(),
-                })
-                logger.info(
-                    f"[ChatAgent]   tool={tc['name']} → "
-                    f"{result.to_content_str()[:120]}"
-                )
+                }
+                if runtime is None:
+                    messages.append(tool_message)
+                    logger.info(
+                        f"[ChatAgent]   tool={tc['name']} → "
+                        f"{result.to_content_str()[:120]}"
+                    )
+                elif work_v1 is None or not runtime.perform_if_live_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                    lambda: messages.append(tool_message),
+                ):
+                    return None
 
             if interrupted_during_tools:
                 logger.info("[ChatAgent] Agent loop aborted due to interrupt during tool execution")
@@ -880,10 +1714,33 @@ class ChatAgentHandler(HandlerBase, ABC):
             #     for tc in tool_calls
             # )
             if context.pending_confirmations:
-                context.pending_confirmations.tick_round()
-                nag = context.pending_confirmations.get_nag_reminder()
+                nag_holder = []
+
+                def advance_confirmation_round() -> None:
+                    context.pending_confirmations.tick_round()
+                    nag_holder.append(
+                        context.pending_confirmations.get_nag_reminder()
+                    )
+
+                if runtime is None:
+                    advance_confirmation_round()
+                elif work_v1 is None or not runtime.perform_if_live_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    advance_confirmation_round,
+                ):
+                    return None
+                nag = nag_holder[0] if nag_holder else None
                 if nag:
-                    messages.append({"role": "user", "content": nag})
+                    nag_message = {"role": "user", "content": nag}
+                    if runtime is None:
+                        messages.append(nag_message)
+                    elif not runtime.perform_if_live_v1(
+                        work_v1,
+                        WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        lambda: messages.append(nag_message),
+                    ):
+                        return None
                     logger.info("[ChatAgent] Injected pending-confirmations nag reminder")
 
         logger.warning(
@@ -899,6 +1756,8 @@ class ChatAgentHandler(HandlerBase, ABC):
         output_definition,
         streamer,
         stream_key: Optional[str],
+        *,
+        work_v1: RegisteredWorkV1 | None = None,
     ) -> tuple:
         """Stream an LLM response, accumulating text and tool_calls.
 
@@ -908,8 +1767,27 @@ class ChatAgentHandler(HandlerBase, ABC):
         full_text = ""
         tool_calls_accum: Dict[int, dict] = {}
         cancelled = False
+        runtime = context.work_runtime_v1
 
         for chunk in response:
+            if (
+                runtime is not None
+                and (
+                    work_v1 is None
+                    or not runtime.validate_work_v1(
+                        work_v1,
+                        WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                    )
+                )
+            ):
+                cancelled = True
+                full_text = ""
+                tool_calls_accum.clear()
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                break
             if stream_key and stream_key not in context.active_stream_keys:
                 cancelled = True
                 try:
@@ -924,28 +1802,70 @@ class ChatAgentHandler(HandlerBase, ABC):
             delta = chunk.choices[0].delta
 
             if delta.content:
-                full_text += delta.content
-                output = DataBundle(output_definition)
-                output.set_main_data(delta.content)
-                streamer.stream_data(output)
+                if runtime is None:
+                    full_text += delta.content
+                    output = DataBundle(output_definition)
+                    output.set_main_data(delta.content)
+                    streamer.stream_data(output)
+                else:
+                    output = DataBundle(output_definition)
+                    output.set_main_data(delta.content)
+
+                    def publish_chunk() -> None:
+                        nonlocal full_text
+                        full_text += delta.content
+                        streamer.stream_data(output)
+
+                    if work_v1 is None or not runtime.perform_if_live_v1(
+                        work_v1,
+                        WorkValidationBoundaryV1.BEFORE_EGRESS,
+                        publish_chunk,
+                    ):
+                        cancelled = True
+                        full_text = ""
+                        tool_calls_accum.clear()
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                        break
 
             if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_accum:
-                        tool_calls_accum[idx] = {
-                            "id": "",
-                            "name": "",
-                            "arguments": "",
-                        }
-                    entry = tool_calls_accum[idx]
-                    if tc_delta.id:
-                        entry["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            entry["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            entry["arguments"] += tc_delta.function.arguments
+                def accumulate_tool_calls() -> None:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_accum:
+                            tool_calls_accum[idx] = {
+                                "id": "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        entry = tool_calls_accum[idx]
+                        if tc_delta.id:
+                            entry["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                entry["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                entry["arguments"] += (
+                                    tc_delta.function.arguments
+                                )
+
+                if runtime is None:
+                    accumulate_tool_calls()
+                elif work_v1 is None or not runtime.perform_if_live_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    accumulate_tool_calls,
+                ):
+                    cancelled = True
+                    full_text = ""
+                    tool_calls_accum.clear()
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    break
 
         tool_calls_list = [
             tool_calls_accum[idx]
@@ -954,7 +1874,12 @@ class ChatAgentHandler(HandlerBase, ABC):
 
         return full_text, tool_calls_list, cancelled
 
-    def _check_compact(self, context: ChatAgentContext):
+    def _check_compact(
+        self,
+        context: ChatAgentContext,
+        *,
+        work_v1: RegisteredWorkV1 | None = None,
+    ):
         """检查并触发对话上下文自动压缩。"""
         if context.memory and context.memory.should_compact() and context.llm_client:
             compact_model = (
@@ -967,9 +1892,38 @@ class ChatAgentHandler(HandlerBase, ABC):
             task_brief = ""
             if context.task_mirror:
                 task_brief = context.task_mirror.get_active_brief()
+            runtime = context.work_runtime_v1
+            if runtime is None:
+                context.memory.check_and_compact(
+                    context.llm_client,
+                    compact_model,
+                    task_brief=task_brief,
+                    env_state=env_state,
+                )
+                return
+            if work_v1 is None:
+                return
             context.memory.check_and_compact(
-                context.llm_client, compact_model,
-                task_brief=task_brief, env_state=env_state,
+                context.llm_client,
+                compact_model,
+                task_brief=task_brief,
+                env_state=env_state,
+                before_external_call=lambda: runtime.validate_work_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                ),
+                after_external_call=lambda: runtime.validate_work_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                ),
+                perform_if_live=lambda action: (
+                    runtime.perform_if_live_v1(
+                        work_v1,
+                        WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                        action,
+                    )
+                ),
+                redact_errors=True,
             )
 
     # ── 事件工具方法 ──
@@ -982,9 +1936,71 @@ class ChatAgentHandler(HandlerBase, ABC):
             return False
         return (time.time() - last) <= cooldown
 
-    def _process_pending_events(self, context: ChatAgentContext):
+    def _process_pending_events(
+        self,
+        context: ChatAgentContext,
+        *,
+        parent_work_v1: RegisteredWorkV1 | None = None,
+    ):
         """合并所有有效 pending events 为一次 LLM 调用。"""
         if not context.pending_events or not context.output_definitions:
+            return
+        if context.work_runtime_v1 is not None:
+            runtime = context.work_runtime_v1
+            parent = parent_work_v1 or context.current_work_v1()
+            if parent is None:
+                return
+            pending_snapshot: list[EnvironmentEvent] = []
+
+            def take_pending_events() -> None:
+                pending_snapshot.extend(context.pending_events)
+                context.pending_events.clear()
+
+            if not runtime.perform_if_live_v1(
+                parent,
+                WorkValidationBoundaryV1.BEFORE_FOLLOW_ON_WORK,
+                take_pending_events,
+            ):
+                return
+            now = time.time()
+            valid_events = []
+            valid_cfgs = []
+            for event in pending_snapshot:
+                age = (
+                    now - event.timestamp
+                    if event.timestamp > 0
+                    else 0.0
+                )
+                if age > 15.0:
+                    continue
+                trigger_cfg = (
+                    context.config.proactive.event_triggers.get(
+                        event.event_type
+                    )
+                )
+                if trigger_cfg and not trigger_cfg.enabled:
+                    continue
+                cooldown = (
+                    trigger_cfg.cooldown
+                    if trigger_cfg
+                    else 30.0
+                )
+                if self._should_skip_event(
+                    context,
+                    event,
+                    cooldown,
+                ):
+                    continue
+                valid_events.append(event)
+                valid_cfgs.append(trigger_cfg)
+            if valid_events:
+                self._handle_proactive_response(
+                    context,
+                    valid_events,
+                    context.output_definitions,
+                    valid_cfgs,
+                    parent_work_v1=parent,
+                )
             return
 
         max_event_age = 15.0
@@ -1044,6 +2060,46 @@ class ChatAgentHandler(HandlerBase, ABC):
         approval_grace_seconds = 1
 
         while not context._idle_stop.is_set():
+            runtime = context.work_runtime_v1
+            if runtime is not None:
+                lifecycle_work = self._idle_lifecycle_snapshot_v1(
+                    context
+                )
+                if lifecycle_work is None:
+                    context._idle_stop.wait(timeout=0.1)
+                    continue
+                try:
+                    proactive_work = runtime.register_child_work_v1(
+                        lifecycle_work,
+                        WorkOperationKindV1.CHAT_AGENT_PROACTIVE,
+                    )
+                except WorkAdmissionDeniedV1:
+                    self._release_idle_lifecycle_if_matches_v1(
+                        context,
+                        lifecycle_work,
+                    )
+                    context._idle_stop.wait(timeout=0.1)
+                    continue
+                try:
+                    with context.activate_work_v1(proactive_work):
+                        self._idle_trigger_iteration_fenced_v1(
+                            context,
+                            proactive_work,
+                            check_interval,
+                            approval_grace_seconds,
+                        )
+                finally:
+                    runtime.release_work_v1(proactive_work)
+                if not runtime.validate_work_v1(
+                    lifecycle_work,
+                    WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                ):
+                    self._release_idle_lifecycle_if_matches_v1(
+                        context,
+                        lifecycle_work,
+                    )
+                continue
+
             # Block until wake signal or timeout
             woken = context._proactive_wake.wait(timeout=check_interval)
             if woken:
@@ -1137,10 +2193,150 @@ class ChatAgentHandler(HandlerBase, ABC):
                 )
                 context._idle_triggered = True
 
+    def _idle_trigger_iteration_fenced_v1(
+        self,
+        context: ChatAgentContext,
+        work_v1: RegisteredWorkV1,
+        check_interval: float,
+        approval_grace_seconds: float,
+    ) -> None:
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            return
+        wait_deadline = time.monotonic() + check_interval
+        woken = False
+        while not context._idle_stop.is_set():
+            if context._proactive_wake.is_set():
+                woken = True
+                break
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if work_v1.cancellation.wait(
+                timeout=min(remaining, 0.1)
+            ):
+                return
+        if (
+            context._idle_stop.is_set()
+            or not runtime.validate_work_v1(
+                work_v1,
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+            )
+        ):
+            return
+        if woken and not runtime.perform_if_live_v1(
+            work_v1,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            context._proactive_wake.clear,
+        ):
+            return
+        generation = work_v1.fence.session_epoch.generation
+        if context._secure_generation_v1 != generation:
+            if not runtime.perform_if_live_v1(
+                work_v1,
+                WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                lambda: self._reset_generation_state_v1(
+                    context,
+                    generation,
+                ),
+            ):
+                return
+        if context.is_generating or not context.output_definitions:
+            return
+
+        elapsed = time.time() - context.last_interaction_time
+        pc_cfg = context.config.proactive.pending_confirmation_trigger
+        if (
+            woken
+            and pc_cfg.enabled
+            and context.pending_confirmations
+            and context.pending_confirmations.has_pending()
+            and not self._should_skip_event(
+                context,
+                EnvironmentEvent(event_type="pending_confirmation"),
+                pc_cfg.cooldown,
+            )
+        ):
+            time.sleep(approval_grace_seconds)
+            if (
+                context.is_generating
+                or not runtime.validate_work_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                )
+            ):
+                return
+            self._fire_pending_confirmation(
+                context,
+                pc_cfg,
+                existing_work_v1=work_v1,
+            )
+            return
+
+        if (
+            pc_cfg.enabled
+            and context.pending_confirmations
+            and context.pending_confirmations.has_pending()
+            and elapsed >= pc_cfg.idle_seconds
+            and not self._should_skip_event(
+                context,
+                EnvironmentEvent(event_type="pending_confirmation"),
+                pc_cfg.cooldown,
+            )
+        ):
+            self._fire_pending_confirmation(
+                context,
+                pc_cfg,
+                existing_work_v1=work_v1,
+            )
+            return
+        if context._idle_triggered:
+            return
+
+        idle_cfg = context.config.proactive.idle_trigger
+        if not idle_cfg.enabled:
+            return
+        current_mode = (
+            context.memory.session_mode
+            if context.memory
+            else "chitchat"
+        )
+        threshold = idle_cfg.mode_overrides.get(
+            current_mode,
+            idle_cfg.idle_seconds,
+        )
+        if elapsed < threshold:
+            return
+        idle_event = EnvironmentEvent(
+            event_type="idle",
+            description="用户已安静一段时间",
+            confidence=1.0,
+            urgency="low",
+            timestamp=time.time(),
+        )
+        idle_trigger_cfg = EventTriggerConfig(
+            hint=idle_cfg.hint,
+            cooldown=threshold,
+        )
+        self._handle_proactive_response(
+            context,
+            [idle_event],
+            context.output_definitions,
+            [idle_trigger_cfg],
+            existing_work_v1=work_v1,
+        )
+        runtime.perform_if_live_v1(
+            work_v1,
+            WorkValidationBoundaryV1.BEFORE_COMPLETION,
+            lambda: setattr(context, "_idle_triggered", True),
+        )
+
     def _fire_pending_confirmation(
         self,
         context: ChatAgentContext,
         pc_cfg: PendingConfirmationTriggerConfig,
+        *,
+        existing_work_v1: RegisteredWorkV1 | None = None,
     ):
         """触发一次 pending-confirmation 主动响应。"""
         pc_event = EnvironmentEvent(
@@ -1155,7 +2351,11 @@ class ChatAgentHandler(HandlerBase, ABC):
             cooldown=pc_cfg.cooldown,
         )
         self._handle_proactive_response(
-            context, [pc_event], context.output_definitions, [pc_trigger_cfg]
+            context,
+            [pc_event],
+            context.output_definitions,
+            [pc_trigger_cfg],
+            existing_work_v1=existing_work_v1,
         )
 
     # ── OC Bridge 初始化 ──
@@ -1326,6 +2526,19 @@ class ChatAgentHandler(HandlerBase, ABC):
     def destroy_context(self, context: HandlerContext):
         context = cast(ChatAgentContext, context)
         context._idle_stop.set()
+        context._proactive_wake.set()
+        if (
+            context._idle_thread is not None
+            and context._idle_thread is not threading.current_thread()
+        ):
+            context._idle_thread.join(timeout=2.5)
+        context._idle_thread = None
+        lifecycle_work = self._idle_lifecycle_snapshot_v1(context)
+        if lifecycle_work is not None:
+            self._release_idle_lifecycle_if_matches_v1(
+                context,
+                lifecycle_work,
+            )
         if context.oc_channel_client:
             try:
                 context.oc_channel_client.stop()
@@ -1337,7 +2550,9 @@ class ChatAgentHandler(HandlerBase, ABC):
             except Exception:
                 pass
         if context.memory:
-            context.memory.destroy()
+            context.memory.destroy(
+                flush_write_back=context.work_runtime_v1 is None,
+            )
         context.compiler = None
         context.tool_registry = None
         context.oc_mcp_client = None

@@ -1,8 +1,8 @@
 import asyncio
+import contextlib
 import queue
 import threading
 import time
-import typing
 from typing import Dict, List, Iterable
 
 from loguru import logger
@@ -31,7 +31,7 @@ from chat_engine.data_models.engine_channel_type import EngineChannelType
 from chat_engine.data_models.chat_engine_config_data import (HandlerBaseConfigModel, ChatEngineConfigModel,
                                                              LogicBaseConfigModel)
 from chat_engine.data_models.chat_signal import ChatSignal, SignalFilterRule
-from chat_engine.data_models.chat_signal_type import ChatSignalSourceType, ChatSignalType
+from chat_engine.data_models.chat_signal_type import ChatSignalType
 
 from chat_engine.contexts.session_context import SessionContext
 from chat_engine.security.audit_events import SecurityAuditEventCodeV1
@@ -46,6 +46,11 @@ from chat_engine.security.envelope import SecurityClassificationV1
 from chat_engine.security.history import SessionHistoryConsumerViewV1
 from chat_engine.security.session_work_controller import (
     SessionWorkControllerV1,
+)
+from chat_engine.security.work_fence import WorkValidationBoundaryV1
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
 )
 
 
@@ -127,14 +132,22 @@ class ChatSession:
             raise RuntimeError(
                 "work controller requires a secure session"
             )
+        self._work_runtime_v1: SessionWorkRuntimeV1 | None = None
+        if self._work_controller_v1 is not None:
+            self._work_runtime_v1 = SessionWorkRuntimeV1(
+                self._work_controller_v1,
+                self._security_authority,
+            )
         self.signal_manager = SignalManager(
             self.session_context.session_clock,
             security_authority=self._security_authority,
+            work_runtime_v1=self._work_runtime_v1,
         )
         self.signal_manager.init()
         self.stream_manager = StreamManager(
             self.signal_manager,
             security_authority=self._security_authority,
+            work_runtime_v1=self._work_runtime_v1,
         )
         self.stream_manager.enable_debug_logging(True)
         self.data_sinks: Dict[ChatDataType, List[DataSink]] = {}
@@ -168,96 +181,180 @@ class ChatSession:
         
         # Track stream begin events for auto history recording
         stream_begin_events: Dict[str, str] = {}  # stream_key -> event_id
-        
+
         while shared_states.active:
             try:
                 queued_item = input_queue.get_nowait()
             except (queue.Empty, asyncio.QueueEmpty):
                 time.sleep(0.03)
                 continue
-
-            validated_dispatch: ValidatedDispatchV1 | None = None
-            history_authorized = True
-            if security_authority is not None:
-                # This is intentionally the first security-relevant action
-                # after dequeue. No stream, history, state, type, or log path
-                # may inspect the queued payload before this validation.
-                capability = handler_env.consumer_capability
-                if capability is None:
-                    security_authority._record(
-                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED
-                    )
-                    continue
-                validated_dispatch = (
-                    security_authority.validate_dequeued_dispatch_v1(
-                        queued_item,
-                        capability,
-                    )
+            runtime = context.work_runtime_v1
+            work_item: WorkBoundItemV1 | None = None
+            envelope_ref = None
+            if runtime is not None:
+                candidate = getattr(
+                    queued_item,
+                    "work_item_v1",
+                    None,
                 )
-                if validated_dispatch is None:
-                    continue
-                input_data = validated_dispatch.payload
-                if not isinstance(input_data, ChatData):
-                    security_authority._record(
-                        SecurityAuditEventCodeV1.DISPATCH_DENIED,
-                        dispatch_id=validated_dispatch.dispatch_id,
-                    )
-                    continue
-                producer_authority = handler_env.producer_authority
-                if (
-                    producer_authority is None
-                    or not security_authority.record_dispatch_for_producer_v1(
-                        producer_authority,
-                        capability,
-                        validated_dispatch,
-                    )
-                ):
-                    continue
-
-                trusted_identity = validated_dispatch.stream_ref.identity
-                input_data.stream_id = ChatStreamIdentity(
-                    data_type=trusted_identity.data_type,
-                    builder_id=trusted_identity.builder_id,
-                    stream_id=trusted_identity.stream_id,
-                    name=trusted_identity.name,
-                    producer_name=trusted_identity.producer_name,
-                )
-                input_data.type = validated_dispatch.trusted_data_type
-                input_data.source = validated_dispatch.trusted_source
-                handler_env.core_data_submitter.update_input_dispatch_v1(
-                    validated_dispatch
-                )
-                history_capability = handler_env.history_capability
-                history_authorized = (
-                    history_capability is not None
-                    and security_authority.consumer_is_authorized_v1(
-                        validated_dispatch.envelope_ref,
-                        history_capability,
-                        audit_denial=False,
-                    )
-                )
-            else:
-                input_data = queued_item
-                handler_env.core_data_submitter.update_input_stream(input_data)
-
-            # Consumer-side cancel guard: drop data from cancelled streams.
-            # The production-side guard in stream_data() blocks new data, but residual
-            # data may already be in the queue from before cancel(). This check ensures
-            # the handler never processes data after a stream has been cancelled.
-            if input_data.stream_id is not None:
-                _sm = getattr(context, 'stream_manager', None)
-                if _sm is not None:
-                    _stream = _sm.find_stream(input_data.stream_id)
-                    if _stream is not None and _stream.status == ChatStreamStatus.CANCELLED:
+                if isinstance(candidate, WorkBoundItemV1):
+                    work_item = candidate
+                    if not runtime.validate_work_v1(
+                        work_item.registered_work,
+                        WorkValidationBoundaryV1.QUEUE_DEQUEUE,
+                    ):
+                        runtime.log_late_drop_v1(
+                            work_item.registered_work,
+                            "QUEUE_DEQUEUE",
+                        )
+                        work_item.release_once_v1(runtime)
                         continue
+                    envelope_ref = work_item.envelope_ref
 
-            # Auto-record STREAM_BEGIN to history
-            if (input_data.is_first_data 
-                and history_authorized
-                and handler.should_auto_record_history(input_data.type)
-                and input_data.stream_id is not None):
-                stream_key_obj = input_data.stream_id.key
-                stream_key_str = str(stream_key_obj) if stream_key_obj else None
+            try:
+                scope = (
+                    runtime.activate_work_v1(
+                        work_item.registered_work,
+                        envelope_ref,
+                    )
+                    if runtime is not None and work_item is not None
+                    else contextlib.nullcontext()
+                )
+                with scope:
+                    cls._process_handler_item_v1(
+                        handler_env=handler_env,
+                        security_authority=security_authority,
+                        queued_item=queued_item,
+                        handler_visible_output_info=(
+                            handler_visible_output_info
+                        ),
+                        stream_begin_events=stream_begin_events,
+                    )
+            finally:
+                if runtime is not None and work_item is not None:
+                    work_item.release_once_v1(runtime)
+
+    @classmethod
+    def _process_handler_item_v1(
+        cls,
+        *,
+        handler_env: HandlerEnv,
+        security_authority: SecurityAuthorityV1 | None,
+        queued_item,
+        handler_visible_output_info,
+        stream_begin_events: Dict[str, str],
+    ) -> None:
+        handler = handler_env.handler
+        context = handler_env.context
+        runtime = context.work_runtime_v1
+
+        def protected(boundary, action) -> bool:
+            if runtime is None:
+                action()
+                return True
+            return runtime.perform_current_if_live_v1(boundary, action)
+
+        validated_dispatch: ValidatedDispatchV1 | None = None
+        history_authorized = True
+        if security_authority is not None:
+            capability = handler_env.consumer_capability
+            if capability is None:
+                security_authority._record(
+                    SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED
+                )
+                return
+            validated_dispatch = (
+                security_authority.validate_dequeued_dispatch_v1(
+                    queued_item,
+                    capability,
+                )
+            )
+            if validated_dispatch is None:
+                return
+            if runtime is not None and runtime.current_work_v1() is None:
+                security_authority._record(
+                    SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED,
+                    dispatch_id=validated_dispatch.dispatch_id,
+                )
+                return
+            if (
+                runtime is not None
+                and runtime.current_envelope_ref_v1()
+                != validated_dispatch.envelope_ref
+            ):
+                security_authority._record(
+                    SecurityAuditEventCodeV1.DISPATCH_DENIED,
+                    dispatch_id=validated_dispatch.dispatch_id,
+                )
+                return
+            input_data = validated_dispatch.payload
+            if not isinstance(input_data, ChatData):
+                security_authority._record(
+                    SecurityAuditEventCodeV1.DISPATCH_DENIED,
+                    dispatch_id=validated_dispatch.dispatch_id,
+                )
+                return
+            producer_authority = handler_env.producer_authority
+            if (
+                producer_authority is None
+                or not security_authority.record_dispatch_for_producer_v1(
+                    producer_authority,
+                    capability,
+                    validated_dispatch,
+                )
+            ):
+                return
+
+            trusted_identity = validated_dispatch.stream_ref.identity
+            input_data.stream_id = ChatStreamIdentity(
+                data_type=trusted_identity.data_type,
+                builder_id=trusted_identity.builder_id,
+                stream_id=trusted_identity.stream_id,
+                name=trusted_identity.name,
+                producer_name=trusted_identity.producer_name,
+            )
+            input_data.type = validated_dispatch.trusted_data_type
+            input_data.source = validated_dispatch.trusted_source
+            if not protected(
+                WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                lambda: handler_env.core_data_submitter
+                .update_input_dispatch_v1(validated_dispatch),
+            ):
+                return
+            history_capability = handler_env.history_capability
+            history_authorized = (
+                history_capability is not None
+                and security_authority.consumer_is_authorized_v1(
+                    validated_dispatch.envelope_ref,
+                    history_capability,
+                    audit_denial=False,
+                )
+            )
+        else:
+            input_data = queued_item
+            handler_env.core_data_submitter.update_input_stream(input_data)
+
+        if input_data.stream_id is not None:
+            stream_manager = getattr(context, "stream_manager", None)
+            if stream_manager is not None:
+                stream = stream_manager.find_stream(input_data.stream_id)
+                if (
+                    stream is not None
+                    and stream.status == ChatStreamStatus.CANCELLED
+                ):
+                    return
+
+        if (
+            input_data.is_first_data
+            and history_authorized
+            and handler.should_auto_record_history(input_data.type)
+            and input_data.stream_id is not None
+        ):
+            stream_key_obj = input_data.stream_id.key
+            stream_key_str = (
+                str(stream_key_obj) if stream_key_obj else None
+            )
+            def record_history_begin() -> None:
                 event_id = handler.on_history_record(
                     context,
                     signal_type=ChatSignalType.STREAM_BEGIN,
@@ -266,70 +363,123 @@ class ChatSession:
                 )
                 if event_id and stream_key_str:
                     stream_begin_events[stream_key_str] = event_id
-            
-            # Accumulate streaming text data for TEXT types
-            # Use timestamp as chunk_id for deduplication across multiple handlers
-            if (handler.should_auto_record_history(input_data.type)
-                and history_authorized
-                and input_data.stream_id is not None
-                and input_data.data is not None
-                and context.session_history is not None):
-                try:
-                    text_data = input_data.data.get_main_data()
-                    if text_data and isinstance(text_data, str):
-                        stream_key_obj = input_data.stream_id.key
-                        stream_key_str = str(stream_key_obj) if stream_key_obj else None
-                        if stream_key_str:
-                            # Use timestamp as unique chunk identifier for deduplication
-                            chunk_id = f"{input_data.timestamp[0]}:{input_data.timestamp[1]}"
-                            context.session_history.accumulate_stream_data(stream_key_str, text_data, chunk_id)
-                except Exception:
-                    pass
-            
-            # Map input type back to original type if there's a reverse mapping
-            # This allows handler code to check against its declared input types
-            actual_type = input_data.type
-            if handler_env.input_type_reverse_mapping:
-                original_type = handler_env.input_type_reverse_mapping.get(actual_type)
-                if original_type:
-                    input_data.type = original_type
-            
-            # 使用 try-except 包裹 handler.handle()，防止单次处理失败导致整个 pumper 线程退出
+
+            protected(
+                WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                record_history_begin,
+            )
+
+        if (
+            handler.should_auto_record_history(input_data.type)
+            and history_authorized
+            and input_data.stream_id is not None
+            and input_data.data is not None
+            and context.session_history is not None
+        ):
             try:
-                handler_result = handler.handle(context, input_data, handler_visible_output_info)
-            except Exception as e:
-                if (
-                    validated_dispatch is not None
-                    and validated_dispatch.classification
-                    is SecurityClassificationV1.CERTIFICATE_PRIVATE
-                ):
-                    logger.bind(
-                        dispatch_id=validated_dispatch.dispatch_id
-                    ).error("PRIVATE_HANDLER_FAILURE_V1")
-                else:
-                    handler_name = handler_env.handler_info.name if handler_env.handler_info else "Unknown"
-                    logger.opt(exception=e).error(f"Handler {handler_name} raised exception during handle(), "
-                                                  f"input type: {input_data.type}, stream: {input_data.stream_id}")
-                # 重置 input_data.type 然后继续处理下一个数据
+                text_data = input_data.data.get_main_data()
+                if text_data and isinstance(text_data, str):
+                    stream_key_obj = input_data.stream_id.key
+                    stream_key_str = (
+                        str(stream_key_obj) if stream_key_obj else None
+                    )
+                    if stream_key_str:
+                        chunk_id = (
+                            f"{input_data.timestamp[0]}:"
+                            f"{input_data.timestamp[1]}"
+                        )
+                        protected(
+                            WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                            lambda: context.session_history
+                            .accumulate_stream_data(
+                                stream_key_str,
+                                text_data,
+                                chunk_id,
+                            ),
+                        )
+            except Exception:
+                pass
+
+        actual_type = input_data.type
+        if handler_env.input_type_reverse_mapping:
+            original_type = handler_env.input_type_reverse_mapping.get(
+                actual_type
+            )
+            if original_type:
+                input_data.type = original_type
+
+        try:
+            if (
+                runtime is not None
+                and not runtime.validate_current_v1(
+                    WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL
+                )
+            ):
                 input_data.type = actual_type
-                continue
-            
-            # Restore the actual type after handle() call
+                return
+            handler_result = handler.handle(
+                context,
+                input_data,
+                handler_visible_output_info,
+            )
+        except Exception as error:
+            if (
+                validated_dispatch is not None
+                and validated_dispatch.classification
+                is SecurityClassificationV1.CERTIFICATE_PRIVATE
+            ):
+                logger.bind(
+                    dispatch_id=validated_dispatch.dispatch_id
+                ).error("PRIVATE_HANDLER_FAILURE_V1")
+            elif runtime is not None and not runtime.validate_current_v1(
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK
+            ):
+                current = runtime.current_work_v1()
+                if current is not None:
+                    runtime.log_late_drop_v1(
+                        current,
+                        "HANDLER_EXCEPTION_AFTER_RETIREMENT",
+                    )
+            else:
+                handler_name = (
+                    handler_env.handler_info.name
+                    if handler_env.handler_info
+                    else "Unknown"
+                )
+                if runtime is None:
+                    logger.opt(exception=error).error(
+                        f"Handler {handler_name} raised exception "
+                        "during handle()."
+                    )
+                else:
+                    logger.error("SECURE_HANDLER_FAILURE_V1")
             input_data.type = actual_type
-            
-            # Auto-record STREAM_END to history with accumulated data content
-            if (input_data.is_last_data 
-                and history_authorized
-                and handler.should_auto_record_history(input_data.type)
-                and input_data.stream_id is not None):
-                stream_key_obj = input_data.stream_id.key
-                stream_key_str = str(stream_key_obj) if stream_key_obj else None
-                begin_event_id = stream_begin_events.pop(stream_key_str, None) if stream_key_str else None
-                # Use accumulated data instead of just the last chunk
+            return
+
+        input_data.type = actual_type
+
+        if (
+            input_data.is_last_data
+            and history_authorized
+            and handler.should_auto_record_history(input_data.type)
+            and input_data.stream_id is not None
+        ):
+            stream_key_obj = input_data.stream_id.key
+            stream_key_str = (
+                str(stream_key_obj) if stream_key_obj else None
+            )
+            def finalize_history() -> None:
+                begin_event_id = (
+                    stream_begin_events.pop(stream_key_str, None)
+                    if stream_key_str
+                    else None
+                )
                 data_content = None
                 if context.session_history is not None and stream_key_str:
-                    data_content = context.session_history.finalize_stream_accumulator(stream_key_str)
-                # Fallback to last chunk data if no accumulator
+                    data_content = (
+                        context.session_history
+                        .finalize_stream_accumulator(stream_key_str)
+                    )
                 if not data_content and input_data.data is not None:
                     try:
                         data_content = input_data.data.get_main_data()
@@ -343,26 +493,38 @@ class ChatSession:
                     related_event_id=begin_event_id,
                     source_stream_key=stream_key_str,
                 )
-            
-            if not isinstance(handler_result, Iterable):
-                handler_result = [handler_result]
-            for handler_output in handler_result:
-                if context.data_submitter is None:
-                    continue
-                try:
-                    handler_env.core_data_submitter.submit(handler_output)
-                except Exception as error:
-                    if (
-                        validated_dispatch is not None
-                        and validated_dispatch.classification
-                        is SecurityClassificationV1.CERTIFICATE_PRIVATE
-                    ):
-                        logger.bind(
-                            dispatch_id=validated_dispatch.dispatch_id
-                        ).error("PRIVATE_OUTPUT_REJECTED_V1")
-                    else:
+
+            protected(
+                WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                finalize_history,
+            )
+
+        if not isinstance(handler_result, Iterable):
+            handler_result = [handler_result]
+        for handler_output in handler_result:
+            if context.data_submitter is None:
+                continue
+            try:
+                handler_env.core_data_submitter.submit(handler_output)
+            except Exception as error:
+                if (
+                    validated_dispatch is not None
+                    and validated_dispatch.classification
+                    is SecurityClassificationV1.CERTIFICATE_PRIVATE
+                ):
+                    logger.bind(
+                        dispatch_id=validated_dispatch.dispatch_id
+                    ).error("PRIVATE_OUTPUT_REJECTED_V1")
+                elif runtime is None or runtime.validate_current_v1(
+                    WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK
+                ):
+                    if runtime is None:
                         logger.opt(exception=error).error(
                             "Handler output submission failed."
+                        )
+                    else:
+                        logger.error(
+                            "SECURE_HANDLER_OUTPUT_SUBMISSION_FAILED_V1"
                         )
 
     def _register_playback_auto_recorder(self):
@@ -385,26 +547,51 @@ class ChatSession:
             return
         stream_key_str = signal.related_stream.stream_key_str
 
-        if signal.type == ChatSignalType.STREAM_BEGIN:
-            event_id = session_history.create_and_add_event(
-                data_type=ChatDataType.CLIENT_PLAYBACK,
-                signal_type=ChatSignalType.STREAM_BEGIN,
-                source_stream_key=stream_key_str,
-                owner=signal.source_name,
-                _security_writer_v1=self._history_producer_authority,
-            )
-            if event_id and stream_key_str:
-                self._playback_begin_event_ids[stream_key_str] = event_id
-        elif signal.type in (ChatSignalType.STREAM_END, ChatSignalType.STREAM_CANCEL):
-            begin_event_id = self._playback_begin_event_ids.pop(stream_key_str, None) if stream_key_str else None
-            session_history.create_and_add_event(
-                data_type=ChatDataType.CLIENT_PLAYBACK,
-                signal_type=signal.type,
-                source_stream_key=stream_key_str,
-                owner=signal.source_name,
-                parent_event_id=begin_event_id,
-                _security_writer_v1=self._history_producer_authority,
-            )
+        def record_playback_history() -> None:
+            if signal.type == ChatSignalType.STREAM_BEGIN:
+                event_id = session_history.create_and_add_event(
+                    data_type=ChatDataType.CLIENT_PLAYBACK,
+                    signal_type=ChatSignalType.STREAM_BEGIN,
+                    source_stream_key=stream_key_str,
+                    owner=signal.source_name,
+                    _security_writer_v1=(
+                        self._history_producer_authority
+                    ),
+                )
+                if event_id and stream_key_str:
+                    self._playback_begin_event_ids[
+                        stream_key_str
+                    ] = event_id
+            elif signal.type in (
+                ChatSignalType.STREAM_END,
+                ChatSignalType.STREAM_CANCEL,
+            ):
+                begin_event_id = (
+                    self._playback_begin_event_ids.pop(
+                        stream_key_str,
+                        None,
+                    )
+                    if stream_key_str
+                    else None
+                )
+                session_history.create_and_add_event(
+                    data_type=ChatDataType.CLIENT_PLAYBACK,
+                    signal_type=signal.type,
+                    source_stream_key=stream_key_str,
+                    owner=signal.source_name,
+                    parent_event_id=begin_event_id,
+                    _security_writer_v1=(
+                        self._history_producer_authority
+                    ),
+                )
+
+        if self._work_runtime_v1 is None:
+            record_playback_history()
+            return
+        self._work_runtime_v1.perform_current_if_live_v1(
+            WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+            record_playback_history,
+        )
 
     def prepare_handler(
         self,
@@ -519,6 +706,10 @@ class ChatSession:
             handler_env.handler_output_info = handler_output_info
 
         handler_context = handler_env.context
+        handler_context.work_runtime_v1 = self._work_runtime_v1
+        handler_context.work_consumer_capability_v1 = (
+            consumer_capability
+        )
 
         filters = io_detail.signal_filters
         if filters is None or len(filters) == 0:
@@ -534,6 +725,7 @@ class ChatSession:
         core_data_submitter = ChatDataSubmitter(
             security_authority=self._security_authority,
             producer_authority=producer_authority,
+            work_runtime_v1=self._work_runtime_v1,
         )
         handler_env.core_data_submitter = core_data_submitter
         handler_context.signal_emitter = self.signal_manager.get_emitter(
@@ -591,7 +783,6 @@ class ChatSession:
         logic_env.context.owner = logic_info.name
         logic_detail = logic.get_logic_detail(self.session_context, logic_env.context)
         logic_detail.validate()
-        inputs = logic_detail.inspected_streamers
 
     def sort_sinks(self):
         for input_type, sink_list in self.data_sinks.items():
@@ -644,11 +835,14 @@ class ChatSession:
             return
         try:
             if self._work_controller_v1 is not None:
-                cleanup_succeeded = self._work_controller_v1.shutdown()
+                cleanup_succeeded = self._work_controller_v1.shutdown(
+                    self._prepare_retired_work_cleanup_v1
+                )
                 if not cleanup_succeeded:
                     logger.error("SECURE_SESSION_WORK_CLEANUP_FAILED_V1")
         finally:
             try:
+                self.session_context.shared_states.active = False
                 self._finish_stop_v1()
             finally:
                 self._stop_complete_event_v1.set()
@@ -663,12 +857,15 @@ class ChatSession:
         try:
             if self._work_controller_v1 is not None:
                 cleanup_succeeded = (
-                    await self._work_controller_v1.shutdown_async()
+                    await self._work_controller_v1.shutdown_async(
+                        self._prepare_retired_work_cleanup_v1
+                    )
                 )
                 if not cleanup_succeeded:
                     logger.error("SECURE_SESSION_WORK_CLEANUP_FAILED_V1")
         finally:
             try:
+                self.session_context.shared_states.active = False
                 self._finish_stop_v1()
             finally:
                 self._stop_complete_event_v1.set()
@@ -678,19 +875,74 @@ class ChatSession:
             if self._stop_started_v1:
                 return False
             self._stop_started_v1 = True
-            self.session_context.shared_states.active = False
+            if self._work_controller_v1 is None:
+                self.session_context.shared_states.active = False
             return True
+
+    def _release_queued_work_v1(self, queued_item) -> None:
+        runtime = self._work_runtime_v1
+        if runtime is None:
+            return
+        work_item = (
+            queued_item
+            if isinstance(queued_item, WorkBoundItemV1)
+            else getattr(queued_item, "work_item_v1", None)
+        )
+        if isinstance(work_item, WorkBoundItemV1):
+            work_item.release_once_v1(runtime)
+
+    def _drain_handler_input_queue_v1(
+        self,
+        handler_record: HandlerRecord,
+    ) -> None:
+        while True:
+            try:
+                queued_item = handler_record.env.input_queue.get_nowait()
+            except (queue.Empty, asyncio.QueueEmpty):
+                return
+            self._release_queued_work_v1(queued_item)
+
+    def _prepare_retired_work_cleanup_v1(self) -> None:
+        """Stop consumers and release queued application work after retirement."""
+
+        self.session_context.shared_states.active = False
+        for handler_record in tuple(self.handlers.values()):
+            self._drain_handler_input_queue_v1(handler_record)
+            handler = handler_record.env.handler
+            context = handler_record.env.context
+            drain_handler = getattr(
+                handler,
+                "drain_registered_work_v1",
+                None,
+            )
+            if callable(drain_handler):
+                try:
+                    drain_handler(context)
+                except Exception:  # noqa: BLE001 - payload-free cleanup log
+                    logger.error("HANDLER_WORK_QUEUE_DRAIN_FAILED_V1")
+            delegate = getattr(
+                context,
+                "client_session_delegate",
+                None,
+            )
+            drain_delegate = getattr(
+                delegate,
+                "drain_application_output_v1",
+                None,
+            )
+            if callable(drain_delegate):
+                try:
+                    drain_delegate()
+                except Exception:  # noqa: BLE001 - payload-free cleanup log
+                    logger.error("CLIENT_OUTPUT_QUEUE_DRAIN_FAILED_V1")
+        self.signal_manager.drain_registered_work_v1()
 
     def _finish_stop_v1(self):
         for handler_name, handler_record in self.handlers.items():
             if handler_record.pump_thread:
                 handler_record.pump_thread.join()
                 handler_record.pump_thread = None
-            while True:
-                try:
-                    handler_record.env.input_queue.get_nowait()
-                except (queue.Empty, asyncio.QueueEmpty):
-                    break
+            self._drain_handler_input_queue_v1(handler_record)
             handler_record.env.handler.destroy_context(handler_record.env.context)
         self.signal_manager.shutdown()
         self.handlers.clear()

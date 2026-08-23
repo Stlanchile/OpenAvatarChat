@@ -26,6 +26,7 @@ from service.service_security.certificate_session_authority import (
     SessionAuthorityReasonV1,
 )
 from service.service_security.certificate_session_control import (
+    CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1,
     SESSION_CAPABILITY_HEADER_V1,
     install_certificate_session_control_v1,
 )
@@ -398,6 +399,18 @@ async def test_invalid_admission_requests_use_stable_non_echoing_error_code():
 async def test_revoke_route_invalidates_session_and_returns_no_secret_body():
     app, _, authority = _install()
     principal = _principal()
+    retired_sessions: list[str] = []
+
+    class _Lifecycle:
+        @staticmethod
+        async def retire_secure_session_v1(session_id: str) -> None:
+            retired_sessions.append(session_id)
+
+    setattr(
+        app.state,
+        CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1,
+        _Lifecycle(),
+    )
 
     async with _asgi_client(app) as client:
         created = (
@@ -416,6 +429,7 @@ async def test_revoke_route_invalidates_session_and_returns_no_secret_body():
         assert response.status_code == 204
         assert response.content == b""
         assert response.headers["cache-control"] == "no-store"
+        assert retired_sessions == [created["session_id"]]
         with pytest.raises(SessionAuthorityErrorV1) as exception:
             authority.get_session_ownership(
                 principal,
@@ -426,6 +440,65 @@ async def test_revoke_route_invalidates_session_and_returns_no_secret_body():
             exception.value.reason_code
             == SessionAuthorityReasonV1.SESSION_ACCESS_DENIED.value
         )
+
+
+@pytest.mark.asyncio
+async def test_revoke_route_fails_closed_without_application_lifecycle():
+    app, _, authority = _install()
+    principal = _principal()
+
+    async with _asgi_client(app) as client:
+        created = (
+            await client.post(
+                "/api/v1/session-capabilities",
+                headers=_authorization("owner-token"),
+            )
+        ).json()
+        response = await client.delete(
+            f"/api/v1/sessions/{created['session_id']}",
+            headers={
+                **_authorization("owner-token"),
+                SESSION_CAPABILITY_HEADER_V1: created[
+                    "session_capability"
+                ],
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "reason_code": "SESSION_LIFECYCLE_UNAVAILABLE"
+        }
+    }
+    with pytest.raises(SessionAuthorityErrorV1):
+        authority.get_session_ownership(
+            principal,
+            created["session_id"],
+            created["session_capability"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_replacement_fails_closed_without_application_lifecycle():
+    app, _, _ = _install()
+
+    async with _asgi_client(app) as client:
+        first = await client.post(
+            "/api/v1/session-capabilities",
+            headers=_authorization("owner-token"),
+        )
+        replacement = await client.post(
+            "/api/v1/session-capabilities",
+            headers=_authorization("owner-token"),
+        )
+
+    assert first.status_code == 201
+    assert replacement.status_code == 503
+    assert replacement.json() == {
+        "detail": {
+            "reason_code": "SESSION_LIFECYCLE_UNAVAILABLE"
+        }
+    }
 
 
 @pytest.mark.asyncio

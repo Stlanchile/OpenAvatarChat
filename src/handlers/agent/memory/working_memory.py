@@ -15,8 +15,8 @@ Phase 2.5 新增：
 """
 import json
 import time
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from dataclasses import dataclass
+from typing import Callable, List, Dict, Optional
 
 from loguru import logger
 
@@ -213,6 +213,11 @@ class WorkingMemory:
         llm_client,
         model: str,
         keep_recent: int = 5,
+        *,
+        before_external_call: Callable[[], bool] | None = None,
+        after_external_call: Callable[[], bool] | None = None,
+        commit_if_live: Callable[[Callable[[], None]], bool] | None = None,
+        redact_errors: bool = False,
     ) -> Optional[str]:
         """
         触发 auto-compact：双标签 LLM 压缩旧对话为摘要。
@@ -230,6 +235,8 @@ class WorkingMemory:
             f"[{t.role}] {t.content}" for t in old_turns
         )
 
+        if before_external_call is not None and not before_external_call():
+            return None
         try:
             response = llm_client.chat.completions.create(
                 model=model,
@@ -239,18 +246,41 @@ class WorkingMemory:
                 ],
                 max_tokens=600,
             )
+            if (
+                after_external_call is not None
+                and not after_external_call()
+            ):
+                return None
             raw_output = response.choices[0].message.content.strip()
             summary = self._extract_summary_tag(raw_output)
         except Exception as e:
-            logger.warning(f"[WorkingMemory] compact LLM call failed: {e}")
+            if (
+                after_external_call is not None
+                and not after_external_call()
+            ):
+                return None
+            if redact_errors:
+                logger.warning("WORKING_MEMORY_COMPACT_LLM_FAILED")
+            else:
+                logger.warning(
+                    f"[WorkingMemory] compact LLM call failed: {e}"
+                )
             summary = f"（之前进行了 {len(old_turns)} 轮对话）"
 
-        if self._compact_summary:
-            self._compact_summary = f"{self._compact_summary}\n{summary}"
-        else:
-            self._compact_summary = summary
+        def commit() -> None:
+            if self._compact_summary:
+                self._compact_summary = (
+                    f"{self._compact_summary}\n{summary}"
+                )
+            else:
+                self._compact_summary = summary
+            self._dialogue = recent_turns
 
-        self._dialogue = recent_turns
+        if commit_if_live is not None:
+            if not commit_if_live(commit):
+                return None
+        else:
+            commit()
         logger.info(
             f"[WorkingMemory] compacted: {len(old_turns)} turns → "
             f"{len(summary)} chars summary, kept {len(recent_turns)} recent"

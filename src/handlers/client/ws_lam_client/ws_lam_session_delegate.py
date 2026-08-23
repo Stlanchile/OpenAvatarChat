@@ -27,6 +27,10 @@ import numpy as np
 from loguru import logger
 
 from chat_engine.data_models.engine_channel_type import EngineChannelType
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
 from handlers.client.ws_client.ws_input_delegate import WsInputSessionDelegate
 
 if TYPE_CHECKING:
@@ -94,8 +98,33 @@ class WsLamClientSessionDelegate(WsInputSessionDelegate):
                 data=data_bundle,
                 timestamp=timestamp,
             )
-            self.data_submitter.submit(chat_data, finish_stream=True)
-            self.ws_text_queue.put_nowait(chat_data)
+            if self.work_runtime_v1 is None:
+                self.data_submitter.submit(
+                    chat_data,
+                    finish_stream=True,
+                )
+                self.ws_text_queue.put_nowait(chat_data)
+                return
+            submit_with_egress = getattr(
+                self.data_submitter,
+                "submit_ingress_with_egress_item_v1",
+                None,
+            )
+            if not callable(submit_with_egress):
+                return
+            item = submit_with_egress(
+                chat_data,
+                chat_data,
+                WorkOperationKindV1.WS_EGRESS,
+                finish_stream=True,
+            )
+            if item is not None:
+                if not self.work_runtime_v1.perform_if_live_v1(
+                    item.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_EGRESS,
+                    lambda: self.ws_text_queue.put_nowait(item),
+                ):
+                    item.release_once_v1(self.work_runtime_v1)
             return
 
         super().put_data(modality, data, timestamp, samplerate, loopback, speech_id)
@@ -103,6 +132,21 @@ class WsLamClientSessionDelegate(WsInputSessionDelegate):
     # ------------------------------------------------------------------
     # Override clear_data to preserve WebSocket connections
     # ------------------------------------------------------------------
+
+    def drain_application_output_v1(self) -> None:
+        super().drain_application_output_v1()
+        while not self.ws_text_queue.empty():
+            try:
+                queued_item = self.ws_text_queue.get_nowait()
+                if (
+                    self.work_runtime_v1 is not None
+                    and hasattr(queued_item, "release_once_v1")
+                ):
+                    queued_item.release_once_v1(
+                        self.work_runtime_v1
+                    )
+            except Exception:
+                break
 
     def clear_data(self):
         """
@@ -115,17 +159,7 @@ class WsLamClientSessionDelegate(WsInputSessionDelegate):
         from destroy_context.  Delegating to the parent is safe.
         """
         if self.upstream_mode == "rtc":
-            for data_queue in self.output_queues.values():
-                while not data_queue.empty():
-                    try:
-                        data_queue.get_nowait()
-                    except Exception:
-                        pass
-            while not self.ws_text_queue.empty():
-                try:
-                    self.ws_text_queue.get_nowait()
-                except Exception:
-                    pass
+            self.drain_application_output_v1()
             self.text_buffer.clear()
             self.binary_stream_assembler.clear()
             self._active_playback_stream_keys.clear()
@@ -149,17 +183,29 @@ class WsLamClientSessionDelegate(WsInputSessionDelegate):
 
         Motion data, heartbeat, signals, and input are always present.
         """
-        self.quit.clear()
-        self.motion_welcome_sent = False
-        self.motion_welcome_payload = None
-        self.binary_stream_assembler.clear()
-        self.subscriptions = set(self.AVAILABLE_SUBSCRIPTIONS)
+        def reset_primary_state() -> None:
+            self.quit.clear()
+            self.motion_welcome_sent = False
+            self.motion_welcome_payload = None
+            self.binary_stream_assembler.clear()
+            self.subscriptions = set(self.AVAILABLE_SUBSCRIPTIONS)
+            self.audio_format = "PCM"
+            self.audio_sample_rate = 16000
+            self.audio_channels = 1
+            self._opus_encoder = None
+            self._opus_decoder = None
 
-        self.audio_format = "PCM"
-        self.audio_sample_rate = 16000
-        self.audio_channels = 1
-        self._opus_encoder = None
-        self._opus_decoder = None
+        if self.work_runtime_v1 is None:
+            reset_primary_state()
+        else:
+            with self._ingress_work_scope_v1() as scope:
+                if (
+                    scope is None
+                    or not self._perform_ingress_mutation_v1(
+                        reset_primary_state
+                    )
+                ):
+                    return True
 
         self.primary_tasks = [
             asyncio.create_task(self._ws_input_task(info)),
@@ -214,75 +260,42 @@ class WsLamClientSessionDelegate(WsInputSessionDelegate):
         self.ws_text_queue so that the RTC data-channel task cannot
         steal items from the shared TEXT output queue.
         """
-        from uuid import uuid4
-        from chat_engine.data_models.chat_data_type import ChatDataType
-        from handlers.client.ws_client.ws_message_protocol import (
-            EchoHumanText, EchoAvatarText, MessageHeader, EchoTextPayload,
-        )
-
         logger.info(f"LAM text output task started for session {self.session_id}")
 
         while not self.quit.is_set():
             try:
-                chat_data = await asyncio.wait_for(
+                queued_item = await asyncio.wait_for(
                     self.ws_text_queue.get(),
                     timeout=0.1,
                 )
             except asyncio.TimeoutError:
                 continue
 
-            if chat_data is None or chat_data.data is None:
+            if queued_item is None:
                 continue
-
+            chat_data, work_item = self._unwrap_output_item_v1(
+                queued_item
+            )
             try:
-                text = chat_data.data.get_main_data()
-                stream_key_str = (
-                    chat_data.stream_id.stream_key_str if chat_data.stream_id else None
+                if chat_data is None or chat_data.data is None:
+                    continue
+                with self._work_scope_v1(work_item):
+                    await self._send_text_output_v1(
+                        chat_data,
+                        work_item,
+                    )
+            except Exception:
+                logger.error(
+                    "LAM_WS_TEXT_OUTPUT_FAILED"
                 )
-
-                if chat_data.type == ChatDataType.HUMAN_TEXT:
-                    if "human_text" not in self.subscriptions:
-                        continue
-                    text_end = chat_data.is_last_data
-                    stream_metadata = self._extract_stream_metadata(
-                        chat_data, excluded_keys={"human_text_end"},
-                    )
-                    response = EchoHumanText(
-                        header=MessageHeader(name="EchoHumanText", request_id=str(uuid4())),
-                        payload=EchoTextPayload(
-                            stream_key=stream_key_str,
-                            mode="full_text",
-                            text=text,
-                            end_of_speech=text_end,
-                            metadata=stream_metadata,
-                        ),
-                    )
-                    await self._broadcast_message(response)
-                    logger.debug(f"LAM echo human text (end={text_end}): {text[:50]}")
-                    self.last_human_text = text if not text_end else None
-
-                elif chat_data.type == ChatDataType.AVATAR_TEXT:
-                    if "avatar_text" not in self.subscriptions:
-                        continue
-                    text_end = chat_data.is_last_data
-                    stream_metadata = self._extract_stream_metadata(
-                        chat_data, excluded_keys={"avatar_text_end"},
-                    )
-                    response = EchoAvatarText(
-                        header=MessageHeader(name="EchoAvatarText", request_id=str(uuid4())),
-                        payload=EchoTextPayload(
-                            stream_key=stream_key_str,
-                            mode="increment",
-                            text=text,
-                            end_of_speech=text_end,
-                            metadata=stream_metadata,
-                        ),
-                    )
-                    await self._broadcast_message(response)
-                    logger.debug(f"LAM echo avatar text (end={text_end}): {text[:50]}")
-
-            except Exception as e:
-                logger.error(f"Error in LAM text output task for session {self.session_id}: {e}")
                 break
+            finally:
+                if (
+                    work_item is not None
+                    and self.work_runtime_v1 is not None
+                ):
+                    work_item.release_once_v1(
+                        self.work_runtime_v1
+                    )
 
         logger.info(f"LAM text output task ended for session {self.session_id}")

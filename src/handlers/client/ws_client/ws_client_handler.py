@@ -36,6 +36,11 @@ from chat_engine.data_models.runtime_data.data_bundle import (
     VariableSize,
 )
 from service.frontend_service import register_frontend
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
 
 from .ws_input_delegate import WsInputSessionDelegate
 from .ws_session_endpoint import register_ws_session_endpoint
@@ -220,6 +225,12 @@ class WsClientHandler(ClientHandlerBase):
         session_delegate.heartbeat_timeout = self.handler_config.heartbeat_timeout
         session_delegate.session_history = session_context.session_history
         session_delegate.stream_manager = handler_context.stream_manager
+        session_delegate.work_runtime_v1 = (
+            handler_context.work_runtime_v1
+        )
+        session_delegate.work_consumer_capability_v1 = (
+            handler_context.work_consumer_capability_v1
+        )
         
         # 保存引用
         handler_context.client_session_delegate = session_delegate
@@ -294,7 +305,23 @@ class WsClientHandler(ClientHandlerBase):
         data_queue = context.client_session_delegate.output_queues.get(channel_type)
         
         if data_queue is not None:
-            data_queue.put_nowait(inputs)
+            runtime = context.work_runtime_v1
+            if runtime is None:
+                data_queue.put_nowait(inputs)
+            else:
+                try:
+                    item = runtime.make_child_item_v1(
+                        inputs,
+                        WorkOperationKindV1.WS_EGRESS,
+                    )
+                except WorkAdmissionDeniedV1:
+                    return
+                if not runtime.perform_if_live_v1(
+                    item.registered_work,
+                    WorkValidationBoundaryV1.BEFORE_EGRESS,
+                    lambda: data_queue.put_nowait(item),
+                ):
+                    item.release_once_v1(runtime)
             logger.debug(f"Routed {inputs.type} to {channel_type} queue")
     
     def on_signal(self, context: HandlerContext, signal: ChatSignal):
@@ -307,10 +334,36 @@ class WsClientHandler(ClientHandlerBase):
         # 处理打断信号：重置 Opus 编码器以清空残留缓冲区
         if signal.type == ChatSignalType.INTERRUPT:
             if context.client_session_delegate._opus_encoder is not None:
-                context.client_session_delegate._opus_encoder.reset()
+                runtime = context.work_runtime_v1
+                if runtime is None:
+                    context.client_session_delegate._opus_encoder.reset()
+                elif not runtime.perform_current_if_live_v1(
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    context.client_session_delegate._opus_encoder.reset,
+                ):
+                    return
                 logger.debug("Opus encoder reset due to interrupt signal from engine")
         
-        context.client_session_delegate.signal_to_client_queue.put_nowait(signal)
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            context.client_session_delegate.signal_to_client_queue.put_nowait(
+                signal
+            )
+            return
+        try:
+            item = runtime.make_child_item_v1(
+                signal,
+                WorkOperationKindV1.WS_EGRESS,
+            )
+        except WorkAdmissionDeniedV1:
+            return
+        if not runtime.perform_if_live_v1(
+            item.registered_work,
+            WorkValidationBoundaryV1.BEFORE_EGRESS,
+            lambda: context.client_session_delegate
+            .signal_to_client_queue.put_nowait(item),
+        ):
+            item.release_once_v1(runtime)
 
     def destroy_context(self, context: HandlerContext):
         """销毁 Context"""

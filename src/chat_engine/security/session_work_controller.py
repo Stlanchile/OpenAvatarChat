@@ -12,7 +12,7 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -101,6 +101,15 @@ class _RetiredGenerationRecordV1:
     state: RetiredGenerationCleanupStateV1
     outstanding_work_token_ids: set[uuid.UUID]
     outstanding_cleanup_token_ids: set[uuid.UUID]
+
+
+@dataclass(slots=True)
+class _AsyncProtectedActionStateV1:
+    """One awaited side effect serialized against generation publication."""
+
+    generation: int
+    task: asyncio.Future[Any] | None = None
+    cancel_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +201,10 @@ class SessionWorkControllerV1:
         self._destroyed = False
         self._session_owner_claimed = False
         self._protected_action_thread_id: int | None = None
+        self._retirement_pending_generation: int | None = None
+        self._async_protected_actions: dict[
+            uuid.UUID, _AsyncProtectedActionStateV1
+        ] = {}
         self._registered_work: dict[uuid.UUID, _RegisteredWorkStateV1] = {}
         self._cleanup_tokens: dict[uuid.UUID, _CleanupTokenStateV1] = {}
         self._retired_generations: dict[int, _RetiredGenerationRecordV1] = {}
@@ -249,6 +262,7 @@ class SessionWorkControllerV1:
                 or self._shutdown_started
                 or self._destroyed
                 or self._registered_work
+                or self._async_protected_actions
                 or self._cleanup_tokens
                 or self._retired_generations
                 or self._completed_cleanup_records
@@ -318,6 +332,7 @@ class SessionWorkControllerV1:
                 WorkControllerFailureReasonV1.INTERNAL_AUTHORITY_FAILURE
             )
         self._cancel_all_unreleased_work_locked_v1()
+        self._cancel_async_protected_actions_locked_v1()
         self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
         self._condition.notify_all()
 
@@ -328,6 +343,25 @@ class SessionWorkControllerV1:
             if registered.state is _WorkStateV1.LIVE:
                 registered.state = _WorkStateV1.CANCELLED
             registered.registered_work.cancellation._cancel_v1()
+
+    def _cancel_async_protected_actions_locked_v1(
+        self,
+        generation: int | None = None,
+    ) -> None:
+        for state in self._async_protected_actions.values():
+            if generation is not None and state.generation != generation:
+                continue
+            state.cancel_requested = True
+            task = state.task
+            if task is None or task.done():
+                continue
+            try:
+                task.get_loop().call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                # A closed transport loop cannot be resumed.  The action
+                # remains accounted for and forces bounded cleanup failure
+                # unless its owner reaches the normal finally path.
+                pass
 
     def current_epoch_v1(self) -> SessionEpochV1:
         with self._lock:
@@ -396,6 +430,7 @@ class SessionWorkControllerV1:
             or self._failed
             or self._shutdown_started
             or self._destroyed
+            or self._retirement_pending_generation is not None
         ):
             self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
             raise WorkAdmissionDeniedV1("secure work admission is unavailable")
@@ -489,6 +524,144 @@ class SessionWorkControllerV1:
         self._call_transition_hook_v1(ControllerTransitionPointV1.AFTER_REGISTRATION)
         return registered_work
 
+    def register_child_work_v1(
+        self,
+        parent_fence: object,
+        operation_kind: WorkOperationKindV1,
+        deadline_monotonic: float,
+    ) -> RegisteredWorkV1:
+        """Atomically register work under one exact live parent generation.
+
+        Unlike :meth:`register_work_v1`, this method never consults the latest
+        epoch and then attaches a callback-derived child to it.  The parent is
+        authenticated and checked for liveness while the controller lock is
+        held; the child is minted under that exact epoch before the lock is
+        released.  This is the Milestone 3B no-generation-laundering seam.
+
+        Child registration is the only controller mutation permitted from a
+        protected action.  That lets a short protected publication atomically
+        create downstream queue work without permitting retirement, release,
+        or unrelated root admission to re-enter the controller.
+        """
+
+        self._call_transition_hook_v1(
+            ControllerTransitionPointV1.BEFORE_REGISTRATION_LOCK
+        )
+        with self._lock:
+            try:
+                self._call_transition_hook_v1(
+                    ControllerTransitionPointV1.REGISTRATION_LOCKED
+                )
+                now = self._now_v1()
+                self._expire_due_cleanups_locked_v1(now)
+                self._ensure_normal_admission_locked_v1()
+                parent = self._registered_state_for_fence_locked_v1(
+                    parent_fence
+                )
+                if (
+                    parent is None
+                    or not self._work_fence_is_live_locked_v1(
+                        parent_fence,
+                        now,
+                        audit_denial=True,
+                    )
+                ):
+                    self._record_v1(
+                        SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED
+                    )
+                    raise WorkAdmissionDeniedV1(
+                        "parent work is not live"
+                    )
+                if not isinstance(operation_kind, WorkOperationKindV1):
+                    self._record_v1(
+                        SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED
+                    )
+                    raise WorkAdmissionDeniedV1(
+                        "invalid work operation kind"
+                    )
+                if (
+                    isinstance(deadline_monotonic, bool)
+                    or not isinstance(deadline_monotonic, (int, float))
+                    or not math.isfinite(deadline_monotonic)
+                    or deadline_monotonic <= now
+                ):
+                    self._record_v1(
+                        SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED
+                    )
+                    raise WorkAdmissionDeniedV1(
+                        "invalid monotonic work deadline"
+                    )
+
+                parent_canonical = parent.registered_work.fence
+                # The parent proves exact-generation ancestry at admission.
+                # A child owns an independent lease and deadline after that
+                # atomic admission, so it may legitimately outlive the
+                # parent's shorter operational deadline (for example a
+                # generation-bound proactive timer or non-cancellable tool).
+                deadline = float(deadline_monotonic)
+                if deadline <= now:
+                    self._record_v1(
+                        SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED
+                    )
+                    raise WorkAdmissionDeniedV1(
+                        "parent work deadline expired"
+                    )
+                epoch = parent_canonical.session_epoch
+                operation_id = new_uuid7_v1()
+                token_id = new_uuid7_v1()
+                fence = WorkFenceV1(
+                    authority_id=self._authority_id,
+                    session_epoch=epoch,
+                    operation_id=operation_id,
+                    operation_kind=operation_kind,
+                    deadline_monotonic=deadline,
+                    authenticator=self._mac_v1(
+                        b"work-fence-v1",
+                        self._authority_id,
+                        epoch.session_instance_id,
+                        epoch.generation,
+                        operation_id,
+                        operation_kind,
+                        deadline,
+                    ),
+                )
+                lease = WorkLeaseV1(
+                    authority_id=self._authority_id,
+                    session_epoch=epoch,
+                    operation_id=operation_id,
+                    token_id=token_id,
+                    authenticator=self._mac_v1(
+                        b"work-lease-v1",
+                        self._authority_id,
+                        epoch.session_instance_id,
+                        epoch.generation,
+                        operation_id,
+                        token_id,
+                    ),
+                )
+                registered_work = RegisteredWorkV1(
+                    fence=fence,
+                    cancellation=WorkCancellationSignalV1(),
+                    lease=lease,
+                )
+                self._registered_work[operation_id] = (
+                    _RegisteredWorkStateV1(
+                        registered_work=registered_work,
+                        state=_WorkStateV1.LIVE,
+                    )
+                )
+            except WorkAdmissionDeniedV1:
+                raise
+            except Exception:  # noqa: BLE001 - stable fail-closed API
+                self._fail_internal_authority_locked_v1()
+                raise WorkAdmissionDeniedV1(
+                    "secure child work registration failed"
+                ) from None
+        self._call_transition_hook_v1(
+            ControllerTransitionPointV1.AFTER_REGISTRATION
+        )
+        return registered_work
+
     def _registered_state_for_fence_locked_v1(
         self,
         fence: object,
@@ -530,6 +703,7 @@ class SessionWorkControllerV1:
             or self._failed
             or self._shutdown_started
             or self._destroyed
+            or self._retirement_pending_generation is not None
         ):
             if audit_denial:
                 self._record_v1(SecurityAuditEventCodeV1.STALE_WORK_FENCE)
@@ -545,6 +719,8 @@ class SessionWorkControllerV1:
             != self._current_epoch.session_instance_id
             or canonical.session_epoch.generation != self._current_epoch.generation
             or canonical.session_epoch.generation in self._retired_generations
+            or canonical.session_epoch.generation
+            == self._retirement_pending_generation
         ):
             if audit_denial:
                 self._record_v1(SecurityAuditEventCodeV1.STALE_WORK_FENCE)
@@ -624,16 +800,34 @@ class SessionWorkControllerV1:
             WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
         )
 
+    def validate_before_memory_write_v1(self, fence: object) -> bool:
+        return self.validate_work_v1(
+            fence,
+            WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+        )
+
     def validate_before_private_store_write_v1(self, fence: object) -> bool:
         return self.validate_work_v1(
             fence,
             WorkValidationBoundaryV1.BEFORE_PRIVATE_STORE_WRITE,
         )
 
+    def validate_before_follow_on_work_v1(self, fence: object) -> bool:
+        return self.validate_work_v1(
+            fence,
+            WorkValidationBoundaryV1.BEFORE_FOLLOW_ON_WORK,
+        )
+
     def validate_before_egress_v1(self, fence: object) -> bool:
         return self.validate_work_v1(
             fence,
             WorkValidationBoundaryV1.BEFORE_EGRESS,
+        )
+
+    def validate_before_completion_v1(self, fence: object) -> bool:
+        return self.validate_work_v1(
+            fence,
+            WorkValidationBoundaryV1.BEFORE_COMPLETION,
         )
 
     def perform_if_live_v1(
@@ -653,9 +847,9 @@ class SessionWorkControllerV1:
             self._record_v1(SecurityAuditEventCodeV1.STALE_WORK_FENCE)
             return False
         with self._lock:
-            if self._protected_action_thread_id == threading.get_ident():
-                self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
-                return False
+            nested_protected_action = (
+                self._protected_action_thread_id == threading.get_ident()
+            )
             now = self._now_v1()
             self._expire_due_cleanups_locked_v1(now)
             if not self._work_fence_is_live_locked_v1(
@@ -664,12 +858,92 @@ class SessionWorkControllerV1:
                 audit_denial=True,
             ):
                 return False
+            if nested_protected_action:
+                action()
+                return True
             self._protected_action_thread_id = threading.get_ident()
             try:
                 action()
                 return True
             finally:
                 self._protected_action_thread_id = None
+
+    async def perform_if_live_async_v1(
+        self,
+        fence: object,
+        boundary: WorkValidationBoundaryV1,
+        action: Callable[[], Awaitable[Any]],
+    ) -> bool:
+        """Run one awaited side effect without racing retirement publication.
+
+        The controller lock is held only while admitting and completing the
+        action.  The awaited call runs in its own task.  Retirement first
+        closes admission, marks the generation stale, and cancels that task;
+        publication then waits for this action record to drain.  A transport
+        coroutine therefore cannot be validated live and resume its actual
+        send after the generation has been published retired.
+        """
+
+        if (
+            not isinstance(boundary, WorkValidationBoundaryV1)
+            or not callable(action)
+        ):
+            self._record_v1(SecurityAuditEventCodeV1.STALE_WORK_FENCE)
+            return False
+
+        action_id = new_uuid7_v1()
+        with self._lock:
+            now = self._now_v1()
+            self._expire_due_cleanups_locked_v1(now)
+            if not self._work_fence_is_live_locked_v1(
+                fence,
+                now,
+                audit_denial=True,
+            ):
+                return False
+            registered = self._registered_state_for_fence_locked_v1(fence)
+            if registered is None:
+                self._record_v1(SecurityAuditEventCodeV1.STALE_WORK_FENCE)
+                return False
+            generation = (
+                registered.registered_work.fence.session_epoch.generation
+            )
+            state = _AsyncProtectedActionStateV1(generation=generation)
+            self._async_protected_actions[action_id] = state
+
+        action_task: asyncio.Future[Any] | None = None
+        try:
+            action_task = asyncio.ensure_future(action())
+            with self._lock:
+                canonical = self._async_protected_actions.get(action_id)
+                if canonical is not state:
+                    action_task.cancel()
+                    return False
+                state.task = action_task
+                if (
+                    state.generation == self._retirement_pending_generation
+                    or self._shutdown_started
+                    or self._failed
+                    or self._destroyed
+                ):
+                    state.cancel_requested = True
+                    action_task.cancel()
+            try:
+                await action_task
+            except asyncio.CancelledError:
+                with self._lock:
+                    retirement_cancelled = state.cancel_requested
+                if retirement_cancelled:
+                    return False
+                raise
+            return True
+        finally:
+            if action_task is not None and not action_task.done():
+                action_task.cancel()
+            with self._condition:
+                if self._async_protected_actions.get(action_id) is state:
+                    self._async_protected_actions.pop(action_id, None)
+                self._condition.notify_all()
 
     def cancel_work_v1(self, fence: object) -> bool:
         with self._lock:
@@ -828,8 +1102,122 @@ class SessionWorkControllerV1:
         if self._failure_reason is None:
             self._failure_reason = WorkControllerFailureReasonV1.GENERATION_OVERFLOW
         self._cancel_all_unreleased_work_locked_v1()
+        self._cancel_async_protected_actions_locked_v1()
         self._record_v1(SecurityAuditEventCodeV1.GENERATION_OVERFLOW)
         self._condition.notify_all()
+
+    def _has_async_protected_actions_locked_v1(
+        self,
+        generation: int,
+    ) -> bool:
+        return any(
+            state.generation == generation
+            for state in self._async_protected_actions.values()
+        )
+
+    def _begin_retirement_barrier_locked_v1(
+        self,
+        *,
+        allow_failed: bool,
+    ) -> tuple[int, float]:
+        """Close admission and cancel awaited effects before publication."""
+
+        now = self._now_v1()
+        self._expire_due_cleanups_locked_v1(now)
+        if (
+            self._destroyed
+            or (self._failed and not allow_failed)
+            or self._retirement_pending_generation is not None
+        ):
+            self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
+            raise WorkAdmissionDeniedV1("generation retirement unavailable")
+        if self._current_epoch.generation == UINT64_MAX_V1:
+            self._fail_generation_overflow_locked_v1()
+            raise SessionGenerationOverflowV1("session generation exhausted")
+
+        generation = self._current_epoch.generation
+        self._admission_open = False
+        self._retirement_pending_generation = generation
+        for registered in self._registered_work.values():
+            work = registered.registered_work
+            if (
+                work.fence.session_epoch.generation != generation
+                or registered.state is _WorkStateV1.RELEASED
+            ):
+                continue
+            if registered.state is _WorkStateV1.LIVE:
+                registered.state = _WorkStateV1.CANCELLED
+            work.cancellation._cancel_v1()
+        self._cancel_async_protected_actions_locked_v1(generation)
+        self._condition.notify_all()
+        return generation, now + self._cleanup_timeout_seconds_v1
+
+    def _fail_retirement_barrier_locked_v1(self) -> None:
+        self._failed = True
+        self._active = False
+        self._admission_open = False
+        if self._failure_reason is None:
+            self._failure_reason = WorkControllerFailureReasonV1.CLEANUP_TIMEOUT
+        self._cancel_all_unreleased_work_locked_v1()
+        self._cancel_async_protected_actions_locked_v1()
+        self._record_v1(SecurityAuditEventCodeV1.CLEANUP_TIMEOUT)
+        self._condition.notify_all()
+
+    def _wait_for_retirement_barrier_locked_v1(
+        self,
+        generation: int,
+        deadline_monotonic: float,
+    ) -> bool:
+        while self._has_async_protected_actions_locked_v1(generation):
+            remaining = deadline_monotonic - self._now_v1()
+            if remaining <= 0:
+                self._fail_retirement_barrier_locked_v1()
+                return False
+            self._condition.wait(timeout=remaining)
+        return True
+
+    async def _wait_for_retirement_barrier_async_v1(
+        self,
+        generation: int,
+        deadline_monotonic: float,
+    ) -> bool:
+        while True:
+            with self._lock:
+                if not self._has_async_protected_actions_locked_v1(
+                    generation
+                ):
+                    return True
+                remaining = deadline_monotonic - self._now_v1()
+                if remaining <= 0:
+                    self._fail_retirement_barrier_locked_v1()
+                    return False
+            await asyncio.sleep(min(remaining, 0.01))
+
+    def _publish_pending_retirement_locked_v1(
+        self,
+        generation: int,
+        reason: GenerationRetirementReasonV1,
+        *,
+        reopen_admission: bool,
+        allow_failed: bool,
+    ) -> GenerationRetirementV1:
+        if (
+            self._retirement_pending_generation != generation
+            or self._current_epoch.generation != generation
+        ):
+            self._fail_internal_authority_locked_v1()
+            raise WorkAdmissionDeniedV1(
+                "generation retirement state invalid"
+            )
+        try:
+            return self._retire_current_generation_locked_v1(
+                reason,
+                reopen_admission=(reopen_admission and not self._failed),
+                allow_failed=allow_failed,
+            )
+        finally:
+            self._retirement_pending_generation = None
+            self._condition.notify_all()
 
     def _retire_current_generation_locked_v1(
         self,
@@ -923,22 +1311,150 @@ class SessionWorkControllerV1:
         if not isinstance(reason, GenerationRetirementReasonV1):
             self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
             raise WorkAdmissionDeniedV1("invalid generation retirement reason")
-        with self._lock:
+        with self._condition:
             self._ensure_no_protected_action_reentry_locked_v1()
             if self._shutdown_started:
                 self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
                 raise WorkAdmissionDeniedV1("generation retirement unavailable")
+            generation = self._current_epoch.generation
+            if self._has_async_protected_actions_locked_v1(generation):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                else:
+                    self._record_v1(
+                        SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED
+                    )
+                    raise WorkAdmissionDeniedV1(
+                        "awaited side effects require "
+                        "retire_generation_async_v1"
+                    )
             try:
-                retirement = self._retire_current_generation_locked_v1(
+                generation, deadline = (
+                    self._begin_retirement_barrier_locked_v1(
+                        allow_failed=False
+                    )
+                )
+                barrier_succeeded = (
+                    self._wait_for_retirement_barrier_locked_v1(
+                        generation,
+                        deadline,
+                    )
+                )
+                retirement = self._publish_pending_retirement_locked_v1(
+                    generation,
                     reason,
-                    reopen_admission=True,
-                    allow_failed=False,
+                    reopen_admission=barrier_succeeded,
+                    allow_failed=not barrier_succeeded,
                 )
             except (SessionGenerationOverflowV1, WorkAdmissionDeniedV1):
                 raise
             except Exception:  # noqa: BLE001 - stable fail-closed API
                 self._fail_internal_authority_locked_v1()
                 raise WorkAdmissionDeniedV1("generation retirement failed") from None
+        self._call_transition_hook_v1(
+            ControllerTransitionPointV1.AFTER_RETIREMENT_PUBLICATION
+        )
+        return retirement
+
+    async def retire_generation_async_v1(
+        self,
+        reason: GenerationRetirementReasonV1 = (
+            GenerationRetirementReasonV1.GENERIC
+        ),
+    ) -> GenerationRetirementV1:
+        """Async retirement for event-loop-owned awaited side effects."""
+
+        if not isinstance(reason, GenerationRetirementReasonV1):
+            self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
+            raise WorkAdmissionDeniedV1(
+                "invalid generation retirement reason"
+            )
+        with self._condition:
+            self._ensure_no_protected_action_reentry_locked_v1()
+            if self._shutdown_started:
+                self._record_v1(
+                    SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED
+                )
+                raise WorkAdmissionDeniedV1(
+                    "generation retirement unavailable"
+                )
+            try:
+                generation, deadline = (
+                    self._begin_retirement_barrier_locked_v1(
+                        allow_failed=False
+                    )
+                )
+            except (SessionGenerationOverflowV1, WorkAdmissionDeniedV1):
+                raise
+            except Exception:  # noqa: BLE001 - stable fail-closed API
+                self._fail_internal_authority_locked_v1()
+                raise WorkAdmissionDeniedV1(
+                    "generation retirement failed"
+                ) from None
+
+        try:
+            barrier_succeeded = (
+                await self._wait_for_retirement_barrier_async_v1(
+                    generation,
+                    deadline,
+                )
+            )
+            with self._condition:
+                retirement = self._publish_pending_retirement_locked_v1(
+                    generation,
+                    reason,
+                    reopen_admission=barrier_succeeded,
+                    allow_failed=not barrier_succeeded,
+                )
+        except (SessionGenerationOverflowV1, WorkAdmissionDeniedV1):
+            raise
+        except asyncio.CancelledError:
+            # Cancellation cannot reopen a generation whose awaited effects
+            # have already been cancelled.  Finish the bounded fail-closed
+            # transition before propagating task cancellation.
+            try:
+                await asyncio.shield(
+                    self._wait_for_retirement_barrier_async_v1(
+                        generation,
+                        deadline,
+                    )
+                )
+            except asyncio.CancelledError:
+                # A repeated caller cancellation does not convert this into
+                # successful quiescence; the controller remains fail closed.
+                pass
+            with self._condition:
+                self._fail_internal_authority_locked_v1()
+                if (
+                    self._retirement_pending_generation == generation
+                    and self._current_epoch.generation == generation
+                ):
+                    self._publish_pending_retirement_locked_v1(
+                        generation,
+                        reason,
+                        reopen_admission=False,
+                        allow_failed=True,
+                    )
+            raise
+        except Exception:  # noqa: BLE001 - stable fail-closed API
+            with self._condition:
+                self._fail_internal_authority_locked_v1()
+                if (
+                    self._retirement_pending_generation == generation
+                    and self._current_epoch.generation == generation
+                ):
+                    self._publish_pending_retirement_locked_v1(
+                        generation,
+                        reason,
+                        reopen_admission=False,
+                        allow_failed=True,
+                    )
+            raise WorkAdmissionDeniedV1(
+                "generation retirement failed"
+            ) from None
+
         self._call_transition_hook_v1(
             ControllerTransitionPointV1.AFTER_RETIREMENT_PUBLICATION
         )
@@ -1108,6 +1624,7 @@ class SessionWorkControllerV1:
         if self._failure_reason is None:
             self._failure_reason = WorkControllerFailureReasonV1.CLEANUP_TIMEOUT
         self._cancel_all_unreleased_work_locked_v1()
+        self._cancel_async_protected_actions_locked_v1()
         self._record_v1(SecurityAuditEventCodeV1.CLEANUP_TIMEOUT)
         self._condition.notify_all()
 
@@ -1191,6 +1708,7 @@ class SessionWorkControllerV1:
         self._active = False
         self._admission_open = False
         self._cancel_all_unreleased_work_locked_v1()
+        self._cancel_async_protected_actions_locked_v1()
         self._destroyed = True
         self._shutdown_result = bool(result and not self._failed)
         self._shutdown_complete = True
@@ -1198,7 +1716,10 @@ class SessionWorkControllerV1:
         self._condition.notify_all()
         return self._shutdown_result
 
-    def shutdown(self) -> bool:
+    def shutdown(
+        self,
+        retired_cleanup_v1: Callable[[], None] | None = None,
+    ) -> bool:
         """Retire, cancel, await all barriers, and destroy this authority."""
 
         with self._condition:
@@ -1209,10 +1730,31 @@ class SessionWorkControllerV1:
                 while not self._shutdown_complete:
                     self._condition.wait()
                 return bool(self._shutdown_result)
+            generation = self._current_epoch.generation
+            if self._has_async_protected_actions_locked_v1(generation):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                else:
+                    raise RuntimeError(
+                        "awaited side effects require shutdown_async"
+                    )
             self._shutdown_started = True
-            self._admission_open = False
             try:
-                self._retire_current_generation_locked_v1(
+                generation, deadline = (
+                    self._begin_retirement_barrier_locked_v1(
+                        allow_failed=True
+                    )
+                )
+                barrier_succeeded = (
+                    self._wait_for_retirement_barrier_locked_v1(
+                        generation,
+                        deadline,
+                    )
+                )
+                self._publish_pending_retirement_locked_v1(
+                    generation,
                     GenerationRetirementReasonV1.SESSION_SHUTDOWN,
                     reopen_admission=False,
                     allow_failed=True,
@@ -1228,7 +1770,14 @@ class SessionWorkControllerV1:
                 if record.state is RetiredGenerationCleanupStateV1.PENDING
             )
 
-        cleanup_succeeded = True
+        cleanup_succeeded = barrier_succeeded
+        if retired_cleanup_v1 is not None:
+            try:
+                retired_cleanup_v1()
+            except Exception:  # noqa: BLE001 - fail closed without payload data
+                with self._condition:
+                    self._fail_internal_authority_locked_v1()
+                cleanup_succeeded = False
         try:
             for cleanup_fence in cleanup_fences:
                 if not self.wait_for_cleanup_v1(cleanup_fence):
@@ -1251,7 +1800,10 @@ class SessionWorkControllerV1:
                 cleanup_succeeded = False
             return self._finish_shutdown_locked_v1(cleanup_succeeded)
 
-    async def shutdown_async(self) -> bool:
+    async def shutdown_async(
+        self,
+        retired_cleanup_v1: Callable[[], None] | None = None,
+    ) -> bool:
         """Native async counterpart to shutdown without blocking the loop."""
 
         with self._condition:
@@ -1264,23 +1816,18 @@ class SessionWorkControllerV1:
             else:
                 owns_shutdown = True
                 self._shutdown_started = True
-                self._admission_open = False
                 try:
-                    self._retire_current_generation_locked_v1(
-                        GenerationRetirementReasonV1.SESSION_SHUTDOWN,
-                        reopen_admission=False,
-                        allow_failed=True,
+                    generation, deadline = (
+                        self._begin_retirement_barrier_locked_v1(
+                            allow_failed=True
+                        )
                     )
                 except SessionGenerationOverflowV1:
                     return self._finish_shutdown_locked_v1(False)
                 except Exception:  # noqa: BLE001 - stable fail-closed result
                     self._fail_internal_authority_locked_v1()
                     return self._finish_shutdown_locked_v1(False)
-                cleanup_fences = tuple(
-                    record.cleanup_fence
-                    for record in self._retired_generations.values()
-                    if (record.state is RetiredGenerationCleanupStateV1.PENDING)
-                )
+                cleanup_fences = ()
 
         if not owns_shutdown:
             while True:
@@ -1289,7 +1836,64 @@ class SessionWorkControllerV1:
                         return bool(self._shutdown_result)
                 await asyncio.sleep(0.01)
 
-        cleanup_succeeded = True
+        try:
+            barrier_succeeded = (
+                await self._wait_for_retirement_barrier_async_v1(
+                    generation,
+                    deadline,
+                )
+            )
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(
+                    self._wait_for_retirement_barrier_async_v1(
+                        generation,
+                        deadline,
+                    )
+                )
+            except asyncio.CancelledError:
+                pass
+            with self._condition:
+                self._fail_internal_authority_locked_v1()
+                if (
+                    self._retirement_pending_generation == generation
+                    and self._current_epoch.generation == generation
+                ):
+                    self._publish_pending_retirement_locked_v1(
+                        generation,
+                        GenerationRetirementReasonV1.SESSION_SHUTDOWN,
+                        reopen_admission=False,
+                        allow_failed=True,
+                    )
+                self._finish_shutdown_locked_v1(False)
+            raise
+        with self._condition:
+            try:
+                self._publish_pending_retirement_locked_v1(
+                    generation,
+                    GenerationRetirementReasonV1.SESSION_SHUTDOWN,
+                    reopen_admission=False,
+                    allow_failed=True,
+                )
+                cleanup_fences = tuple(
+                    record.cleanup_fence
+                    for record in self._retired_generations.values()
+                    if (record.state is RetiredGenerationCleanupStateV1.PENDING)
+                )
+            except SessionGenerationOverflowV1:
+                return self._finish_shutdown_locked_v1(False)
+            except Exception:  # noqa: BLE001 - stable fail-closed result
+                self._fail_internal_authority_locked_v1()
+                return self._finish_shutdown_locked_v1(False)
+
+        cleanup_succeeded = barrier_succeeded
+        if retired_cleanup_v1 is not None:
+            try:
+                retired_cleanup_v1()
+            except Exception:  # noqa: BLE001 - fail closed without payload data
+                with self._condition:
+                    self._fail_internal_authority_locked_v1()
+                cleanup_succeeded = False
         try:
             for cleanup_fence in cleanup_fences:
                 if not await self.wait_for_cleanup_async_v1(cleanup_fence):

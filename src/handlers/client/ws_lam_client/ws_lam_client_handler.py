@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, Literal, Optional, cast
+from typing import Dict, Literal, Optional, cast
 
 import gradio
 from fastapi import FastAPI
@@ -50,6 +50,11 @@ from handlers.client.ws_client.ws_session_endpoint import (
     register_ws_session_endpoint,
 )
 from service.frontend_service import register_frontend
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
 
 from .ws_lam_session_delegate import WsLamClientSessionDelegate
 
@@ -333,13 +338,29 @@ class WsLamClientHandler(_rtc_module.ClientHandlerRtc):
         if inputs.type.channel_type == EngineChannelType.TEXT and delegate.upstream_mode == "rtc":
             # RTC mode: route text to dedicated ws_text_queue to avoid
             # competition with the RTC data-channel's process_chat_history.
-            delegate.ws_text_queue.put_nowait(inputs)
+            data_queue = delegate.ws_text_queue
             logger.debug(f"Routed {inputs.type} to ws_text_queue")
         else:
             data_queue = delegate.output_queues.get(inputs.type.channel_type)
-            if data_queue is not None:
-                data_queue.put_nowait(inputs)
-                logger.debug(f"Routed {inputs.type} to {inputs.type.channel_type} queue")
+        if data_queue is None:
+            return
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            data_queue.put_nowait(inputs)
+        else:
+            try:
+                item = runtime.make_child_item_v1(
+                    inputs,
+                    WorkOperationKindV1.WS_EGRESS,
+                )
+            except WorkAdmissionDeniedV1:
+                return
+            if not runtime.perform_if_live_v1(
+                item.registered_work,
+                WorkValidationBoundaryV1.BEFORE_EGRESS,
+                lambda: data_queue.put_nowait(item),
+            ):
+                item.release_once_v1(runtime)
 
     # ------------------------------------------------------------------
     # Signal routing: engine -> delegate signal queue
@@ -353,10 +374,36 @@ class WsLamClientHandler(_rtc_module.ClientHandlerRtc):
 
         if signal.type == ChatSignalType.INTERRUPT:
             if context.client_session_delegate._opus_encoder is not None:
-                context.client_session_delegate._opus_encoder.reset()
+                runtime = context.work_runtime_v1
+                if runtime is None:
+                    context.client_session_delegate._opus_encoder.reset()
+                elif not runtime.perform_current_if_live_v1(
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    context.client_session_delegate._opus_encoder.reset,
+                ):
+                    return
                 logger.debug("Opus encoder reset due to interrupt signal from engine")
 
-        context.client_session_delegate.signal_to_client_queue.put_nowait(signal)
+        runtime = context.work_runtime_v1
+        if runtime is None:
+            context.client_session_delegate.signal_to_client_queue.put_nowait(
+                signal
+            )
+            return
+        try:
+            item = runtime.make_child_item_v1(
+                signal,
+                WorkOperationKindV1.WS_EGRESS,
+            )
+        except WorkAdmissionDeniedV1:
+            return
+        if not runtime.perform_if_live_v1(
+            item.registered_work,
+            WorkValidationBoundaryV1.BEFORE_EGRESS,
+            lambda: context.client_session_delegate
+            .signal_to_client_queue.put_nowait(item),
+        ):
+            item.release_once_v1(runtime)
 
     # ------------------------------------------------------------------
     # Cleanup

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import dataclass
 from typing import Protocol
@@ -29,6 +30,9 @@ from service.service_utils.ssl_helpers import CertificateCaptureStartupError
 SESSION_CAPABILITY_HEADER_V1 = "X-Certificate-Session-Capability"
 CERTIFICATE_CAPTURE_ENABLED_STATE_ATTRIBUTE_V1 = (
     "certificate_capture_enabled_v1"
+)
+CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1 = (
+    "certificate_session_work_lifecycle_v1"
 )
 _LEGACY_RTC_ROUTE_PATHS_V1 = {
     "/webrtc/offer",
@@ -196,9 +200,26 @@ def install_certificate_session_control_v1(
         principal = await authenticated_principal(request)
         try:
             async with session_authority.serialized_transition():
+                previous_session_id = (
+                    session_authority
+                    ._active_session_id_for_principal_v1(principal)
+                )
                 grant = session_authority.create_session(principal)
+                if (
+                    previous_session_id is not None
+                    and previous_session_id != grant.session_id
+                ):
+                    await _retire_application_session_v1(
+                        app,
+                        previous_session_id,
+                    )
         except SessionAuthorityErrorV1 as exception:
             raise _authority_http_error(exception) from None
+        except Exception:  # noqa: BLE001 - stable fail-closed response
+            raise _http_error(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "SESSION_LIFECYCLE_UNAVAILABLE",
+            ) from None
         _apply_no_store(response)
         return _session_capability_response(grant)
 
@@ -245,8 +266,17 @@ def install_certificate_session_control_v1(
                     session_id,
                     session_capability,
                 )
+                await _retire_application_session_v1(
+                    app,
+                    session_id,
+                )
         except SessionAuthorityErrorV1 as exception:
             raise _authority_http_error(exception) from None
+        except Exception:  # noqa: BLE001 - stable fail-closed response
+            raise _http_error(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "SESSION_LIFECYCLE_UNAVAILABLE",
+            ) from None
         return Response(
             status_code=status.HTTP_204_NO_CONTENT,
             headers=_NO_STORE_HEADERS_V1,
@@ -258,6 +288,27 @@ def install_certificate_session_control_v1(
 
     app.add_event_handler("shutdown", close_session_authority)
     return runtime
+
+
+async def _retire_application_session_v1(
+    app: FastAPI,
+    session_id: str,
+) -> None:
+    """Retire fenced work before the owning transport is torn down."""
+
+    lifecycle = getattr(
+        app.state,
+        CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1,
+        None,
+    )
+    if lifecycle is None:
+        raise RuntimeError("secure session lifecycle unavailable")
+    retire = getattr(lifecycle, "retire_secure_session_v1", None)
+    if not callable(retire):
+        raise RuntimeError("secure session lifecycle unavailable")
+    result = retire(session_id)
+    if inspect.isawaitable(result):
+        await result
 
 
 async def require_certificate_control_authorization_v1(

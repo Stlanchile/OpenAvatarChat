@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import os
 import threading
 import uuid
@@ -19,6 +20,9 @@ from chat_engine.data_models.session_info_data import SessionInfoData
 from engine_utils.directory_info import DirectoryInfo
 from service.service_security.manager_authorization import (
     require_manager_http_authorization_v1,
+)
+from service.service_security.certificate_session_control import (
+    CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +91,21 @@ class ChatEngine(object):
         self.logic_manager.initialize(engine_config)
         self.handler_manager.load_handlers(engine_config, app, ui, parent_block)
         self.logic_manager.load_logics(engine_config)
+        if self._certificate_capture_enabled_v1 and app is not None:
+            existing_lifecycle = getattr(
+                app.state,
+                CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1,
+                None,
+            )
+            if existing_lifecycle not in {None, self}:
+                raise RuntimeError(
+                    "secure session lifecycle already installed"
+                )
+            setattr(
+                app.state,
+                CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1,
+                self,
+            )
         self.states.inited = True
 
     def _create_session(
@@ -250,6 +269,124 @@ class ChatEngine(object):
                 self._stopping_session_ids_v1.discard(session_id)
                 self._session_stop_events_v1.pop(session_id, None)
                 stop_event.set()
+
+    async def _teardown_session_transports_v1(
+        self,
+        session_id: str,
+    ) -> None:
+        """Tear down client transports after fenced session cleanup."""
+
+        registries = self.handler_manager.get_enabled_handler_registries()
+        for registry in registries:
+            handler = registry.handler
+            if not isinstance(handler, ClientHandlerBase):
+                continue
+            delegate_manager = handler.handler_delegate
+            session_delegate = (
+                delegate_manager.session_delegates.pop(
+                    session_id,
+                    None,
+                )
+            )
+
+            stream_factory = getattr(
+                handler,
+                "rtc_streamer_factory",
+                None,
+            )
+            streams = getattr(stream_factory, "streams", None)
+            stream = (
+                streams.get(session_id)
+                if isinstance(streams, dict)
+                else None
+            )
+            if stream is not None:
+                shutdown_async = getattr(
+                    stream,
+                    "shutdown_async",
+                    None,
+                )
+                if callable(shutdown_async):
+                    result = shutdown_async()
+                    if inspect.isawaitable(result):
+                        await result
+                else:
+                    shutdown = getattr(stream, "shutdown", None)
+                    if callable(shutdown):
+                        result = shutdown()
+                        if inspect.isawaitable(result):
+                            await result
+
+            if session_delegate is not None:
+                retire_transport = getattr(
+                    session_delegate,
+                    "retire_transport_async_v1",
+                    None,
+                )
+                if callable(retire_transport):
+                    result = retire_transport()
+                    if inspect.isawaitable(result):
+                        await result
+                else:
+                    clear_data = getattr(
+                        session_delegate,
+                        "clear_data",
+                        None,
+                    )
+                    if callable(clear_data):
+                        clear_data()
+
+    def _teardown_session_transports_sync_v1(
+        self,
+        session_id: str,
+    ) -> None:
+        for registry in self.handler_manager.get_enabled_handler_registries():
+            handler = registry.handler
+            if not isinstance(handler, ClientHandlerBase):
+                continue
+            delegate_manager = handler.handler_delegate
+            session_delegate = (
+                delegate_manager.session_delegates.pop(
+                    session_id,
+                    None,
+                )
+            )
+            stream_factory = getattr(
+                handler,
+                "rtc_streamer_factory",
+                None,
+            )
+            streams = getattr(stream_factory, "streams", None)
+            stream = (
+                streams.get(session_id)
+                if isinstance(streams, dict)
+                else None
+            )
+            if stream is not None:
+                shutdown = getattr(stream, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            if session_delegate is not None:
+                quit_event = getattr(session_delegate, "quit", None)
+                if quit_event is not None:
+                    quit_event.set()
+                clear_data = getattr(
+                    session_delegate,
+                    "clear_data",
+                    None,
+                )
+                if callable(clear_data):
+                    clear_data()
+
+    def retire_secure_session_sync_v1(self, session_id: str) -> None:
+        self.stop_session(session_id)
+        self._teardown_session_transports_sync_v1(session_id)
+
+    async def retire_secure_session_v1(self, session_id: str) -> None:
+        """Retire/cancel work, then tear down the owning client transport."""
+
+        await self.stop_session_async(session_id)
+        await self._teardown_session_transports_v1(session_id)
     
     def shutdown(self):
         logger.info("Shutting down chat engine...")
@@ -260,7 +397,7 @@ class ChatEngine(object):
                 if session._work_controller_v1 is not None
             )
         for session_id in secure_session_ids:
-            self.stop_session(session_id)
+            self.retire_secure_session_sync_v1(session_id)
         self.logic_manager.destroy()
         self.handler_manager.destroy()
 
@@ -273,6 +410,6 @@ class ChatEngine(object):
                 if session._work_controller_v1 is not None
             )
         for session_id in secure_session_ids:
-            await self.stop_session_async(session_id)
+            await self.retire_secure_session_v1(session_id)
         self.logic_manager.destroy()
         self.handler_manager.destroy()

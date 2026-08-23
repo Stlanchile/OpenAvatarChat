@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 from typing import Dict, Optional, cast, Union, Tuple
 from uuid import uuid4
@@ -248,8 +249,21 @@ from service.rtc_service.rtc_provider import RTCProvider
 from service.rtc_service.rtc_session_admission import (
     mount_rtc_signaling_routes_v1,
 )
+from service.rtc_service.fenced_tracks import (
+    install_fenced_fastrtc_tracks_v1,
+    send_fenced_data_channel_v1,
+)
 from service.rtc_service.rtc_stream import RtcStream
 from chat_engine.data_models.chat_signal_type import ChatSignalType
+from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
+)
 
 
 class RtcClientSessionDelegate(ClientSessionDelegate):
@@ -269,6 +283,8 @@ class RtcClientSessionDelegate(ClientSessionDelegate):
             EngineChannelType.VIDEO: ChatDataType.CAMERA_VIDEO,
             EngineChannelType.TEXT: ChatDataType.HUMAN_TEXT,
         }
+        self.work_runtime_v1: Optional[SessionWorkRuntimeV1] = None
+        self.work_consumer_capability_v1 = None
 
     async def get_data(self, modality: EngineChannelType, timeout: Optional[float] = 0.1) -> Optional[ChatData]:
         data_queue = self.output_queues.get(modality)
@@ -282,6 +298,37 @@ class RtcClientSessionDelegate(ClientSessionDelegate):
         else:
             data = await data_queue.get()
         return data
+
+    def unwrap_output_item_v1(self, queued_item):
+        runtime = self.work_runtime_v1
+        if runtime is None:
+            return queued_item, None
+        if not isinstance(queued_item, WorkBoundItemV1):
+            return None, None
+        if not runtime.validate_work_v1(
+            queued_item.registered_work,
+            WorkValidationBoundaryV1.QUEUE_DEQUEUE,
+        ):
+            runtime.log_late_drop_v1(
+                queued_item.registered_work,
+                "RTC_QUEUE_DEQUEUE",
+            )
+            return None, queued_item
+        return queued_item.payload, queued_item
+
+    def ingress_work_scope_v1(self):
+        if self.work_runtime_v1 is None:
+            return contextlib.nullcontext(None)
+        if self.data_submitter is None:
+            return contextlib.nullcontext(None)
+        scope_factory = getattr(
+            self.data_submitter,
+            "ingress_work_scope_v1",
+            None,
+        )
+        if not callable(scope_factory):
+            return contextlib.nullcontext(None)
+        return scope_factory()
 
     def put_data(self, modality: EngineChannelType, data: Union[np.ndarray, str],
                  timestamp: Optional[Tuple[int, int]] = None, samplerate: Optional[int] = None, loopback: bool = False):
@@ -310,8 +357,25 @@ class RtcClientSessionDelegate(ClientSessionDelegate):
             data=data_bundle,
             timestamp=timestamp,
         )
-        self.data_submitter.submit(chat_data, finish_stream=is_last_data)
-        if loopback:
+        submit_ingress = getattr(
+            self.data_submitter,
+            "submit_ingress_v1",
+            None,
+        )
+        if callable(submit_ingress):
+            submit_ingress(
+                chat_data,
+                finish_stream=is_last_data,
+            )
+        else:
+            self.data_submitter.submit(
+                chat_data,
+                finish_stream=is_last_data,
+            )
+        # Secure HUMAN_TEXT echo is produced by this handler's ordinary
+        # authorized dispatch path.  A raw local queue entry would have no
+        # exact parent work identity and is therefore legacy-only.
+        if loopback and self.work_runtime_v1 is None:
             self.output_queues[modality].put_nowait(chat_data)
 
     def get_timestamp(self):
@@ -324,9 +388,22 @@ class RtcClientSessionDelegate(ClientSessionDelegate):
             logger.warning("signal_emitter is None, cannot emit signal")
 
     def clear_data(self):
+        self.drain_application_output_v1()
+
+    def drain_application_output_v1(self) -> None:
         for data_queue in self.output_queues.values():
             while not data_queue.empty():
-                data_queue.get_nowait()
+                queued_item = data_queue.get_nowait()
+                if (
+                    self.work_runtime_v1 is not None
+                    and isinstance(
+                        queued_item,
+                        WorkBoundItemV1,
+                    )
+                ):
+                    queued_item.release_once_v1(
+                        self.work_runtime_v1
+                    )
 
 
 class ClientRtcConfigModel(HandlerBaseConfigModel, BaseModel):
@@ -400,6 +477,7 @@ class ClientHandlerRtc(ClientHandlerBase):
     def load(self, engine_config: ChatEngineConfigModel, handler_config: Optional[HandlerBaseConfigModel] = None):
         self.engine_config = engine_config
         self.handler_config = cast(ClientRtcConfigModel, handler_config)
+        install_fenced_fastrtc_tracks_v1()
         self.prepare_rtc_definitions()
 
     def setup_rtc_ui(self, ui, parent_block, fastapi: FastAPI, avatar_config):
@@ -468,6 +546,12 @@ class ClientHandlerRtc(ClientHandlerBase):
         session_delegate.signal_emitter = handler_context.signal_emitter
         session_delegate.input_data_definitions = self.output_bundle_definitions
         session_delegate.shared_states = session_context.shared_states
+        session_delegate.work_runtime_v1 = (
+            handler_context.work_runtime_v1
+        )
+        session_delegate.work_consumer_capability_v1 = (
+            handler_context.work_consumer_capability_v1
+        )
 
         handler_context.client_session_delegate = session_delegate
 
@@ -520,23 +604,68 @@ class ClientHandlerRtc(ClientHandlerBase):
             return None
         return stream
 
-    def _send_message_to_chat_channel(self, session_id: str, message) -> bool:
+    def _send_message_to_chat_channel(
+        self,
+        session_id: str,
+        message,
+        *,
+        work_item_v1: WorkBoundItemV1 | None = None,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
+        consumer_capability_v1=None,
+    ) -> bool:
         stream = self._get_chat_channel(session_id)
         if stream is None or stream.chat_channel is None:
+            if work_item_v1 is not None and work_runtime_v1 is not None:
+                work_item_v1.release_once_v1(work_runtime_v1)
             return False
         payload = json.dumps(serialize_message(message))
+
+        def send_payload() -> None:
+            if work_item_v1 is None or work_runtime_v1 is None:
+                stream.chat_channel.send(payload)
+                return
+            send_fenced_data_channel_v1(
+                stream.chat_channel,
+                payload,
+                work_item_v1,
+                work_runtime_v1,
+                consumer_capability_v1,
+            )
+
         loop = getattr(stream, "chat_channel_loop", None)
         if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(stream.chat_channel.send, payload)
-            return True
+            try:
+                loop.call_soon_threadsafe(send_payload)
+                return True
+            except RuntimeError:
+                if (
+                    work_item_v1 is not None
+                    and work_runtime_v1 is not None
+                ):
+                    work_item_v1.release_once_v1(
+                        work_runtime_v1
+                    )
+                logger.warning("RTC_DATA_CHANNEL_SCHEDULE_FAILED")
+                return False
         try:
-            stream.chat_channel.send(payload)
+            send_payload()
             return True
-        except RuntimeError as e:
-            logger.warning(f"Failed to send chat channel message for session {session_id}: {e}")
+        except RuntimeError as exception:
+            if work_runtime_v1 is None:
+                logger.warning(
+                    "Failed to send chat channel message for "
+                    f"session {session_id}: {exception}"
+                )
+            else:
+                logger.warning("RTC_DATA_CHANNEL_SEND_FAILED")
             return False
 
-    def _send_text_to_chat_channel(self, context: ClientRtcContext, inputs: ChatData) -> bool:
+    def _send_text_to_chat_channel(
+        self,
+        context: ClientRtcContext,
+        inputs: ChatData,
+        work_item_v1: WorkBoundItemV1 | None = None,
+    ) -> bool:
         stream_key_str = inputs.stream_id.stream_key_str if inputs.stream_id else None
         text_end = inputs.is_last_data
         text = inputs.data.get_main_data() if inputs.data is not None else ""
@@ -565,23 +694,69 @@ class ClientHandlerRtc(ClientHandlerBase):
                     metadata=stream_metadata,
                 ),
             )
-        return self._send_message_to_chat_channel(context.session_id, response)
+        return self._send_message_to_chat_channel(
+            context.session_id,
+            response,
+            work_item_v1=work_item_v1,
+            work_runtime_v1=context.work_runtime_v1,
+            consumer_capability_v1=(
+                context.work_consumer_capability_v1
+            ),
+        )
 
     def handle(self, context: HandlerContext, inputs: ChatData,
                output_definitions: Dict[ChatDataType, HandlerDataInfo]):
         context = cast(ClientRtcContext, context)
         if context.client_session_delegate is None:
             return
+        runtime = context.work_runtime_v1
+        work_item = None
+        if runtime is not None:
+            try:
+                work_item = runtime.make_child_item_v1(
+                    inputs,
+                    WorkOperationKindV1.RTC_EGRESS,
+                )
+            except WorkAdmissionDeniedV1:
+                return
         if inputs.type.channel_type == EngineChannelType.TEXT:
-            if not self._send_text_to_chat_channel(context, inputs):
+            if not self._send_text_to_chat_channel(
+                context,
+                inputs,
+                work_item,
+            ):
                 logger.debug(f"Chat channel not ready for session {context.session_id}, skip text forwarding")
             return
         data_queue = context.client_session_delegate.output_queues.get(inputs.type.channel_type)
         if data_queue is not None:
-            data_queue.put_nowait(inputs)
+            if runtime is None:
+                data_queue.put_nowait(inputs)
+            elif work_item is not None and not runtime.perform_if_live_v1(
+                work_item.registered_work,
+                WorkValidationBoundaryV1.BEFORE_EGRESS,
+                lambda: data_queue.put_nowait(work_item),
+            ):
+                work_item.release_once_v1(runtime)
+        elif runtime is not None and work_item is not None:
+            work_item.release_once_v1(runtime)
+
+    def drain_registered_work_v1(
+        self,
+        context: HandlerContext,
+    ) -> None:
+        context = cast(ClientRtcContext, context)
+        if context.client_session_delegate is not None:
+            context.client_session_delegate.drain_application_output_v1()
+        if self.rtc_streamer_factory is None:
+            return
+        stream = self.rtc_streamer_factory.streams.get(
+            context.session_id
+        )
+        if stream is not None:
+            stream.drain_application_egress_v1()
 
     def destroy_context(self, context: HandlerContext):
-        pass
+        self.drain_registered_work_v1(context)
 
     def on_signal(self, context: HandlerContext, signal: ChatSignal):
         context = cast(ClientRtcContext, context)
@@ -608,4 +783,26 @@ class ClientHandlerRtc(ClientHandlerBase):
                 header=MessageHeader(name=MessageType.CHAT_SIGNAL, request_id=str(uuid4())),
                 payload=signal_payload,
             )
-            self._send_message_to_chat_channel(context.session_id, message)
+            runtime = context.work_runtime_v1
+            if runtime is None:
+                self._send_message_to_chat_channel(
+                    context.session_id,
+                    message,
+                )
+                return
+            try:
+                work_item = runtime.make_child_item_v1(
+                    signal,
+                    WorkOperationKindV1.RTC_EGRESS,
+                )
+            except WorkAdmissionDeniedV1:
+                return
+            self._send_message_to_chat_channel(
+                context.session_id,
+                message,
+                work_item_v1=work_item,
+                work_runtime_v1=runtime,
+                consumer_capability_v1=(
+                    context.work_consumer_capability_v1
+                ),
+            )
