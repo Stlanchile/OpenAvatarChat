@@ -8,9 +8,9 @@ from enum import Enum
 class CaptureStateV1(str, Enum):
     """The complete normative V1 capture lifecycle.
 
-    Milestone 4A activates only IDLE, ENTERING, QUIESCING, ARMED, ENDING,
-    and FAILED_CLOSED. The other values reserve the normative vocabulary for
-    later milestones; this package does not implement their runtime behavior.
+    Milestone 4B activates CAPTURING and, only with a constructor-injected test
+    processor, BUILDING_ASSERTIONS and READY. Production post-seal processing
+    remains unavailable and fails closed rather than publishing fake readiness.
     """
 
     IDLE = "IDLE"

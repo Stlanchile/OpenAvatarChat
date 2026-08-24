@@ -15,9 +15,9 @@ from chat_engine.security.epochs import SessionEpochV1
 class WorkOperationKindV1(str, Enum):
     """Closed Milestone 3 operation kinds.
 
-    Milestone 3B adds only the production async-subsystem kinds required to
-    fence existing public-chat work. Certificate capture/OCR/query/speech
-    operation kinds intentionally remain absent.
+    Milestone 4B adds only private frame-request work, capture-control timers,
+    and the constructor-injected mock lifecycle processor. OCR/query/speech
+    work remains absent.
     """
 
     GENERIC_ASYNC = "GENERIC_ASYNC"
@@ -32,6 +32,9 @@ class WorkOperationKindV1(str, Enum):
     TTS_SYNTHESIS = "TTS_SYNTHESIS"
     WS_EGRESS = "WS_EGRESS"
     RTC_EGRESS = "RTC_EGRESS"
+    CAPTURE_FRAME_UPLOAD = "CAPTURE_FRAME_UPLOAD"
+    CAPTURE_INACTIVITY_TIMER = "CAPTURE_INACTIVITY_TIMER"
+    CAPTURE_MOCK_PROCESSOR = "CAPTURE_MOCK_PROCESSOR"
 
 
 class WorkValidationBoundaryV1(str, Enum):

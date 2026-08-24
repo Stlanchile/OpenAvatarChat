@@ -57,6 +57,9 @@ _DEFAULT_WORK_LIFETIME_SECONDS_V1: dict[WorkOperationKindV1, float] = {
     WorkOperationKindV1.TTS_SYNTHESIS: 300.0,
     WorkOperationKindV1.WS_EGRESS: 60.0,
     WorkOperationKindV1.RTC_EGRESS: 60.0,
+    WorkOperationKindV1.CAPTURE_FRAME_UPLOAD: 15.0,
+    WorkOperationKindV1.CAPTURE_INACTIVITY_TIMER: 15 * 60.0,
+    WorkOperationKindV1.CAPTURE_MOCK_PROCESSOR: 30.0,
 }
 
 

@@ -3,19 +3,56 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import inspect
+import math
 import threading
 import time
 import uuid
-from collections.abc import Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Coroutine
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from typing import Any, TypeVar
 
+from certificate_capture.capabilities import (
+    ActiveCaptureCapabilityV1,
+    CaptureCapabilityAuthorityV1,
+    CaptureCapabilityBindingV1,
+)
 from certificate_capture.epochs import CaptureEpochV1
 from certificate_capture.isolation import (
     NormalApplicationAdmissionViewV1,
     _create_normal_mode_isolation_v1,
     _NormalModeIsolationControllerV1,
+)
+from certificate_capture.processor import CaptureProcessorV1
+from certificate_capture.protocol import (
+    CAPTURE_BEGIN_MINIMUM_SESSION_REMAINING_SECONDS_V1,
+    CAPTURE_INACTIVITY_SECONDS_V1,
+    FRAME_UPLOAD_READ_TIMEOUT_SECONDS_V1,
+    MAX_CAPTURE_ENCODED_BYTES_V1,
+    MAX_CAPTURE_FRAMES_V1,
+    MAX_CONCURRENT_UPLOADS_PER_CAPTURE_V1,
+    MAX_OUTSTANDING_CONTROL_MUTATIONS_V1,
+    MINIMUM_MOCK_UNIQUE_FRAMES_V1,
+    BeginCaptureGrantV1,
+    CaptureProtocolErrorV1,
+    CaptureProtocolReasonV1,
+    CapturePublicStatusV1,
+    EndCaptureResultV1,
+    FrameUploadPermitV1,
+    FrameUploadResultV1,
+    MockProcessingInputV1,
+    SealOutcomeV1,
+    SealReasonCodeV1,
+    SealResultV1,
+    ValidatedJpegFrameV1,
+)
+from certificate_capture.replay import (
+    ControlOperationV1,
+    ControlReplayLedgerV1,
+    ControlReplayRecordV1,
+    canonical_control_request_digest_v1,
 )
 from certificate_capture.state import (
     CaptureFailureReasonV1,
@@ -44,6 +81,13 @@ from chat_engine.security.session_work_controller import (
     SessionWorkControllerV1,
     WorkAdmissionDeniedV1,
 )
+from chat_engine.security.work_fence import (
+    RegisteredWorkV1,
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+
+_ControlResultV1 = TypeVar("_ControlResultV1")
 
 
 class CaptureTransitionRejectedV1(RuntimeError):
@@ -83,6 +127,29 @@ class _CaptureTransitionV1:
         return "_CaptureTransitionV1(<opaque>)"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _BeginReplayResultV1:
+    capture_epoch: CaptureEpochV1
+    capability_binding: CaptureCapabilityBindingV1
+
+    def __repr__(self) -> str:
+        return "_BeginReplayResultV1(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _FrameRecordV1:
+    frame_seq: int
+    encoded_size: int
+    decoded_width: int
+    decoded_height: int
+    sha256_digest: bytes
+    accepted_at_monotonic: float
+    result: FrameUploadResultV1
+
+    def __repr__(self) -> str:
+        return "_FrameRecordV1(<private-metadata>)"
+
+
 class _TransitionFailureV1(RuntimeError):
     __slots__ = ("reason",)
 
@@ -111,31 +178,54 @@ class CaptureCoordinatorV1:
     """Own one capture-mode lifecycle for one authenticated secure session."""
 
     __slots__ = (
+        "_accepted_frame_bytes_v1",
+        "_active_capture_capability_v1",
+        "_active_frame_upload_permits_v1",
         "_active_transition",
         "_audit",
+        "_capability_authority_v1",
         "_capture_epoch",
         "_capture_id",
         "_capture_seq",
+        "_control_lock_v1",
+        "_control_waiters_v1",
         "_destroyed",
         "_failure_reason",
         "_failure_terminator_v1",
         "_fatal_failure",
         "_feature_enabled_v1",
+        "_frame_records_v1",
+        "_inactivity_deadline_epoch_v1",
+        "_inactivity_deadline_monotonic_v1",
+        "_inactivity_event_v1",
+        "_inactivity_revision_v1",
+        "_inactivity_task_v1",
+        "_inactivity_work_v1",
         "_isolation_controller",
         "_isolation_view",
+        "_last_seal_result_v1",
         "_last_session_generation",
         "_lock",
+        "_monotonic_clock_v1",
         "_operation_idle",
         "_operation_lock",
+        "_processor_task_v1",
+        "_processor_work_v1",
+        "_profile_id_v1",
         "_quiescence_complete",
         "_quiescence_drain_v1",
+        "_replay_ledger_v1",
+        "_seal_attempt_seq_v1",
         "_security_authority_usable_v1",
         "_semantic_cleanup_v1",
         "_session_live_action_v1",
         "_shutdown_started",
         "_state",
         "_termination_requested",
+        "_test_processor_v1",
         "_transition_hook_for_test_v1",
+        "_unique_frame_digests_v1",
+        "_wall_clock_v1",
         "_work_controller",
     )
 
@@ -152,11 +242,18 @@ class CaptureCoordinatorV1:
         quiescence_drain_v1: QuiescenceDrainV1,
         semantic_cleanup_v1: SemanticCleanupV1,
         failure_terminator_v1: FailureTerminatorV1 | None,
+        test_processor_v1: CaptureProcessorV1 | None = None,
+        wall_clock_v1: Callable[[], float] = time.time,
+        monotonic_clock_v1: Callable[[], float] = time.monotonic,
     ) -> None:
         if _construction_authority_v1 is not _COORDINATOR_CONSTRUCTION_AUTHORITY_V1:
             raise RuntimeError("capture coordinator construction denied")
         if not isinstance(work_controller, SessionWorkControllerV1):
             raise TypeError("work_controller must be SessionWorkControllerV1")
+        if test_processor_v1 is not None and not callable(
+            getattr(test_processor_v1, "process_capture_v1", None)
+        ):
+            raise TypeError("test processor must implement process_capture_v1")
         self._work_controller = work_controller
         self._isolation_controller = isolation_controller
         self._isolation_view = isolation_view
@@ -166,8 +263,12 @@ class CaptureCoordinatorV1:
         self._quiescence_drain_v1 = quiescence_drain_v1
         self._semantic_cleanup_v1 = semantic_cleanup_v1
         self._failure_terminator_v1 = failure_terminator_v1
+        self._test_processor_v1 = test_processor_v1
+        self._wall_clock_v1 = wall_clock_v1
+        self._monotonic_clock_v1 = monotonic_clock_v1
         self._lock = threading.RLock()
         self._operation_lock = asyncio.Lock()
+        self._control_lock_v1 = asyncio.Lock()
         self._operation_idle = threading.Event()
         self._operation_idle.set()
         self._state = CaptureStateV1.IDLE
@@ -184,6 +285,27 @@ class CaptureCoordinatorV1:
         self._last_session_generation = work_controller.current_epoch_v1().generation
         self._audit = CoreSecurityAuditV1()
         self._transition_hook_for_test_v1: TransitionHookV1 | None = None
+        self._capability_authority_v1 = CaptureCapabilityAuthorityV1()
+        self._active_capture_capability_v1: (
+            ActiveCaptureCapabilityV1 | None
+        ) = None
+        self._replay_ledger_v1 = ControlReplayLedgerV1()
+        self._frame_records_v1: dict[int, _FrameRecordV1] = {}
+        self._unique_frame_digests_v1: set[bytes] = set()
+        self._accepted_frame_bytes_v1 = 0
+        self._active_frame_upload_permits_v1: set[uuid.UUID] = set()
+        self._profile_id_v1: str | None = None
+        self._seal_attempt_seq_v1 = 0
+        self._last_seal_result_v1: SealResultV1 | None = None
+        self._inactivity_deadline_epoch_v1: float | None = None
+        self._inactivity_deadline_monotonic_v1: float | None = None
+        self._inactivity_revision_v1 = 0
+        self._inactivity_event_v1: asyncio.Event | None = None
+        self._inactivity_task_v1: asyncio.Task[None] | None = None
+        self._inactivity_work_v1: RegisteredWorkV1 | None = None
+        self._processor_task_v1: asyncio.Task[None] | None = None
+        self._processor_work_v1: RegisteredWorkV1 | None = None
+        self._control_waiters_v1 = 0
 
     @classmethod
     def _create_for_session_v1(
@@ -196,6 +318,9 @@ class CaptureCoordinatorV1:
         quiescence_drain_v1: QuiescenceDrainV1,
         semantic_cleanup_v1: SemanticCleanupV1,
         failure_terminator_v1: FailureTerminatorV1 | None = None,
+        _test_processor_v1: CaptureProcessorV1 | None = None,
+        _wall_clock_for_test_v1: Callable[[], float] | None = None,
+        _monotonic_clock_for_test_v1: Callable[[], float] | None = None,
     ) -> tuple[
         CaptureCoordinatorV1,
         NormalApplicationAdmissionViewV1,
@@ -214,6 +339,17 @@ class CaptureCoordinatorV1:
             quiescence_drain_v1=quiescence_drain_v1,
             semantic_cleanup_v1=semantic_cleanup_v1,
             failure_terminator_v1=failure_terminator_v1,
+            test_processor_v1=_test_processor_v1,
+            wall_clock_v1=(
+                _wall_clock_for_test_v1
+                if _wall_clock_for_test_v1 is not None
+                else time.time
+            ),
+            monotonic_clock_v1=(
+                _monotonic_clock_for_test_v1
+                if _monotonic_clock_for_test_v1 is not None
+                else time.monotonic
+            ),
         )
         return coordinator, isolation_view
 
@@ -258,6 +394,1611 @@ class CaptureCoordinatorV1:
     ) -> NormalApplicationAdmissionViewV1:
         return self._isolation_view
 
+    def _read_protocol_clocks_v1(self) -> tuple[float, float]:
+        try:
+            now_epoch = self._wall_clock_v1()
+            now_monotonic = self._monotonic_clock_v1()
+        except Exception:  # noqa: BLE001 - injected/system clocks fail closed
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+            ) from None
+        if (
+            isinstance(now_epoch, bool)
+            or not isinstance(now_epoch, (int, float))
+            or not math.isfinite(now_epoch)
+            or isinstance(now_monotonic, bool)
+            or not isinstance(now_monotonic, (int, float))
+            or not math.isfinite(now_monotonic)
+        ):
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+            )
+        return float(now_epoch), float(now_monotonic)
+
+    def _claim_control_waiter_v1(self) -> None:
+        with self._lock:
+            if (
+                self._destroyed
+                or self._shutdown_started
+                or self._control_waiters_v1
+                >= MAX_OUTSTANDING_CONTROL_MUTATIONS_V1
+            ):
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CONTROL_BUSY
+                )
+            self._control_waiters_v1 += 1
+
+    def _release_control_waiter_v1(self) -> None:
+        with self._lock:
+            if self._control_waiters_v1 > 0:
+                self._control_waiters_v1 -= 1
+
+    @staticmethod
+    def _protocol_error_for_lifecycle_v1(
+        exception: BaseException,
+    ) -> CaptureProtocolErrorV1:
+        if isinstance(exception, CaptureProtocolErrorV1):
+            return exception
+        reason_code = getattr(exception, "reason_code", None)
+        if reason_code in {
+            CaptureFailureReasonV1.CAPTURE_BUSY.value,
+            CaptureFailureReasonV1.INVALID_STATE.value,
+            CaptureFailureReasonV1.CAPTURE_EPOCH_MISMATCH.value,
+            CaptureFailureReasonV1.CAPTURE_SEQUENCE_MISMATCH.value,
+            CaptureFailureReasonV1.STALE_TRANSITION.value,
+        }:
+            reason = CaptureProtocolReasonV1.CAPTURE_BUSY
+        elif isinstance(exception, CaptureFailedClosedV1):
+            reason = CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+        elif reason_code in {
+            CaptureFailureReasonV1.SESSION_AUTHORITY_UNAVAILABLE.value,
+            CaptureFailureReasonV1.SESSION_SHUTDOWN.value,
+        }:
+            reason = CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+        else:
+            reason = CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+        return CaptureProtocolErrorV1(reason)
+
+    async def begin_capture_protocol_v1(
+        self,
+        *,
+        request_id: uuid.UUID,
+        control_seq: int,
+        profile_id: str,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+        session_expires_at_epoch_seconds: float,
+    ) -> BeginCaptureGrantV1:
+        """Replay-protected Begin that delegates quiescence to Milestone 4A."""
+
+        await self._expire_active_capture_before_control_v1()
+        request_digest = canonical_control_request_digest_v1(
+            operation=ControlOperationV1.BEGIN,
+            request_id=request_id,
+            control_seq=control_seq,
+            profile_id=profile_id,
+        )
+        self._claim_control_waiter_v1()
+        try:
+            async with self._control_lock_v1:
+                replayed_result: _BeginReplayResultV1 | None = None
+                with self._lock:
+                    record, replayed = self._replay_ledger_v1.lookup_or_claim_v1(
+                        operation=ControlOperationV1.BEGIN,
+                        request_id=request_id,
+                        control_seq=control_seq,
+                        request_digest=request_digest,
+                    )
+                    if replayed:
+                        replay_result = self._replay_ledger_v1.replay_result_v1(
+                            record
+                        )
+                        if not isinstance(replay_result, _BeginReplayResultV1):
+                            raise CaptureProtocolErrorV1(
+                                CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+                            )
+                        replayed_result = replay_result
+                if replayed_result is not None:
+                    return self._grant_for_live_begin_replay_v1(
+                        replayed_result,
+                        session_id=session_id,
+                        owner_issuer=owner_issuer,
+                        owner_subject=owner_subject,
+                    )
+
+                async def execute_begin_v1() -> _BeginReplayResultV1:
+                    now_epoch, _ = self._read_protocol_clocks_v1()
+                    remaining = session_expires_at_epoch_seconds - now_epoch
+                    if (
+                        not math.isfinite(remaining)
+                        or remaining
+                        < CAPTURE_BEGIN_MINIMUM_SESSION_REMAINING_SECONDS_V1
+                    ):
+                        raise CaptureProtocolErrorV1(
+                            CaptureProtocolReasonV1.SESSION_LIFETIME_INSUFFICIENT
+                        )
+                    capture_epoch = await self.begin_capture_v1()
+                    return await self._activate_protocol_capture_v1(
+                        capture_epoch=capture_epoch,
+                        profile_id=profile_id,
+                        session_id=session_id,
+                        owner_issuer=owner_issuer,
+                        owner_subject=owner_subject,
+                        session_expires_at_epoch_seconds=(
+                            session_expires_at_epoch_seconds
+                        ),
+                    )
+
+                try:
+                    replay_result, caller_cancelled = (
+                        await self._await_control_operation_to_completion_v1(
+                            execute_begin_v1()
+                        )
+                    )
+                except asyncio.CancelledError:
+                    with self._lock:
+                        self._replay_ledger_v1.complete_error_v1(
+                            record,
+                            CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED,
+                        )
+                    raise
+                except Exception as exception:  # noqa: BLE001
+                    protocol_error = self._protocol_error_for_lifecycle_v1(
+                        exception
+                    )
+                    with self._lock:
+                        self._replay_ledger_v1.complete_error_v1(
+                            record,
+                            protocol_error.reason,
+                        )
+                    raise protocol_error from None
+
+                with self._lock:
+                    record.authorization_binding = (
+                        replay_result.capability_binding
+                    )
+                    self._replay_ledger_v1.complete_result_v1(
+                        record,
+                        replay_result,
+                    )
+                if caller_cancelled:
+                    raise asyncio.CancelledError
+                return self._grant_for_live_begin_replay_v1(
+                    replay_result,
+                    session_id=session_id,
+                    owner_issuer=owner_issuer,
+                    owner_subject=owner_subject,
+                )
+        finally:
+            self._release_control_waiter_v1()
+
+    def _grant_for_live_begin_replay_v1(
+        self,
+        replay_result: _BeginReplayResultV1,
+        *,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+    ) -> BeginCaptureGrantV1:
+        now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+        grants: list[BeginCaptureGrantV1] = []
+
+        def authorize() -> None:
+            with self._lock:
+                capture_epoch = replay_result.capture_epoch
+                if (
+                    self._destroyed
+                    or self._shutdown_started
+                    or self._fatal_failure is not None
+                    or self._capture_epoch is not capture_epoch
+                    or self._state
+                    not in {
+                        CaptureStateV1.ARMED,
+                        CaptureStateV1.CAPTURING,
+                        CaptureStateV1.BUILDING_ASSERTIONS,
+                        CaptureStateV1.READY,
+                    }
+                    or self._work_controller.current_epoch_v1()
+                    != capture_epoch.session_epoch
+                    or not self._feature_is_enabled_v1()
+                    or not self._security_authority_is_usable_v1()
+                    or self._inactivity_deadline_monotonic_v1 is None
+                    or now_monotonic
+                    >= self._inactivity_deadline_monotonic_v1
+                    or not self._capability_authority_v1.binding_is_live_v1(
+                        self._active_capture_capability_v1,
+                        binding=replay_result.capability_binding,
+                        session_id=session_id,
+                        owner_issuer=owner_issuer,
+                        owner_subject=owner_subject,
+                        capture_epoch=capture_epoch,
+                        now_epoch_seconds=now_epoch,
+                        now_monotonic=now_monotonic,
+                    )
+                ):
+                    return
+                grants.append(
+                    BeginCaptureGrantV1(
+                        capture_epoch=capture_epoch,
+                        capture_capability=(
+                            self._capability_authority_v1.render_for_replay_v1(
+                                replay_result.capability_binding
+                            )
+                        ),
+                        expires_at_epoch_seconds=(
+                            replay_result.capability_binding
+                            .expires_at_epoch_seconds
+                        ),
+                    )
+                )
+
+        if not self._run_if_session_live_v1(authorize) or not grants:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return grants[0]
+
+    async def _activate_protocol_capture_v1(
+        self,
+        *,
+        capture_epoch: CaptureEpochV1,
+        profile_id: str,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+        session_expires_at_epoch_seconds: float,
+    ) -> _BeginReplayResultV1:
+        now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+        capability_lifetime = session_expires_at_epoch_seconds - now_epoch
+        if capability_lifetime <= 0:
+            self._fail_protocol_runtime_v1()
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+            )
+        binding = self._capability_authority_v1.create_binding_v1(
+            session_id=session_id,
+            owner_issuer=owner_issuer,
+            owner_subject=owner_subject,
+            capture_epoch=capture_epoch,
+            expires_at_epoch_seconds=session_expires_at_epoch_seconds,
+            expires_at_monotonic=now_monotonic + capability_lifetime,
+        )
+        active_capability, _ = self._capability_authority_v1.activate_v1(binding)
+        inactivity_deadline_monotonic = min(
+            now_monotonic + CAPTURE_INACTIVITY_SECONDS_V1,
+            binding.expires_at_monotonic,
+        )
+        if inactivity_deadline_monotonic <= now_monotonic:
+            self._fail_protocol_runtime_v1()
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+            )
+
+        try:
+            inactivity_work = self._work_controller.register_work_v1(
+                WorkOperationKindV1.CAPTURE_INACTIVITY_TIMER,
+                binding.expires_at_monotonic
+                + self._work_controller.cleanup_timeout_seconds_v1(),
+                _admission_guard_v1=(
+                    lambda: self._capture_work_admission_is_open_v1(
+                        capture_epoch,
+                        {
+                            CaptureStateV1.ARMED,
+                            CaptureStateV1.CAPTURING,
+                            CaptureStateV1.BUILDING_ASSERTIONS,
+                            CaptureStateV1.READY,
+                        },
+                    )
+                ),
+            )
+        except Exception:  # noqa: BLE001 - timer authority is mandatory
+            self._fail_protocol_runtime_v1()
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+            ) from None
+
+        event = asyncio.Event()
+        task_started = asyncio.Event()
+        with self._lock:
+            if (
+                self._destroyed
+                or self._shutdown_started
+                or self._state is not CaptureStateV1.ARMED
+                or self._capture_epoch is not capture_epoch
+                or self._active_capture_capability_v1 is not None
+            ):
+                self._work_controller.release_work_v1(inactivity_work.lease)
+                self._fail_protocol_runtime_v1()
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+                )
+            self._active_capture_capability_v1 = active_capability
+            self._profile_id_v1 = profile_id
+            self._frame_records_v1.clear()
+            self._unique_frame_digests_v1.clear()
+            self._accepted_frame_bytes_v1 = 0
+            self._active_frame_upload_permits_v1.clear()
+            self._seal_attempt_seq_v1 = 0
+            self._last_seal_result_v1 = None
+            self._inactivity_deadline_monotonic_v1 = (
+                inactivity_deadline_monotonic
+            )
+            self._inactivity_deadline_epoch_v1 = now_epoch + (
+                inactivity_deadline_monotonic - now_monotonic
+            )
+            self._inactivity_revision_v1 += 1
+            self._inactivity_event_v1 = event
+            self._inactivity_work_v1 = inactivity_work
+            task = asyncio.create_task(
+                self._run_inactivity_timer_v1(
+                    capture_epoch,
+                    inactivity_work,
+                    event,
+                    task_started,
+                )
+            )
+            self._inactivity_task_v1 = task
+        timer_started = await self._wait_committed_task_started_v1(
+            task_started,
+            task,
+        )
+        if not timer_started:
+            with self._lock:
+                if self._inactivity_task_v1 is task:
+                    self._inactivity_task_v1 = None
+                if self._inactivity_work_v1 is inactivity_work:
+                    self._inactivity_work_v1 = None
+                if self._inactivity_event_v1 is event:
+                    self._inactivity_event_v1 = None
+            self._retire_unstarted_work_v1(inactivity_work)
+            self._fail_protocol_runtime_v1()
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+            )
+        return _BeginReplayResultV1(
+            capture_epoch=capture_epoch,
+            capability_binding=binding,
+        )
+
+    def _capture_work_admission_is_open_v1(
+        self,
+        capture_epoch: CaptureEpochV1,
+        permitted_states: set[CaptureStateV1],
+    ) -> bool:
+        with self._lock:
+            return bool(
+                not self._destroyed
+                and not self._shutdown_started
+                and self._capture_epoch is capture_epoch
+                and self._state in permitted_states
+                and self._fatal_failure is None
+            )
+
+    def _active_capability_authorizes_locked_v1(
+        self,
+        *,
+        capture_id: uuid.UUID,
+        presented_capability: object,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+        permitted_states: set[CaptureStateV1],
+        now_epoch: float,
+        now_monotonic: float,
+    ) -> CaptureEpochV1:
+        capture_epoch = self._capture_epoch
+        if (
+            self._destroyed
+            or self._shutdown_started
+            or self._fatal_failure is not None
+            or capture_epoch is None
+            or capture_epoch.capture_id != capture_id
+            or self._state not in permitted_states
+            or self._work_controller.current_epoch_v1()
+            != capture_epoch.session_epoch
+            or not self._feature_is_enabled_v1()
+            or not self._security_authority_is_usable_v1()
+            or not self._capability_authority_v1.authorizes_v1(
+                self._active_capture_capability_v1,
+                presented_capability=presented_capability,
+                session_id=session_id,
+                owner_issuer=owner_issuer,
+                owner_subject=owner_subject,
+                capture_epoch=capture_epoch,
+                now_epoch_seconds=now_epoch,
+                now_monotonic=now_monotonic,
+            )
+        ):
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return capture_epoch
+
+    async def admit_frame_upload_v1(
+        self,
+        *,
+        capture_id: uuid.UUID,
+        frame_seq: int,
+        capture_capability: str,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+    ) -> FrameUploadPermitV1:
+        """Authorize and reserve one bounded upload before its body is read."""
+
+        if (
+            isinstance(frame_seq, bool)
+            or not isinstance(frame_seq, int)
+            or not 1 <= frame_seq <= MAX_CAPTURE_FRAMES_V1
+        ):
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.FRAME_SEQUENCE_INVALID
+            )
+        now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+        expired_epoch: CaptureEpochV1 | None = None
+        with self._lock:
+            active = self._active_capture_capability_v1
+            if (
+                active is not None
+                and self._capture_epoch is active.binding.capture_epoch
+                and (
+                    now_epoch >= active.binding.expires_at_epoch_seconds
+                    or now_monotonic >= active.binding.expires_at_monotonic
+                    or (
+                        self._inactivity_deadline_monotonic_v1 is not None
+                        and now_monotonic
+                        >= self._inactivity_deadline_monotonic_v1
+                    )
+                )
+            ):
+                expired_epoch = active.binding.capture_epoch
+        if expired_epoch is not None:
+            await self._expire_capture_if_current_v1(expired_epoch)
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+
+        permit_id: uuid.UUID | None = None
+        permit_epoch: CaptureEpochV1 | None = None
+
+        def claim() -> None:
+            nonlocal permit_epoch, permit_id
+            with self._lock:
+                capture_epoch = self._active_capability_authorizes_locked_v1(
+                    capture_id=capture_id,
+                    presented_capability=capture_capability,
+                    session_id=session_id,
+                    owner_issuer=owner_issuer,
+                    owner_subject=owner_subject,
+                    permitted_states={
+                        CaptureStateV1.ARMED,
+                        CaptureStateV1.CAPTURING,
+                    },
+                    now_epoch=now_epoch,
+                    now_monotonic=now_monotonic,
+                )
+                if (
+                    frame_seq not in self._frame_records_v1
+                    and len(self._frame_records_v1) >= MAX_CAPTURE_FRAMES_V1
+                ):
+                    raise CaptureProtocolErrorV1(
+                        CaptureProtocolReasonV1.FRAME_LIMIT_REACHED
+                    )
+                if (
+                    len(self._active_frame_upload_permits_v1)
+                    >= MAX_CONCURRENT_UPLOADS_PER_CAPTURE_V1
+                ):
+                    raise CaptureProtocolErrorV1(
+                        CaptureProtocolReasonV1.UPLOAD_BUSY
+                    )
+                permit_id = uuid.uuid4()
+                permit_epoch = capture_epoch
+                self._active_frame_upload_permits_v1.add(permit_id)
+
+        if not self._run_if_session_live_v1(claim):
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        if permit_id is None or permit_epoch is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        try:
+            active = self._active_capture_capability_v1
+            if active is None:
+                raise WorkAdmissionDeniedV1
+            work_deadline = min(
+                now_monotonic
+                + FRAME_UPLOAD_READ_TIMEOUT_SECONDS_V1
+                + 1.0,
+                active.binding.expires_at_monotonic,
+            )
+            registered_work = self._work_controller.register_work_v1(
+                WorkOperationKindV1.CAPTURE_FRAME_UPLOAD,
+                work_deadline,
+                _admission_guard_v1=(
+                    lambda: self._capture_work_admission_is_open_v1(
+                        permit_epoch,
+                        {
+                            CaptureStateV1.ARMED,
+                            CaptureStateV1.CAPTURING,
+                        },
+                    )
+                ),
+            )
+        except Exception:  # noqa: BLE001 - bounded upload admission
+            with self._lock:
+                self._active_frame_upload_permits_v1.discard(permit_id)
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            ) from None
+        with self._lock:
+            if (
+                permit_id not in self._active_frame_upload_permits_v1
+                or self._capture_epoch is not permit_epoch
+                or self._state
+                not in {CaptureStateV1.ARMED, CaptureStateV1.CAPTURING}
+            ):
+                self._work_controller.release_work_v1(
+                    registered_work.lease
+                )
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                )
+        return FrameUploadPermitV1(
+            permit_id=permit_id,
+            capture_epoch=permit_epoch,
+            frame_seq=frame_seq,
+            registered_work=registered_work,
+        )
+
+    async def commit_frame_upload_v1(
+        self,
+        permit: FrameUploadPermitV1,
+        validated_frame: ValidatedJpegFrameV1,
+    ) -> FrameUploadResultV1:
+        """Atomically commit metadata; encoded bytes never cross this seam."""
+
+        if not isinstance(permit, FrameUploadPermitV1) or not isinstance(
+            validated_frame,
+            ValidatedJpegFrameV1,
+        ):
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+            )
+        async with self._serialized_operation_v1():
+            now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+            result: FrameUploadResultV1 | None = None
+
+            def commit() -> None:
+                nonlocal result
+                with self._lock:
+                    capture_epoch = self._capture_epoch
+                    if (
+                        permit.permit_id
+                        not in self._active_frame_upload_permits_v1
+                        or capture_epoch is not permit.capture_epoch
+                        or self._state
+                        not in {
+                            CaptureStateV1.ARMED,
+                            CaptureStateV1.CAPTURING,
+                        }
+                        or self._fatal_failure is not None
+                        or not self._work_controller.validate_work_v1(
+                            permit.registered_work.fence,
+                            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        )
+                        or self._work_controller.current_epoch_v1()
+                        != capture_epoch.session_epoch
+                    ):
+                        raise CaptureProtocolErrorV1(
+                            CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                        )
+                    active_capability = self._active_capture_capability_v1
+                    if (
+                        active_capability is None
+                        or now_epoch
+                        >= active_capability.binding.expires_at_epoch_seconds
+                        or now_monotonic
+                        >= active_capability.binding.expires_at_monotonic
+                        or self._inactivity_deadline_monotonic_v1 is None
+                        or now_monotonic
+                        >= self._inactivity_deadline_monotonic_v1
+                    ):
+                        raise CaptureProtocolErrorV1(
+                            CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                        )
+
+                    existing = self._frame_records_v1.get(permit.frame_seq)
+                    if existing is not None:
+                        if not hmac.compare_digest(
+                            existing.sha256_digest,
+                            validated_frame.sha256_digest,
+                        ):
+                            raise CaptureProtocolErrorV1(
+                                CaptureProtocolReasonV1.FRAME_SEQUENCE_CONFLICT
+                            )
+                        result = existing.result
+                        return
+
+                    if len(self._frame_records_v1) >= MAX_CAPTURE_FRAMES_V1:
+                        raise CaptureProtocolErrorV1(
+                            CaptureProtocolReasonV1.FRAME_LIMIT_REACHED
+                        )
+                    next_total = (
+                        self._accepted_frame_bytes_v1
+                        + validated_frame.encoded_size
+                    )
+                    if next_total > MAX_CAPTURE_ENCODED_BYTES_V1:
+                        raise CaptureProtocolErrorV1(
+                            CaptureProtocolReasonV1.CAPTURE_BYTE_LIMIT_REACHED
+                        )
+                    next_count = len(self._frame_records_v1) + 1
+                    next_state = (
+                        CaptureStateV1.CAPTURING
+                        if self._state is CaptureStateV1.ARMED
+                        else self._state
+                    )
+                    accepted = FrameUploadResultV1(
+                        capture_id=capture_epoch.capture_id,
+                        capture_seq=capture_epoch.capture_seq,
+                        frame_seq=permit.frame_seq,
+                        state=next_state,
+                        encoded_size=validated_frame.encoded_size,
+                        decoded_width=validated_frame.decoded_width,
+                        decoded_height=validated_frame.decoded_height,
+                        accepted_frame_count=next_count,
+                        remaining_frame_slots=(
+                            MAX_CAPTURE_FRAMES_V1 - next_count
+                        ),
+                        total_accepted_bytes=next_total,
+                    )
+                    self._frame_records_v1[permit.frame_seq] = _FrameRecordV1(
+                        frame_seq=permit.frame_seq,
+                        encoded_size=validated_frame.encoded_size,
+                        decoded_width=validated_frame.decoded_width,
+                        decoded_height=validated_frame.decoded_height,
+                        sha256_digest=bytes(validated_frame.sha256_digest),
+                        accepted_at_monotonic=now_monotonic,
+                        result=accepted,
+                    )
+                    self._unique_frame_digests_v1.add(
+                        bytes(validated_frame.sha256_digest)
+                    )
+                    self._accepted_frame_bytes_v1 = next_total
+                    if self._state is CaptureStateV1.ARMED:
+                        self._state = CaptureStateV1.CAPTURING
+                    self._reset_inactivity_locked_v1(
+                        now_epoch,
+                        now_monotonic,
+                    )
+                    result = accepted
+
+            if not self._run_if_session_live_v1(commit):
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                )
+            if result is None:
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+                )
+            return result
+
+    def release_frame_upload_permit_v1(
+        self,
+        permit: FrameUploadPermitV1,
+    ) -> None:
+        if not isinstance(permit, FrameUploadPermitV1):
+            return
+        with self._lock:
+            self._active_frame_upload_permits_v1.discard(permit.permit_id)
+        self._work_controller.release_work_v1(
+            permit.registered_work.lease
+        )
+
+    async def capture_public_status_v1(
+        self,
+        *,
+        capture_id: uuid.UUID,
+        capture_capability: str,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+    ) -> CapturePublicStatusV1:
+        """Return a private control projection without extending inactivity."""
+
+        now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+        expired_epoch: CaptureEpochV1 | None = None
+        with self._lock:
+            active = self._active_capture_capability_v1
+            if (
+                active is not None
+                and self._capture_epoch is active.binding.capture_epoch
+                and (
+                    now_epoch >= active.binding.expires_at_epoch_seconds
+                    or now_monotonic >= active.binding.expires_at_monotonic
+                    or (
+                        self._inactivity_deadline_monotonic_v1 is not None
+                        and now_monotonic
+                        >= self._inactivity_deadline_monotonic_v1
+                    )
+                )
+            ):
+                expired_epoch = active.binding.capture_epoch
+        if expired_epoch is not None:
+            await self._expire_capture_if_current_v1(expired_epoch)
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+
+        result: CapturePublicStatusV1 | None = None
+
+        def read_status() -> None:
+            nonlocal result
+            with self._lock:
+                capture_epoch = self._active_capability_authorizes_locked_v1(
+                    capture_id=capture_id,
+                    presented_capability=capture_capability,
+                    session_id=session_id,
+                    owner_issuer=owner_issuer,
+                    owner_subject=owner_subject,
+                    permitted_states={
+                        CaptureStateV1.ARMED,
+                        CaptureStateV1.CAPTURING,
+                        CaptureStateV1.BUILDING_ASSERTIONS,
+                        CaptureStateV1.READY,
+                    },
+                    now_epoch=now_epoch,
+                    now_monotonic=now_monotonic,
+                )
+                inactivity_expiry = self._inactivity_deadline_epoch_v1
+                if inactivity_expiry is None:
+                    raise CaptureProtocolErrorV1(
+                        CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                    )
+                last_seal = self._last_seal_result_v1
+                count = len(self._frame_records_v1)
+                result = CapturePublicStatusV1(
+                    capture_id=capture_epoch.capture_id,
+                    capture_seq=capture_epoch.capture_seq,
+                    state=self._state,
+                    accepted_frame_count=count,
+                    remaining_frame_slots=MAX_CAPTURE_FRAMES_V1 - count,
+                    total_accepted_bytes=self._accepted_frame_bytes_v1,
+                    independent_correlation_groups=len(
+                        self._unique_frame_digests_v1
+                    ),
+                    inactivity_expires_at_epoch_seconds=inactivity_expiry,
+                    last_seal_outcome=(
+                        last_seal.outcome if last_seal is not None else None
+                    ),
+                    reason_codes=(
+                        last_seal.reason_codes
+                        if last_seal is not None
+                        else ()
+                    ),
+                    restart_required=(
+                        last_seal.restart_required
+                        if last_seal is not None
+                        else False
+                    ),
+                )
+
+        if not self._run_if_session_live_v1(read_status):
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        if result is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return result
+
+    async def seal_capture_protocol_v1(
+        self,
+        *,
+        request_id: uuid.UUID,
+        control_seq: int,
+        capture_id: uuid.UUID,
+        capture_capability: str,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+    ) -> SealResultV1:
+        await self._expire_active_capture_before_control_v1()
+        request_digest = canonical_control_request_digest_v1(
+            operation=ControlOperationV1.SEAL,
+            request_id=request_id,
+            control_seq=control_seq,
+            capture_id=capture_id,
+        )
+        self._claim_control_waiter_v1()
+        try:
+            async with self._control_lock_v1:
+                now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+                with self._lock:
+                    candidate = self._replay_ledger_v1.candidate_record_v1(
+                        request_id
+                    )
+                    if candidate is not None:
+                        self._require_replay_candidate_authority_v1(
+                            record=candidate,
+                            presented_capability=capture_capability,
+                            capture_id=capture_id,
+                            session_id=session_id,
+                            owner_issuer=owner_issuer,
+                            owner_subject=owner_subject,
+                            now_epoch=now_epoch,
+                            now_monotonic=now_monotonic,
+                        )
+                    existing = self._replay_ledger_v1.existing_record_v1(
+                        operation=ControlOperationV1.SEAL,
+                        request_id=request_id,
+                        control_seq=control_seq,
+                        request_digest=request_digest,
+                    )
+                    if existing is not None:
+                        replay = self._replay_ledger_v1.replay_result_v1(
+                            existing
+                        )
+                        if not isinstance(replay, SealResultV1):
+                            raise CaptureProtocolErrorV1(
+                                CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+                            )
+                        return replay
+
+                    capture_epoch = self._active_capability_authorizes_locked_v1(
+                        capture_id=capture_id,
+                        presented_capability=capture_capability,
+                        session_id=session_id,
+                        owner_issuer=owner_issuer,
+                        owner_subject=owner_subject,
+                        permitted_states={CaptureStateV1.CAPTURING},
+                        now_epoch=now_epoch,
+                        now_monotonic=now_monotonic,
+                    )
+                    active = self._active_capture_capability_v1
+                    assert active is not None
+                    record, _ = self._replay_ledger_v1.lookup_or_claim_v1(
+                        operation=ControlOperationV1.SEAL,
+                        request_id=request_id,
+                        control_seq=control_seq,
+                        request_digest=request_digest,
+                    )
+                    record.authorization_binding = active.binding
+
+                try:
+                    result, caller_cancelled = (
+                        await self._await_control_operation_to_completion_v1(
+                            self._execute_seal_attempt_v1(capture_epoch)
+                        )
+                    )
+                except asyncio.CancelledError:
+                    with self._lock:
+                        self._replay_ledger_v1.complete_error_v1(
+                            record,
+                            CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED,
+                        )
+                    raise
+                except Exception as exception:  # noqa: BLE001
+                    protocol_error = self._protocol_error_for_lifecycle_v1(
+                        exception
+                    )
+                    with self._lock:
+                        self._replay_ledger_v1.complete_error_v1(
+                            record,
+                            protocol_error.reason,
+                        )
+                    raise protocol_error from None
+                with self._lock:
+                    self._replay_ledger_v1.complete_result_v1(
+                        record,
+                        result,
+                    )
+                if caller_cancelled:
+                    raise asyncio.CancelledError
+                return result
+        finally:
+            self._release_control_waiter_v1()
+
+    async def _execute_seal_attempt_v1(
+        self,
+        capture_epoch: CaptureEpochV1,
+    ) -> SealResultV1:
+        async with self._serialized_operation_v1():
+            now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+            result: SealResultV1 | None = None
+            processing_input: MockProcessingInputV1 | None = None
+
+            def seal_atomically() -> None:
+                nonlocal processing_input, result
+                with self._lock:
+                    if (
+                        self._capture_epoch is not capture_epoch
+                        or self._state is not CaptureStateV1.CAPTURING
+                        or self._fatal_failure is not None
+                        or self._processor_task_v1 is not None
+                        or self._work_controller.current_epoch_v1()
+                        != capture_epoch.session_epoch
+                    ):
+                        raise CaptureProtocolErrorV1(
+                            CaptureProtocolReasonV1.CAPTURE_STATE_INVALID
+                        )
+                    active = self._active_capture_capability_v1
+                    if (
+                        active is None
+                        or now_epoch
+                        >= active.binding.expires_at_epoch_seconds
+                        or now_monotonic
+                        >= active.binding.expires_at_monotonic
+                        or self._inactivity_deadline_monotonic_v1 is None
+                        or now_monotonic
+                        >= self._inactivity_deadline_monotonic_v1
+                    ):
+                        raise CaptureProtocolErrorV1(
+                            CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                        )
+                    self._seal_attempt_seq_v1 += 1
+                    self._reset_inactivity_locked_v1(
+                        now_epoch,
+                        now_monotonic,
+                    )
+                    accepted_count = len(self._frame_records_v1)
+                    unique_count = len(self._unique_frame_digests_v1)
+                    remaining = MAX_CAPTURE_FRAMES_V1 - accepted_count
+                    if unique_count < MINIMUM_MOCK_UNIQUE_FRAMES_V1:
+                        result = SealResultV1(
+                            seal_attempt_seq=self._seal_attempt_seq_v1,
+                            outcome=SealOutcomeV1.NEEDS_RECAPTURE,
+                            capture_state=CaptureStateV1.CAPTURING,
+                            accepted_frame_count=accepted_count,
+                            independent_correlation_groups=unique_count,
+                            remaining_frame_slots=remaining,
+                            reason_codes=(
+                                SealReasonCodeV1.TOO_FEW_UNIQUE_FRAMES,
+                            ),
+                            restart_required=remaining == 0,
+                        )
+                        self._last_seal_result_v1 = result
+                        return
+                    if self._test_processor_v1 is None:
+                        raise CaptureProtocolErrorV1(
+                            CaptureProtocolReasonV1.PROCESSOR_NOT_READY
+                        )
+                    self._state = CaptureStateV1.BUILDING_ASSERTIONS
+                    result = SealResultV1(
+                        seal_attempt_seq=self._seal_attempt_seq_v1,
+                        outcome=SealOutcomeV1.BUILD_STARTED,
+                        capture_state=CaptureStateV1.BUILDING_ASSERTIONS,
+                        accepted_frame_count=accepted_count,
+                        independent_correlation_groups=unique_count,
+                        remaining_frame_slots=remaining,
+                        reason_codes=(),
+                        restart_required=False,
+                    )
+                    self._last_seal_result_v1 = result
+                    processing_input = MockProcessingInputV1(
+                        capture_seq=capture_epoch.capture_seq,
+                        accepted_frame_count=accepted_count,
+                        independent_correlation_groups=unique_count,
+                    )
+
+            if not self._run_if_session_live_v1(seal_atomically):
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                )
+            if result is None:
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+                )
+            if processing_input is None:
+                return result
+
+            processor_deadline = now_monotonic + 30.0
+            try:
+                processor_work = self._work_controller.register_work_v1(
+                    WorkOperationKindV1.CAPTURE_MOCK_PROCESSOR,
+                    processor_deadline,
+                    _admission_guard_v1=(
+                        lambda: self._capture_work_admission_is_open_v1(
+                            capture_epoch,
+                            {CaptureStateV1.BUILDING_ASSERTIONS},
+                        )
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - build cannot run unfenced
+                self._fail_protocol_runtime_v1()
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+                ) from None
+
+            with self._lock:
+                if (
+                    self._capture_epoch is not capture_epoch
+                    or self._state is not CaptureStateV1.BUILDING_ASSERTIONS
+                    or self._processor_task_v1 is not None
+                ):
+                    self._work_controller.release_work_v1(
+                        processor_work.lease
+                    )
+                    raise CaptureProtocolErrorV1(
+                        CaptureProtocolReasonV1.CAPTURE_STATE_INVALID
+                    )
+                task_started = asyncio.Event()
+                processor_task = asyncio.create_task(
+                    self._run_mock_processor_v1(
+                        capture_epoch,
+                        processor_work,
+                        processing_input,
+                        task_started,
+                    )
+                )
+                self._processor_work_v1 = processor_work
+                self._processor_task_v1 = processor_task
+            processor_started = await self._wait_committed_task_started_v1(
+                task_started,
+                processor_task,
+            )
+            if not processor_started:
+                with self._lock:
+                    if self._processor_task_v1 is processor_task:
+                        self._processor_task_v1 = None
+                    if self._processor_work_v1 is processor_work:
+                        self._processor_work_v1 = None
+                self._retire_unstarted_work_v1(processor_work)
+                self._fail_protocol_runtime_v1()
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+                )
+            return result
+
+    async def end_capture_protocol_v1(
+        self,
+        *,
+        request_id: uuid.UUID,
+        control_seq: int,
+        capture_id: uuid.UUID,
+        capture_capability: str,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+    ) -> EndCaptureResultV1:
+        await self._expire_active_capture_before_control_v1()
+        request_digest = canonical_control_request_digest_v1(
+            operation=ControlOperationV1.END,
+            request_id=request_id,
+            control_seq=control_seq,
+            capture_id=capture_id,
+        )
+        self._claim_control_waiter_v1()
+        try:
+            async with self._control_lock_v1:
+                now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+                with self._lock:
+                    candidate = self._replay_ledger_v1.candidate_record_v1(
+                        request_id
+                    )
+                    if candidate is not None:
+                        self._require_replay_candidate_authority_v1(
+                            record=candidate,
+                            presented_capability=capture_capability,
+                            capture_id=capture_id,
+                            session_id=session_id,
+                            owner_issuer=owner_issuer,
+                            owner_subject=owner_subject,
+                            now_epoch=now_epoch,
+                            now_monotonic=now_monotonic,
+                        )
+                    existing = self._replay_ledger_v1.existing_record_v1(
+                        operation=ControlOperationV1.END,
+                        request_id=request_id,
+                        control_seq=control_seq,
+                        request_digest=request_digest,
+                    )
+                    if existing is not None:
+                        replay = self._replay_ledger_v1.replay_result_v1(
+                            existing
+                        )
+                        if not isinstance(replay, EndCaptureResultV1):
+                            raise CaptureProtocolErrorV1(
+                                CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+                            )
+                        return replay
+
+                    capture_epoch = self._active_capability_authorizes_locked_v1(
+                        capture_id=capture_id,
+                        presented_capability=capture_capability,
+                        session_id=session_id,
+                        owner_issuer=owner_issuer,
+                        owner_subject=owner_subject,
+                        permitted_states={
+                            CaptureStateV1.ARMED,
+                            CaptureStateV1.CAPTURING,
+                            CaptureStateV1.BUILDING_ASSERTIONS,
+                            CaptureStateV1.READY,
+                        },
+                        now_epoch=now_epoch,
+                        now_monotonic=now_monotonic,
+                    )
+                    active = self._active_capture_capability_v1
+                    assert active is not None
+                    record, _ = self._replay_ledger_v1.lookup_or_claim_v1(
+                        operation=ControlOperationV1.END,
+                        request_id=request_id,
+                        control_seq=control_seq,
+                        request_digest=request_digest,
+                    )
+                    record.authorization_binding = active.binding
+
+                async def execute_end_v1() -> EndCaptureResultV1:
+                    status = await self.end_capture_v1(capture_epoch)
+                    return EndCaptureResultV1(
+                        capture_id=capture_epoch.capture_id,
+                        capture_seq=capture_epoch.capture_seq,
+                        session_generation=status.session_generation,
+                        state=status.state,
+                    )
+
+                try:
+                    result, caller_cancelled = (
+                        await self._await_control_operation_to_completion_v1(
+                            execute_end_v1()
+                        )
+                    )
+                except asyncio.CancelledError:
+                    with self._lock:
+                        self._replay_ledger_v1.complete_error_v1(
+                            record,
+                            CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED,
+                        )
+                    raise
+                except Exception as exception:  # noqa: BLE001
+                    protocol_error = self._protocol_error_for_lifecycle_v1(
+                        exception
+                    )
+                    with self._lock:
+                        self._replay_ledger_v1.complete_error_v1(
+                            record,
+                            protocol_error.reason,
+                        )
+                    raise protocol_error from None
+                with self._lock:
+                    self._replay_ledger_v1.complete_result_v1(
+                        record,
+                        result,
+                    )
+                    self._replay_ledger_v1.retain_only_v1(record)
+                if caller_cancelled:
+                    raise asyncio.CancelledError
+                return result
+        finally:
+            self._release_control_waiter_v1()
+
+    def _require_replay_candidate_authority_v1(
+        self,
+        *,
+        record: ControlReplayRecordV1,
+        presented_capability: object,
+        capture_id: uuid.UUID,
+        session_id: str,
+        owner_issuer: str,
+        owner_subject: str,
+        now_epoch: float,
+        now_monotonic: float,
+    ) -> None:
+        binding = record.authorization_binding
+        if isinstance(binding, CaptureCapabilityBindingV1):
+            if not self._capability_authority_v1.replay_capability_matches_v1(
+                binding,
+                presented_capability,
+            ):
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                )
+            if (
+                record.operation is ControlOperationV1.END
+                and record.completed
+                and isinstance(record.result, EndCaptureResultV1)
+                and self._state is CaptureStateV1.IDLE
+                and self._active_capture_capability_v1 is None
+                and now_epoch < binding.expires_at_epoch_seconds
+                and now_monotonic < binding.expires_at_monotonic
+            ):
+                return
+            capture_id = binding.capture_epoch.capture_id
+        self._active_capability_authorizes_locked_v1(
+            capture_id=capture_id,
+            presented_capability=presented_capability,
+            session_id=session_id,
+            owner_issuer=owner_issuer,
+            owner_subject=owner_subject,
+            permitted_states={
+                CaptureStateV1.ARMED,
+                CaptureStateV1.CAPTURING,
+                CaptureStateV1.BUILDING_ASSERTIONS,
+                CaptureStateV1.READY,
+            },
+            now_epoch=now_epoch,
+            now_monotonic=now_monotonic,
+        )
+
+    async def _expire_active_capture_before_control_v1(self) -> None:
+        """Make an observed expired capture destructive before mutation."""
+
+        now_epoch, now_monotonic = self._read_protocol_clocks_v1()
+        expired_epoch: CaptureEpochV1 | None = None
+        with self._lock:
+            active = self._active_capture_capability_v1
+            if (
+                active is not None
+                and self._capture_epoch is active.binding.capture_epoch
+                and (
+                    now_epoch >= active.binding.expires_at_epoch_seconds
+                    or now_monotonic >= active.binding.expires_at_monotonic
+                    or (
+                        self._inactivity_deadline_monotonic_v1 is not None
+                        and now_monotonic
+                        >= self._inactivity_deadline_monotonic_v1
+                    )
+                )
+            ):
+                expired_epoch = active.binding.capture_epoch
+        if expired_epoch is not None:
+            await self._expire_capture_if_current_v1(expired_epoch)
+
+    def _reset_inactivity_locked_v1(
+        self,
+        now_epoch: float,
+        now_monotonic: float,
+    ) -> None:
+        active = self._active_capture_capability_v1
+        event = self._inactivity_event_v1
+        if active is None or event is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
+            )
+        deadline = min(
+            now_monotonic + CAPTURE_INACTIVITY_SECONDS_V1,
+            active.binding.expires_at_monotonic,
+        )
+        if deadline <= now_monotonic:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_EXPIRED
+            )
+        self._inactivity_deadline_monotonic_v1 = deadline
+        self._inactivity_deadline_epoch_v1 = now_epoch + (
+            deadline - now_monotonic
+        )
+        self._inactivity_revision_v1 += 1
+        event.set()
+
+    async def _run_inactivity_timer_v1(
+        self,
+        capture_epoch: CaptureEpochV1,
+        registered_work: RegisteredWorkV1,
+        reset_event: asyncio.Event,
+        task_started: asyncio.Event,
+    ) -> None:
+        lease_released = False
+        task_started.set()
+        try:
+            while True:
+                with self._lock:
+                    if (
+                        self._capture_epoch is not capture_epoch
+                        or self._inactivity_work_v1 is not registered_work
+                        or self._inactivity_event_v1 is not reset_event
+                        or self._state
+                        not in {
+                            CaptureStateV1.ARMED,
+                            CaptureStateV1.CAPTURING,
+                            CaptureStateV1.BUILDING_ASSERTIONS,
+                            CaptureStateV1.READY,
+                        }
+                    ):
+                        return
+                    deadline = self._inactivity_deadline_monotonic_v1
+                    revision = self._inactivity_revision_v1
+                if deadline is None:
+                    return
+                _, now_monotonic = self._read_protocol_clocks_v1()
+                wait_seconds = max(0.0, deadline - now_monotonic)
+                try:
+                    await asyncio.wait_for(
+                        reset_event.wait(),
+                        timeout=wait_seconds,
+                    )
+                except TimeoutError:
+                    pass
+                with self._lock:
+                    if (
+                        self._capture_epoch is not capture_epoch
+                        or self._inactivity_work_v1 is not registered_work
+                    ):
+                        return
+                    _, current_monotonic = self._read_protocol_clocks_v1()
+                    if (
+                        self._inactivity_revision_v1 != revision
+                        or current_monotonic
+                        < (
+                            self._inactivity_deadline_monotonic_v1
+                            if self._inactivity_deadline_monotonic_v1
+                            is not None
+                            else current_monotonic
+                        )
+                    ):
+                        reset_event.clear()
+                        continue
+                    self._inactivity_task_v1 = None
+                    self._inactivity_work_v1 = None
+                    self._inactivity_event_v1 = None
+                if not self._work_controller.validate_work_v1(
+                    registered_work.fence,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                ):
+                    return
+                self._work_controller.release_work_v1(
+                    registered_work.lease
+                )
+                lease_released = True
+                await self._expire_capture_if_current_v1(capture_epoch)
+                return
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - timer uncertainty fails closed
+            with self._lock:
+                still_current = self._capture_epoch is capture_epoch
+            if still_current:
+                self._fail_protocol_runtime_v1()
+        finally:
+            with self._lock:
+                if self._inactivity_work_v1 is registered_work:
+                    self._inactivity_work_v1 = None
+                    self._inactivity_task_v1 = None
+                    self._inactivity_event_v1 = None
+            if not lease_released:
+                self._work_controller.release_work_v1(
+                    registered_work.lease
+                )
+
+    async def _expire_capture_if_current_v1(
+        self,
+        capture_epoch: CaptureEpochV1,
+    ) -> None:
+        async with self._control_lock_v1:
+            with self._lock:
+                if (
+                    self._capture_epoch is not capture_epoch
+                    or self._state
+                    not in {
+                        CaptureStateV1.ARMED,
+                        CaptureStateV1.CAPTURING,
+                        CaptureStateV1.BUILDING_ASSERTIONS,
+                        CaptureStateV1.READY,
+                    }
+                ):
+                    return
+            try:
+                await self.end_capture_v1(capture_epoch)
+                with self._lock:
+                    self._replay_ledger_v1.discard_replay_records_v1()
+            except CaptureTransitionRejectedV1:
+                return
+            except CaptureFailedClosedV1:
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - M4A end already fails closed
+                self._fail_protocol_runtime_v1()
+
+    async def _run_mock_processor_v1(
+        self,
+        capture_epoch: CaptureEpochV1,
+        registered_work: RegisteredWorkV1,
+        processing_input: MockProcessingInputV1,
+        task_started: asyncio.Event,
+    ) -> None:
+        current_task = asyncio.current_task()
+        processor = self._test_processor_v1
+        failed = False
+        task_started.set()
+        try:
+            if (
+                processor is None
+                or not self._work_controller.validate_work_v1(
+                    registered_work.fence,
+                    WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                )
+                or not self._capture_work_admission_is_open_v1(
+                    capture_epoch,
+                    {CaptureStateV1.BUILDING_ASSERTIONS},
+                )
+            ):
+                return
+            await processor.process_capture_v1(processing_input)
+            if not self._work_controller.validate_work_v1(
+                registered_work.fence,
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+            ):
+                return
+
+            published: list[bool] = []
+
+            def publish_ready() -> None:
+                with self._lock:
+                    if (
+                        self._capture_epoch is not capture_epoch
+                        or self._state
+                        is not CaptureStateV1.BUILDING_ASSERTIONS
+                        or self._processor_work_v1 is not registered_work
+                        or self._processor_task_v1 is not current_task
+                        or self._work_controller.current_epoch_v1()
+                        != capture_epoch.session_epoch
+                    ):
+                        return
+                    self._state = CaptureStateV1.READY
+                    self._processor_task_v1 = None
+                    self._processor_work_v1 = None
+                    published.append(True)
+
+            if not self._run_if_session_live_v1(publish_ready) or not published:
+                return
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - mock failure is a runtime failure
+            failed = True
+        finally:
+            with self._lock:
+                if self._processor_task_v1 is current_task:
+                    self._processor_task_v1 = None
+                if self._processor_work_v1 is registered_work:
+                    self._processor_work_v1 = None
+            self._work_controller.release_work_v1(
+                registered_work.lease
+            )
+        if failed:
+            with self._lock:
+                still_current = self._capture_epoch is capture_epoch
+            if still_current:
+                self._fail_protocol_runtime_v1()
+
+    @staticmethod
+    async def _wait_committed_task_started_v1(
+        task_started: asyncio.Event,
+        committed_task: asyncio.Task[None],
+    ) -> bool:
+        """Observe child startup or its terminal pre-start cancellation."""
+
+        started_waiter = asyncio.create_task(task_started.wait())
+        try:
+            while True:
+                try:
+                    done, _ = await asyncio.wait(
+                        {started_waiter, committed_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    continue
+                if task_started.is_set():
+                    return True
+                if committed_task in done:
+                    return False
+        finally:
+            if not started_waiter.done():
+                started_waiter.cancel()
+            with suppress(asyncio.CancelledError):
+                await started_waiter
+
+    def _retire_unstarted_work_v1(
+        self,
+        registered_work: RegisteredWorkV1,
+    ) -> None:
+        """Conclude a work lease whose owning coroutine never entered."""
+
+        try:
+            self._work_controller.cancel_work_v1(registered_work.fence)
+        except Exception:  # noqa: BLE001, S110 - fail closed below
+            pass
+        try:
+            self._work_controller.release_work_v1(registered_work.lease)
+        except Exception:  # noqa: BLE001, S110 - fail closed below
+            pass
+
+    @staticmethod
+    async def _await_control_operation_to_completion_v1(
+        operation: Coroutine[Any, Any, _ControlResultV1],
+    ) -> tuple[_ControlResultV1, bool]:
+        """Durably finish a claimed mutation before honoring cancellation."""
+
+        operation_task = asyncio.create_task(operation)
+        caller_cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(operation_task)
+                return result, caller_cancelled
+            except asyncio.CancelledError:
+                if operation_task.done() and operation_task.cancelled():
+                    raise
+                caller_cancelled = True
+
+    @staticmethod
+    def _cancel_task_v1(task: asyncio.Task[None] | None) -> None:
+        if task is None or task.done():
+            return
+        loop: asyncio.AbstractEventLoop | None = None
+        try:
+            loop = task.get_loop()
+            if loop is asyncio.get_running_loop():
+                task.cancel()
+                return
+        except RuntimeError:
+            pass
+        try:
+            if loop is not None:
+                loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            return
+
+    def _clear_private_capture_locked_v1(self) -> None:
+        """Invalidate admission and delete all capture-scoped private metadata."""
+
+        timer_task = self._inactivity_task_v1
+        processor_task = self._processor_task_v1
+        timer_work = self._inactivity_work_v1
+        processor_work = self._processor_work_v1
+
+        self._active_capture_capability_v1 = None
+        self._frame_records_v1.clear()
+        self._unique_frame_digests_v1.clear()
+        self._accepted_frame_bytes_v1 = 0
+        self._active_frame_upload_permits_v1.clear()
+        self._profile_id_v1 = None
+        self._seal_attempt_seq_v1 = 0
+        self._last_seal_result_v1 = None
+        self._inactivity_deadline_epoch_v1 = None
+        self._inactivity_deadline_monotonic_v1 = None
+        self._inactivity_revision_v1 += 1
+        self._inactivity_event_v1 = None
+        self._inactivity_task_v1 = None
+        self._inactivity_work_v1 = None
+        self._processor_task_v1 = None
+        self._processor_work_v1 = None
+
+        for work in (timer_work, processor_work):
+            if work is not None:
+                try:
+                    self._work_controller.cancel_work_v1(work.fence)
+                except Exception:  # noqa: BLE001, S110 - fail closed
+                    pass
+        self._cancel_task_v1(timer_task)
+        self._cancel_task_v1(processor_task)
+
+    def _private_capture_is_clear_locked_v1(self) -> bool:
+        return bool(
+            self._active_capture_capability_v1 is None
+            and not self._frame_records_v1
+            and not self._unique_frame_digests_v1
+            and self._accepted_frame_bytes_v1 == 0
+            and not self._active_frame_upload_permits_v1
+            and self._profile_id_v1 is None
+            and self._inactivity_task_v1 is None
+            and self._inactivity_work_v1 is None
+            and self._processor_task_v1 is None
+            and self._processor_work_v1 is None
+        )
+
+    def _fail_protocol_runtime_v1(self) -> None:
+        with self._lock:
+            capture_was_active = self._capture_epoch is not None
+            self._clear_private_capture_locked_v1()
+            transition = self._active_transition
+        if capture_was_active and self._enter_failed_closed_v1(
+            transition,
+            CaptureFailureReasonV1.INTERNAL_FAILURE,
+        ):
+            self._request_failure_termination_v1()
+
     def _feature_is_enabled_v1(self) -> bool:
         try:
             return bool(self._feature_enabled_v1())
@@ -276,6 +2017,8 @@ class CaptureCoordinatorV1:
     ) -> bool:
         try:
             return bool(self._session_live_action_v1(action))
+        except CaptureProtocolErrorV1:
+            raise
         except Exception:  # noqa: BLE001 - authority callback is fail closed
             return False
 
@@ -343,6 +2086,7 @@ class CaptureCoordinatorV1:
                 return False
             if transition is not None and self._active_transition is not transition:
                 return False
+            self._clear_private_capture_locked_v1()
             self._isolation_controller.close_v1()
             self._isolation_controller.disable_transport_keepalive_v1()
             self._fatal_failure = reason
@@ -761,6 +2505,9 @@ class CaptureCoordinatorV1:
                     CaptureStateV1.ENTERING,
                     CaptureStateV1.QUIESCING,
                     CaptureStateV1.ARMED,
+                    CaptureStateV1.CAPTURING,
+                    CaptureStateV1.BUILDING_ASSERTIONS,
+                    CaptureStateV1.READY,
                     CaptureStateV1.FAILED_CLOSED,
                 }:
                     rejected.append(CaptureFailureReasonV1.INVALID_STATE)
@@ -830,6 +2577,7 @@ class CaptureCoordinatorV1:
                 self._active_transition = transition
                 self._state = CaptureStateV1.ENDING
                 self._quiescence_complete = False
+                self._clear_private_capture_locked_v1()
                 self._record_v1(SecurityAuditEventCodeV1.CAPTURE_ENDING)
                 claimed.append(transition)
 
@@ -906,6 +2654,7 @@ class CaptureCoordinatorV1:
                     or not self._feature_is_enabled_v1()
                     or not self._security_authority_is_usable_v1()
                     or self._isolation_controller.snapshot_v1().admission_open
+                    or not self._private_capture_is_clear_locked_v1()
                 ):
                     return
 
@@ -1073,6 +2822,9 @@ class CaptureCoordinatorV1:
                 return
             self._shutdown_started = True
             was_active = self._state is not CaptureStateV1.IDLE
+            self._clear_private_capture_locked_v1()
+            self._replay_ledger_v1.clear_v1()
+            self._capability_authority_v1.close_v1()
             self._active_transition = None
             self._capture_epoch = None
             self._capture_id = None

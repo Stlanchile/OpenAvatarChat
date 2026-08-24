@@ -18,6 +18,7 @@ from service.service_security.certificate_session_authority import (
     SessionAuthorityErrorV1,
     SessionAuthorityReasonV1,
     SessionCapabilityGrantV1,
+    SessionOwnershipV1,
 )
 from service.service_security.oidc_resource_server import (
     OIDC_CERTIFICATE_CAPTURE_SCOPE_V1,
@@ -363,6 +364,31 @@ async def require_certificate_control_authorization_v1(
     return principal
 
 
+def require_certificate_session_ownership_v1(
+    app: FastAPI,
+    request: Request,
+    principal: AuthenticatedPrincipalV1,
+    session_id: str,
+) -> SessionOwnershipV1:
+    """Reuse the Milestone 1C owner/capability authority for later controls."""
+
+    runtime = getattr(app.state, "certificate_session_control_v1", None)
+    if not isinstance(runtime, CertificateSessionControlRuntimeV1):
+        raise certificate_control_http_error_v1(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "SESSION_AUTHORITY_UNAVAILABLE",
+        )
+    session_capability = _extract_session_capability(request)
+    try:
+        return runtime.authority.get_session_ownership(
+            principal,
+            session_id,
+            session_capability,
+        )
+    except SessionAuthorityErrorV1 as exception:
+        raise _authority_http_error(exception) from None
+
+
 def _extract_bearer_token(request: Request) -> str:
     values = request.headers.getlist(_AUTHORIZATION_HEADER_V1)
     if len(values) != 1:
@@ -514,6 +540,21 @@ def _http_error(
     )
 
 
+def certificate_control_http_error_v1(
+    status_code: int,
+    reason_code: str,
+    *,
+    authenticate: bool = False,
+) -> HTTPException:
+    """Stable no-store HTTP error shared by enabled certificate routes."""
+
+    return _http_error(
+        status_code,
+        reason_code,
+        authenticate=authenticate,
+    )
+
+
 def _session_capability_response(
     grant: SessionCapabilityGrantV1,
 ) -> SessionCapabilityResponseV1:
@@ -541,3 +582,9 @@ def _admission_ticket_response(
 def _apply_no_store(response: Response) -> None:
     for header_name, header_value in _NO_STORE_HEADERS_V1.items():
         response.headers[header_name] = header_value
+
+
+def apply_certificate_no_store_headers_v1(response: Response) -> None:
+    """Apply the common private-control cache policy."""
+
+    _apply_no_store(response)

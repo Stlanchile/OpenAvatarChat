@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from service.service_security.certificate_session_authority import (
         CertificateSessionAuthorityV1,
         ConsumedSessionAdmissionV1,
+        SessionOwnershipV1,
     )
 
 
@@ -149,7 +150,50 @@ class ChatEngine(object):
                 CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1,
                 self,
             )
+            from certificate_capture.routes import (
+                install_certificate_capture_routes_v1,
+            )
+
+            if install_certificate_capture_routes_v1(app, self) is None:
+                raise RuntimeError(
+                    "certificate capture routes unavailable"
+                )
         self.states.inited = True
+
+    def _resolve_certificate_capture_session_v1(
+        self,
+        ownership: "SessionOwnershipV1",
+    ) -> ChatSession | None:
+        """Resolve one exact live authenticated application session."""
+
+        from service.service_security.certificate_session_authority import (
+            SessionOwnershipV1,
+        )
+
+        if (
+            not self._certificate_capture_enabled_v1
+            or not isinstance(ownership, SessionOwnershipV1)
+        ):
+            return None
+        with self._sessions_lock_v1:
+            session_id = ownership.session_id
+            session = self.sessions.get(session_id)
+            if (
+                session is None
+                or session_id in self._stopping_session_ids_v1
+                or session_id in self._transport_retirement_ids_v1
+                or not session.session_context.shared_states.active
+            ):
+                return None
+            admission = session.session_context.session_admission
+            if (
+                admission is None
+                or admission.session_id != ownership.session_id
+                or admission.owner_issuer != ownership.owner_issuer
+                or admission.owner_subject != ownership.owner_subject
+            ):
+                return None
+            return session
 
     def _create_session(
         self,

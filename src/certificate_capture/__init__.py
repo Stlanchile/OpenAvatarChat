@@ -1,4 +1,4 @@
-"""Secure Certificate Capture V1 Milestone 4A control-plane primitives."""
+"""Secure Certificate Capture V1 lifecycle and private Milestone 4B protocol."""
 
 from certificate_capture.coordinator import (
     CaptureCoordinatorV1,

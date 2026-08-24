@@ -3,6 +3,7 @@ import contextlib
 import queue
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from typing import Dict, List, Iterable
 
@@ -58,7 +59,21 @@ from certificate_capture.epochs import CaptureEpochV1
 from certificate_capture.isolation import (
     NormalApplicationAdmissionViewV1,
 )
+from certificate_capture.protocol import (
+    BeginCaptureGrantV1,
+    CaptureProtocolErrorV1,
+    CaptureProtocolReasonV1,
+    CapturePublicStatusV1,
+    EndCaptureResultV1,
+    FrameUploadPermitV1,
+    FrameUploadResultV1,
+    SealResultV1,
+    ValidatedJpegFrameV1,
+)
 from certificate_capture.status import CaptureStatusV1
+from service.service_security.certificate_session_authority import (
+    SessionOwnershipV1,
+)
 
 
 class ChatSession:
@@ -277,6 +292,167 @@ class ChatSession:
         if coordinator is None:
             raise RuntimeError("capture coordinator unavailable")
         return coordinator.snapshot_v1()
+
+    def _require_certificate_capture_ownership_v1(
+        self,
+        ownership: SessionOwnershipV1,
+    ) -> None:
+        admission = self.session_context.session_admission
+        if (
+            not isinstance(ownership, SessionOwnershipV1)
+            or admission is None
+            or ownership.session_id != admission.session_id
+            or ownership.owner_issuer != admission.owner_issuer
+            or ownership.owner_subject != admission.owner_subject
+            or self.session_context.session_info.session_id
+            != ownership.session_id
+        ):
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+
+    async def _begin_certificate_capture_protocol_v1(
+        self,
+        *,
+        request_id: uuid.UUID,
+        control_seq: int,
+        profile_id: str,
+        ownership: SessionOwnershipV1,
+    ) -> BeginCaptureGrantV1:
+        self._require_certificate_capture_ownership_v1(ownership)
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return await coordinator.begin_capture_protocol_v1(
+            request_id=request_id,
+            control_seq=control_seq,
+            profile_id=profile_id,
+            session_id=ownership.session_id,
+            owner_issuer=ownership.owner_issuer,
+            owner_subject=ownership.owner_subject,
+            session_expires_at_epoch_seconds=(
+                ownership.expires_at_epoch_seconds
+            ),
+        )
+
+    async def _admit_certificate_frame_upload_v1(
+        self,
+        *,
+        capture_id: uuid.UUID,
+        frame_seq: int,
+        capture_capability: str,
+        ownership: SessionOwnershipV1,
+    ) -> FrameUploadPermitV1:
+        self._require_certificate_capture_ownership_v1(ownership)
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return await coordinator.admit_frame_upload_v1(
+            capture_id=capture_id,
+            frame_seq=frame_seq,
+            capture_capability=capture_capability,
+            session_id=ownership.session_id,
+            owner_issuer=ownership.owner_issuer,
+            owner_subject=ownership.owner_subject,
+        )
+
+    async def _commit_certificate_frame_upload_v1(
+        self,
+        permit: FrameUploadPermitV1,
+        validated_frame: ValidatedJpegFrameV1,
+    ) -> FrameUploadResultV1:
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return await coordinator.commit_frame_upload_v1(
+            permit,
+            validated_frame,
+        )
+
+    def _release_certificate_frame_upload_v1(
+        self,
+        permit: FrameUploadPermitV1,
+    ) -> None:
+        coordinator = self._capture_coordinator_v1
+        if coordinator is not None:
+            coordinator.release_frame_upload_permit_v1(permit)
+
+    async def _seal_certificate_capture_protocol_v1(
+        self,
+        *,
+        request_id: uuid.UUID,
+        control_seq: int,
+        capture_id: uuid.UUID,
+        capture_capability: str,
+        ownership: SessionOwnershipV1,
+    ) -> SealResultV1:
+        self._require_certificate_capture_ownership_v1(ownership)
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return await coordinator.seal_capture_protocol_v1(
+            request_id=request_id,
+            control_seq=control_seq,
+            capture_id=capture_id,
+            capture_capability=capture_capability,
+            session_id=ownership.session_id,
+            owner_issuer=ownership.owner_issuer,
+            owner_subject=ownership.owner_subject,
+        )
+
+    async def _certificate_capture_public_status_v1(
+        self,
+        *,
+        capture_id: uuid.UUID,
+        capture_capability: str,
+        ownership: SessionOwnershipV1,
+    ) -> CapturePublicStatusV1:
+        self._require_certificate_capture_ownership_v1(ownership)
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return await coordinator.capture_public_status_v1(
+            capture_id=capture_id,
+            capture_capability=capture_capability,
+            session_id=ownership.session_id,
+            owner_issuer=ownership.owner_issuer,
+            owner_subject=ownership.owner_subject,
+        )
+
+    async def _end_certificate_capture_protocol_v1(
+        self,
+        *,
+        request_id: uuid.UUID,
+        control_seq: int,
+        capture_id: uuid.UUID,
+        capture_capability: str,
+        ownership: SessionOwnershipV1,
+    ) -> EndCaptureResultV1:
+        self._require_certificate_capture_ownership_v1(ownership)
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        return await coordinator.end_capture_protocol_v1(
+            request_id=request_id,
+            control_seq=control_seq,
+            capture_id=capture_id,
+            capture_capability=capture_capability,
+            session_id=ownership.session_id,
+            owner_issuer=ownership.owner_issuer,
+            owner_subject=ownership.owner_subject,
+        )
 
     @classmethod
     def handler_pumper(
