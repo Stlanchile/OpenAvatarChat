@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import math
 import secrets
 import threading
@@ -60,6 +61,7 @@ class GenerationRetirementReasonV1(str, Enum):
 
 class WorkControllerFailureReasonV1(str, Enum):
     CLEANUP_TIMEOUT = "CLEANUP_TIMEOUT"
+    EGRESS_TRANSPORT_ABORTED = "EGRESS_TRANSPORT_ABORTED"
     GENERATION_OVERFLOW = "GENERATION_OVERFLOW"
     INTERNAL_AUTHORITY_FAILURE = "INTERNAL_AUTHORITY_FAILURE"
 
@@ -344,6 +346,21 @@ class SessionWorkControllerV1:
                 registered.state = _WorkStateV1.CANCELLED
             registered.registered_work.cancellation._cancel_v1()
 
+    def _fail_egress_transport_abort_locked_v1(self) -> None:
+        """Prevent admission on a generation whose transport was aborted."""
+
+        self._failed = True
+        self._active = False
+        self._admission_open = False
+        if self._failure_reason is None:
+            self._failure_reason = (
+                WorkControllerFailureReasonV1.EGRESS_TRANSPORT_ABORTED
+            )
+        self._cancel_all_unreleased_work_locked_v1()
+        self._cancel_async_protected_actions_locked_v1()
+        self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
+        self._condition.notify_all()
+
     def _cancel_async_protected_actions_locked_v1(
         self,
         generation: int | None = None,
@@ -367,6 +384,30 @@ class SessionWorkControllerV1:
         with self._lock:
             self._expire_due_cleanups_locked_v1(self._now_v1())
             return self._current_epoch
+
+    def cleanup_timeout_seconds_v1(self) -> float:
+        """Return the fixed retirement/shutdown budget for this controller."""
+
+        return self._cleanup_timeout_seconds_v1
+
+    async def wait_for_retirement_settled_async_v1(self) -> bool:
+        """Wait boundedly until retirement publication no longer owns the controller.
+
+        Transport teardown uses this only as an ordering barrier after an
+        irreversible egress abort.  It does not expose an epoch and cannot be
+        used to register or validate work.
+        """
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._cleanup_timeout_seconds_v1
+        while True:
+            with self._lock:
+                if self._retirement_pending_generation is None:
+                    return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(remaining, 0.01))
 
     def failure_reason_v1(self) -> WorkControllerFailureReasonV1 | None:
         with self._lock:
@@ -873,6 +914,7 @@ class SessionWorkControllerV1:
         fence: object,
         boundary: WorkValidationBoundaryV1,
         action: Callable[[], Awaitable[Any]],
+        abort_action_v1: Callable[[], Awaitable[Any] | Any],
     ) -> bool:
         """Run one awaited side effect without racing retirement publication.
 
@@ -881,12 +923,16 @@ class SessionWorkControllerV1:
         closes admission, marks the generation stale, and cancels that task;
         publication then waits for this action record to drain.  A transport
         coroutine therefore cannot be validated live and resume its actual
-        send after the generation has been published retired.
+        send after the generation has been published retired.  Invoking the
+        physical abort hook makes the controller permanently inactive: a
+        replacement secure session/transport is then required instead of
+        silently admitting work onto the aborted path.
         """
 
         if (
             not isinstance(boundary, WorkValidationBoundaryV1)
             or not callable(action)
+            or not callable(abort_action_v1)
         ):
             self._record_v1(SecurityAuditEventCodeV1.STALE_WORK_FENCE)
             return False
@@ -911,15 +957,97 @@ class SessionWorkControllerV1:
             state = _AsyncProtectedActionStateV1(generation=generation)
             self._async_protected_actions[action_id] = state
 
-        action_task: asyncio.Future[Any] | None = None
+        async def await_cancelled_task_v1(
+            task: asyncio.Future[Any],
+        ) -> None:
+            """Keep the action accounted for despite repeated cancellation."""
+
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    with self._lock:
+                        retirement_cancelled = state.cancel_requested
+                    if not retirement_cancelled:
+                        raise
+                except Exception:  # noqa: BLE001 - arbitrary transport failure
+                    return
+            if task.cancelled():
+                return
+            try:
+                task.result()
+            except Exception:  # noqa: BLE001 - result is already quarantined
+                return
+
+        async def supervise_action_v1() -> bool:
+            raw_action_task = asyncio.ensure_future(action())
+            try:
+                try:
+                    await asyncio.shield(raw_action_task)
+                except asyncio.CancelledError:
+                    with self._lock:
+                        retirement_cancelled = state.cancel_requested
+                    if not retirement_cancelled:
+                        raw_action_task.cancel()
+                        raise
+
+                    # Quarantine the exact physical egress path before the
+                    # raw coroutine receives cancellation.  Transport hooks
+                    # must synchronously make the path ineligible, then may
+                    # return an awaitable for close/stop completion.
+                    try:
+                        abort_result = abort_action_v1()
+                    except Exception:  # noqa: BLE001 - fail closed below
+                        abort_result = None
+                    with self._condition:
+                        if not self._shutdown_started:
+                            self._fail_egress_transport_abort_locked_v1()
+                    abort_task = (
+                        asyncio.ensure_future(abort_result)
+                        if inspect.isawaitable(abort_result)
+                        else None
+                    )
+                    raw_action_task.cancel()
+                    if abort_task is not None:
+                        await await_cancelled_task_v1(abort_task)
+                    await await_cancelled_task_v1(raw_action_task)
+                    return False
+
+                with self._lock:
+                    now = self._now_v1()
+                    self._expire_due_cleanups_locked_v1(now)
+                    return (
+                        not state.cancel_requested
+                        and self._work_fence_is_live_locked_v1(
+                            fence,
+                            now,
+                            audit_denial=True,
+                        )
+                    )
+            finally:
+                if not raw_action_task.done():
+                    raw_action_task.cancel()
+
+        supervisor_task: asyncio.Future[bool] = asyncio.ensure_future(
+            supervise_action_v1()
+        )
+
+        def finish_action_v1(done_task: asyncio.Future[bool]) -> None:
+            if not done_task.cancelled():
+                done_task.exception()
+            with self._condition:
+                if self._async_protected_actions.get(action_id) is state:
+                    self._async_protected_actions.pop(action_id, None)
+                self._condition.notify_all()
+
+        supervisor_task.add_done_callback(finish_action_v1)
         try:
-            action_task = asyncio.ensure_future(action())
             with self._lock:
                 canonical = self._async_protected_actions.get(action_id)
                 if canonical is not state:
-                    action_task.cancel()
+                    supervisor_task.cancel()
                     return False
-                state.task = action_task
+                state.task = supervisor_task
                 if (
                     state.generation == self._retirement_pending_generation
                     or self._shutdown_started
@@ -927,23 +1055,21 @@ class SessionWorkControllerV1:
                     or self._destroyed
                 ):
                     state.cancel_requested = True
-                    action_task.cancel()
+                    supervisor_task.cancel()
             try:
-                await action_task
+                return await asyncio.shield(supervisor_task)
             except asyncio.CancelledError:
                 with self._lock:
                     retirement_cancelled = state.cancel_requested
                 if retirement_cancelled:
                     return False
+                with self._lock:
+                    state.cancel_requested = True
+                supervisor_task.cancel()
                 raise
-            return True
         finally:
-            if action_task is not None and not action_task.done():
-                action_task.cancel()
-            with self._condition:
-                if self._async_protected_actions.get(action_id) is state:
-                    self._async_protected_actions.pop(action_id, None)
-                self._condition.notify_all()
+            if supervisor_task.done():
+                finish_action_v1(supervisor_task)
 
     def cancel_work_v1(self, fence: object) -> bool:
         with self._lock:
@@ -1198,6 +1324,7 @@ class SessionWorkControllerV1:
         generation: int,
         reason: GenerationRetirementReasonV1,
         *,
+        cleanup_deadline_monotonic: float,
         reopen_admission: bool,
         allow_failed: bool,
     ) -> GenerationRetirementV1:
@@ -1212,6 +1339,7 @@ class SessionWorkControllerV1:
         try:
             return self._retire_current_generation_locked_v1(
                 reason,
+                cleanup_deadline_monotonic=cleanup_deadline_monotonic,
                 reopen_admission=(reopen_admission and not self._failed),
                 allow_failed=allow_failed,
             )
@@ -1223,6 +1351,7 @@ class SessionWorkControllerV1:
         self,
         reason: GenerationRetirementReasonV1,
         *,
+        cleanup_deadline_monotonic: float,
         reopen_admission: bool,
         allow_failed: bool,
     ) -> GenerationRetirementV1:
@@ -1245,7 +1374,7 @@ class SessionWorkControllerV1:
             retired_epoch.generation + 1,
         )
         cleanup_id = new_uuid7_v1()
-        cleanup_deadline = now + self._cleanup_timeout_seconds_v1
+        cleanup_deadline = float(cleanup_deadline_monotonic)
         cleanup_fence = RetiredGenerationCleanupFenceV1(
             authority_id=self._authority_id,
             session_instance_id=retired_epoch.session_instance_id,
@@ -1345,8 +1474,11 @@ class SessionWorkControllerV1:
                 retirement = self._publish_pending_retirement_locked_v1(
                     generation,
                     reason,
+                    cleanup_deadline_monotonic=deadline,
                     reopen_admission=barrier_succeeded,
-                    allow_failed=not barrier_succeeded,
+                    allow_failed=(
+                        not barrier_succeeded or self._failed
+                    ),
                 )
             except (SessionGenerationOverflowV1, WorkAdmissionDeniedV1):
                 raise
@@ -1405,8 +1537,11 @@ class SessionWorkControllerV1:
                 retirement = self._publish_pending_retirement_locked_v1(
                     generation,
                     reason,
+                    cleanup_deadline_monotonic=deadline,
                     reopen_admission=barrier_succeeded,
-                    allow_failed=not barrier_succeeded,
+                    allow_failed=(
+                        not barrier_succeeded or self._failed
+                    ),
                 )
         except (SessionGenerationOverflowV1, WorkAdmissionDeniedV1):
             raise
@@ -1434,6 +1569,7 @@ class SessionWorkControllerV1:
                     self._publish_pending_retirement_locked_v1(
                         generation,
                         reason,
+                        cleanup_deadline_monotonic=deadline,
                         reopen_admission=False,
                         allow_failed=True,
                     )
@@ -1448,6 +1584,7 @@ class SessionWorkControllerV1:
                     self._publish_pending_retirement_locked_v1(
                         generation,
                         reason,
+                        cleanup_deadline_monotonic=deadline,
                         reopen_admission=False,
                         allow_failed=True,
                     )
@@ -1756,6 +1893,7 @@ class SessionWorkControllerV1:
                 self._publish_pending_retirement_locked_v1(
                     generation,
                     GenerationRetirementReasonV1.SESSION_SHUTDOWN,
+                    cleanup_deadline_monotonic=deadline,
                     reopen_admission=False,
                     allow_failed=True,
                 )
@@ -1862,6 +2000,7 @@ class SessionWorkControllerV1:
                     self._publish_pending_retirement_locked_v1(
                         generation,
                         GenerationRetirementReasonV1.SESSION_SHUTDOWN,
+                        cleanup_deadline_monotonic=deadline,
                         reopen_admission=False,
                         allow_failed=True,
                     )
@@ -1872,6 +2011,7 @@ class SessionWorkControllerV1:
                 self._publish_pending_retirement_locked_v1(
                     generation,
                     GenerationRetirementReasonV1.SESSION_SHUTDOWN,
+                    cleanup_deadline_monotonic=deadline,
                     reopen_admission=False,
                     allow_failed=True,
                 )

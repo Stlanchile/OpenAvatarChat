@@ -154,8 +154,17 @@ class ChatSession:
         self.handlers: Dict[str, HandlerRecord] = {}
         self._playback_begin_event_ids: Dict[str, str] = {}
         self._stop_state_lock_v1 = threading.Lock()
+        self._stop_finalize_lock_v1 = threading.Lock()
         self._stop_complete_event_v1 = threading.Event()
+        self._fully_quiesced_event_v1 = threading.Event()
         self._stop_started_v1 = False
+        self._shutdown_deadline_monotonic_v1: float | None = None
+        self._shutdown_quarantined_v1 = False
+        self._signal_shutdown_started_v1 = False
+        self._context_cleanup_threads_v1: dict[
+            str, threading.Thread
+        ] = {}
+        self._context_cleanup_failures_v1: set[str] = set()
         self._register_playback_auto_recorder()
 
     @classmethod
@@ -830,9 +839,13 @@ class ChatSession:
                 raise RuntimeError(
                     "secure session stop requires await stop_async()"
                 )
+        stop_already_complete = self._stop_complete_event_v1.is_set()
         if not self._claim_stop_owner_v1():
             self._stop_complete_event_v1.wait()
+            if stop_already_complete and not self.is_fully_quiesced_v1():
+                self._reap_quarantined_stop_v1()
             return
+        deadline = self._begin_shutdown_budget_v1()
         try:
             if self._work_controller_v1 is not None:
                 cleanup_succeeded = self._work_controller_v1.shutdown(
@@ -843,17 +856,22 @@ class ChatSession:
         finally:
             try:
                 self.session_context.shared_states.active = False
-                self._finish_stop_v1()
+                if not self._finish_stop_v1(deadline):
+                    logger.error("SECURE_SESSION_HANDLER_QUARANTINED_V1")
             finally:
                 self._stop_complete_event_v1.set()
 
     async def stop_async(self):
         """Stop a secure session without blocking its cooperative event loop."""
 
+        stop_already_complete = self._stop_complete_event_v1.is_set()
         if not self._claim_stop_owner_v1():
             while not self._stop_complete_event_v1.is_set():
                 await asyncio.sleep(0.01)
+            if stop_already_complete and not self.is_fully_quiesced_v1():
+                await self._reap_quarantined_stop_async_v1()
             return
+        deadline = self._begin_shutdown_budget_v1()
         try:
             if self._work_controller_v1 is not None:
                 cleanup_succeeded = (
@@ -866,7 +884,11 @@ class ChatSession:
         finally:
             try:
                 self.session_context.shared_states.active = False
-                self._finish_stop_v1()
+                finished = await self._finish_stop_async_v1(
+                    deadline,
+                )
+                if not finished:
+                    logger.error("SECURE_SESSION_HANDLER_QUARANTINED_V1")
             finally:
                 self._stop_complete_event_v1.set()
 
@@ -878,6 +900,54 @@ class ChatSession:
             if self._work_controller_v1 is None:
                 self.session_context.shared_states.active = False
             return True
+
+    def _begin_shutdown_budget_v1(self) -> float | None:
+        controller = self._work_controller_v1
+        if controller is None:
+            return None
+        with self._stop_state_lock_v1:
+            if self._shutdown_deadline_monotonic_v1 is None:
+                self._shutdown_deadline_monotonic_v1 = (
+                    time.monotonic()
+                    + controller.cleanup_timeout_seconds_v1()
+                )
+            return self._shutdown_deadline_monotonic_v1
+
+    @staticmethod
+    def _remaining_shutdown_budget_v1(
+        deadline_monotonic: float | None,
+    ) -> float | None:
+        if deadline_monotonic is None:
+            return None
+        return max(0.0, deadline_monotonic - time.monotonic())
+
+    def is_fully_quiesced_v1(self) -> bool:
+        if self._work_controller_v1 is None:
+            return self._stop_complete_event_v1.is_set()
+        return self._fully_quiesced_event_v1.is_set()
+
+    def shutdown_deadline_monotonic_v1(self) -> float | None:
+        return self._shutdown_deadline_monotonic_v1
+
+    def _reap_quarantined_stop_v1(self) -> bool:
+        controller = self._work_controller_v1
+        if controller is None:
+            return True
+        deadline = (
+            time.monotonic()
+            + controller.cleanup_timeout_seconds_v1()
+        )
+        return self._finish_stop_v1(deadline)
+
+    async def _reap_quarantined_stop_async_v1(self) -> bool:
+        controller = self._work_controller_v1
+        if controller is None:
+            return True
+        deadline = (
+            time.monotonic()
+            + controller.cleanup_timeout_seconds_v1()
+        )
+        return await self._finish_stop_async_v1(deadline)
 
     def _release_queued_work_v1(self, queued_item) -> None:
         runtime = self._work_runtime_v1
@@ -937,22 +1007,144 @@ class ChatSession:
                     logger.error("CLIENT_OUTPUT_QUEUE_DRAIN_FAILED_V1")
         self.signal_manager.drain_registered_work_v1()
 
-    def _finish_stop_v1(self):
-        for handler_name, handler_record in self.handlers.items():
-            if handler_record.pump_thread:
-                handler_record.pump_thread.join()
-                handler_record.pump_thread = None
-            self._drain_handler_input_queue_v1(handler_record)
-            handler_record.env.handler.destroy_context(handler_record.env.context)
-        self.signal_manager.shutdown()
-        self.handlers.clear()
-        self.data_sinks.clear()
-        self._playback_begin_event_ids.clear()
-        self.session_context.cleanup()
-        if self._security_authority is not None:
-            self.stream_manager.release_secure_state_v1()
-            self._security_authority.close()
-        logger.info("chat session stopped")
+    def _start_context_cleanup_v1(
+        self,
+        handler_name: str,
+        handler_record: HandlerRecord,
+    ) -> threading.Thread:
+        existing = self._context_cleanup_threads_v1.get(handler_name)
+        if existing is not None:
+            return existing
+
+        def destroy_context() -> None:
+            try:
+                handler_record.env.handler.destroy_context(
+                    handler_record.env.context
+                )
+            except Exception:  # noqa: BLE001 - payload-free cleanup failure
+                with self._stop_state_lock_v1:
+                    self._context_cleanup_failures_v1.add(handler_name)
+                logger.error("HANDLER_CONTEXT_DESTROY_FAILED_V1")
+
+        cleanup_thread = threading.Thread(
+            target=destroy_context,
+            name="secure_context_cleanup_v1",
+            daemon=True,
+        )
+        self._context_cleanup_threads_v1[handler_name] = cleanup_thread
+        cleanup_thread.start()
+        return cleanup_thread
+
+    def _finish_stop_v1(
+        self,
+        deadline_monotonic: float | None = None,
+    ) -> bool:
+        with self._stop_finalize_lock_v1:
+            if self._fully_quiesced_event_v1.is_set():
+                return True
+
+            secure = self._work_controller_v1 is not None
+            completed_handlers: list[str] = []
+            for handler_name, handler_record in tuple(
+                self.handlers.items()
+            ):
+                pump_thread = handler_record.pump_thread
+                if pump_thread is not None:
+                    pump_thread.join(
+                        timeout=(
+                            self._remaining_shutdown_budget_v1(
+                                deadline_monotonic
+                            )
+                            if secure
+                            else None
+                        )
+                    )
+                    if pump_thread.is_alive():
+                        self._shutdown_quarantined_v1 = True
+                        continue
+                    handler_record.pump_thread = None
+
+                self._drain_handler_input_queue_v1(handler_record)
+                if secure:
+                    cleanup_thread = self._start_context_cleanup_v1(
+                        handler_name,
+                        handler_record,
+                    )
+                    cleanup_thread.join(
+                        timeout=self._remaining_shutdown_budget_v1(
+                            deadline_monotonic
+                        )
+                    )
+                    if cleanup_thread.is_alive():
+                        self._shutdown_quarantined_v1 = True
+                        continue
+                    if handler_name in self._context_cleanup_failures_v1:
+                        self._shutdown_quarantined_v1 = True
+                        continue
+                else:
+                    handler_record.env.handler.destroy_context(
+                        handler_record.env.context
+                    )
+                completed_handlers.append(handler_name)
+
+            for handler_name in completed_handlers:
+                self.handlers.pop(handler_name, None)
+                self._context_cleanup_threads_v1.pop(
+                    handler_name,
+                    None,
+                )
+
+            if self.handlers:
+                return False
+
+            if self._signal_shutdown_started_v1:
+                signal_stopped = (
+                    self.signal_manager.finalize_shutdown_v1()
+                )
+            else:
+                self._signal_shutdown_started_v1 = True
+                signal_stopped = self.signal_manager.shutdown(
+                    timeout=(
+                        self._remaining_shutdown_budget_v1(
+                            deadline_monotonic
+                        )
+                        if secure
+                        else None
+                    )
+                )
+            if not signal_stopped:
+                self._shutdown_quarantined_v1 = True
+                return False
+
+            self.data_sinks.clear()
+            self._playback_begin_event_ids.clear()
+            self.session_context.cleanup()
+            if self._security_authority is not None:
+                self.stream_manager.release_secure_state_v1()
+                self._security_authority.close()
+            self._shutdown_quarantined_v1 = False
+            self._fully_quiesced_event_v1.set()
+            logger.info("chat session stopped")
+            return True
+
+    async def _finish_stop_async_v1(
+        self,
+        deadline_monotonic: float | None,
+    ) -> bool:
+        if self._work_controller_v1 is None:
+            return await asyncio.to_thread(
+                self._finish_stop_v1,
+                None,
+            )
+        while True:
+            if self._finish_stop_v1(time.monotonic()):
+                return True
+            remaining = self._remaining_shutdown_budget_v1(
+                deadline_monotonic
+            )
+            if remaining is None or remaining <= 0:
+                return False
+            await asyncio.sleep(min(remaining, 0.01))
 
     def get_timestamp(self):
         return self.session_context.get_clock().get_timestamp()

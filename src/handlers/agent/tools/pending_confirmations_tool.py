@@ -11,14 +11,21 @@ from typing import Any, Dict
 
 from loguru import logger
 
+from chat_engine.security.work_fence import WorkValidationBoundaryV1
+from chat_engine.security.work_runtime import SessionWorkRuntimeV1
 from handlers.agent.tools.base_tool import BaseTool, ToolResult
 
 
 class PendingConfirmationsTool(BaseTool):
     """Manage the pending-confirmations list."""
 
-    def __init__(self, manager=None):
+    def __init__(
+        self,
+        manager=None,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
+    ):
         self._manager = manager
+        self._work_runtime_v1 = work_runtime_v1
 
     @property
     def name(self) -> str:
@@ -82,7 +89,25 @@ class PendingConfirmationsTool(BaseTool):
                 data={"list": self._manager.render()},
             )
 
-        rendered = self._manager.upsert(items)
+        runtime = self._work_runtime_v1
+        work = runtime.current_work_v1() if runtime is not None else None
+        rendered_items: list[str] = []
+
+        def update_items() -> None:
+            rendered_items.append(self._manager.upsert(items))
+
+        if runtime is None:
+            update_items()
+        elif work is None or not runtime.perform_if_live_v1(
+            work,
+            WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+            update_items,
+        ):
+            return ToolResult(
+                success=False,
+                error="OC secure work retired",
+            )
+        rendered = rendered_items[0]
         logger.info(f"[PendingConfirmTool] Updated {len(items)} items")
         return ToolResult(
             success=True,

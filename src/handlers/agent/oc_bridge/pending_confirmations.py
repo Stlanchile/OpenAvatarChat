@@ -75,9 +75,7 @@ class PendingConfirmationsManager:
                         created_at=now,
                         updated_at=now,
                     )
-                logger.info(
-                    f"[PendingConfirm] upsert id={item_id} status={status}"
-                )
+                logger.info("OC_PENDING_CONFIRMATION_UPDATED_V1")
             self._rounds_since_reminded = 0
         return self.render()
 
@@ -112,6 +110,13 @@ class PendingConfirmationsManager:
     def get_pending_items(self) -> List[PendingItem]:
         with self._lock:
             return [i for i in self._items.values() if i.status == "pending"]
+
+    def clear_v1(self) -> None:
+        """Discard generation-bound confirmation state."""
+
+        with self._lock:
+            self._items.clear()
+            self._rounds_since_reminded = 0
 
     def purge_resolved(self, max_age: float = 120.0):
         """Remove resolved (non-pending) items older than *max_age* seconds.

@@ -8,11 +8,27 @@ main agent file free of OC-specific parsing logic.
 """
 
 import re
+import secrets
 import threading
+import time
+from dataclasses import dataclass, field
 from typing import Optional, Set
 
 from loguru import logger
 
+from chat_engine.security.dispatch import SecurityEnvelopeReferenceV1
+from chat_engine.security.session_work_controller import (
+    WorkAdmissionDeniedV1,
+)
+from chat_engine.security.work_fence import (
+    RegisteredWorkV1,
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import (
+    SessionWorkRuntimeV1,
+    WorkBoundItemV1,
+)
 from handlers.agent.oc_bridge.oc_channel_client import OcChannelClient, OcReplyMessage
 from handlers.agent.oc_bridge.pending_confirmations import PendingConfirmationsManager
 from handlers.agent.oc_bridge.task_notification_queue import (
@@ -102,15 +118,33 @@ def try_handle_external_resolution(
         resolved_status = "denied" if decision == "deny" else "confirmed"
         try:
             pending_mgr.upsert([{"id": aid, "status": resolved_status}])
-            logger.info(
-                f"[OcReplyBridge] External approval resolution: "
-                f"{aid} → {resolved_status}"
-            )
-        except Exception as e:
-            logger.warning(
-                f"[OcReplyBridge] Failed to mark external resolution: {e}"
-            )
+            logger.info("OC_EXTERNAL_APPROVAL_RESOLVED_V1")
+        except Exception:
+            logger.warning("OC_EXTERNAL_APPROVAL_RESOLUTION_FAILED_V1")
     return True
+
+
+@dataclass(slots=True, repr=False)
+class OcPendingRequestV1:
+    """Server-owned correlation to one exact-generation child work item."""
+
+    correlation_id: str
+    work_item_v1: WorkBoundItemV1
+    route_to_notifications: bool
+    reply_event: threading.Event = field(default_factory=threading.Event)
+    terminal_event: threading.Event = field(default_factory=threading.Event)
+    reply: OcReplyMessage | None = None
+    deadline_timer_v1: threading.Timer | None = field(
+        default=None,
+        repr=False,
+    )
+    callback_lock_v1: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
+
+    def __repr__(self) -> str:
+        return "OcPendingRequestV1(<redacted>)"
 
 
 class OcReplyBridge:
@@ -122,14 +156,133 @@ class OcReplyBridge:
         task_queue: TaskNotificationQueue,
         pending_mgr: Optional[PendingConfirmationsManager],
         proactive_wake: threading.Event,
+        channel_client: OcChannelClient,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
     ):
         self._task_queue = task_queue
         self._pending_mgr = pending_mgr
         self._proactive_wake = proactive_wake
+        self._channel_client = channel_client
+        self._work_runtime_v1 = work_runtime_v1
         self._seen_approval_ids: Set[str] = set()
+        self._pending_lock_v1 = threading.Lock()
+        self._pending_v1: dict[str, OcPendingRequestV1] = {}
 
-    def handle_reply(self, msg: OcReplyMessage) -> None:
-        """Main entry point — called for every OC reply message."""
+    def begin_request_v1(
+        self,
+        parent_work_v1: RegisteredWorkV1,
+        envelope_ref_v1: SecurityEnvelopeReferenceV1 | None,
+        *,
+        route_to_notifications: bool,
+    ) -> OcPendingRequestV1 | None:
+        runtime = self._work_runtime_v1
+        if runtime is None or not runtime.validate_work_v1(
+            parent_work_v1,
+            WorkValidationBoundaryV1.BEFORE_FOLLOW_ON_WORK,
+        ):
+            return None
+        try:
+            child_work = runtime.register_child_work_v1(
+                parent_work_v1,
+                WorkOperationKindV1.TOOL_EXECUTION,
+            )
+        except WorkAdmissionDeniedV1:
+            return None
+        pending = OcPendingRequestV1(
+            correlation_id=(
+                "ocw1_" + secrets.token_urlsafe(18)
+            ),
+            work_item_v1=WorkBoundItemV1(
+                payload=None,
+                registered_work=child_work,
+                envelope_ref=envelope_ref_v1,
+            ),
+            route_to_notifications=route_to_notifications,
+        )
+
+        def install_pending() -> None:
+            with self._pending_lock_v1:
+                self._pending_v1[pending.correlation_id] = pending
+            self._channel_client.reply_queue.register_callback(
+                pending.correlation_id,
+                self.handle_reply,
+            )
+
+        if not runtime.perform_if_live_v1(
+            child_work,
+            WorkValidationBoundaryV1.BEFORE_FOLLOW_ON_WORK,
+            install_pending,
+        ):
+            pending.work_item_v1.release_once_v1(runtime)
+            return None
+        deadline_timer = threading.Timer(
+            max(
+                0.0,
+                child_work.fence.deadline_monotonic - time.monotonic(),
+            ),
+            self.cancel_request_v1,
+            args=(pending,),
+        )
+        deadline_timer.daemon = True
+        with self._pending_lock_v1:
+            if self._pending_v1.get(pending.correlation_id) is pending:
+                pending.deadline_timer_v1 = deadline_timer
+                deadline_timer.start()
+        return pending
+
+    def cancel_request_v1(
+        self,
+        pending: OcPendingRequestV1,
+    ) -> None:
+        removed = False
+        with pending.callback_lock_v1:
+            with self._pending_lock_v1:
+                canonical = self._pending_v1.get(
+                    pending.correlation_id
+                )
+                if canonical is pending:
+                    self._pending_v1.pop(
+                        pending.correlation_id,
+                        None,
+                    )
+                    removed = True
+        if not removed:
+            return
+        pending.terminal_event.set()
+        pending.reply_event.set()
+        if pending.deadline_timer_v1 is not None:
+            pending.deadline_timer_v1.cancel()
+        self._channel_client.reply_queue.unregister_callback(
+            pending.correlation_id
+        )
+        runtime = self._work_runtime_v1
+        if runtime is not None:
+            pending.work_item_v1.release_once_v1(runtime)
+
+    @staticmethod
+    def wait_for_reply_v1(
+        pending: OcPendingRequestV1,
+        timeout: float,
+    ) -> OcReplyMessage | None:
+        pending.reply_event.wait(timeout=timeout)
+        return pending.reply
+
+    def pending_count_v1(self) -> int:
+        with self._pending_lock_v1:
+            return len(self._pending_v1)
+
+    def reset_generation_state_v1(self) -> None:
+        """Discard only deferred semantic state, not running work leases."""
+
+        self._seen_approval_ids.clear()
+
+    def close_v1(self) -> None:
+        with self._pending_lock_v1:
+            pending_items = tuple(self._pending_v1.values())
+        for pending in pending_items:
+            self.cancel_request_v1(pending)
+
+    def _route_reply_v1(self, msg: OcReplyMessage) -> None:
         if self._task_queue is None:
             return
 
@@ -140,9 +293,7 @@ class OcReplyBridge:
         if approval_info:
             aid = approval_info["approval_id"]
             if aid in self._seen_approval_ids:
-                logger.debug(
-                    f"[OcReplyBridge] Skipping duplicate approval {aid}"
-                )
+                logger.debug("OC_DUPLICATE_APPROVAL_DROPPED_V1")
                 return
             self._seen_approval_ids.add(aid)
             summary = format_approval_notification(approval_info)
@@ -156,15 +307,22 @@ class OcReplyBridge:
                         "text": f"exec: {approval_info['command'][:60]}",
                         "status": "pending",
                     }])
-                except Exception as e:
-                    logger.warning(
-                        f"[OcReplyBridge] pending_confirmations.upsert failed: {e}"
-                    )
+                except Exception:
+                    logger.warning("OC_PENDING_CONFIRMATION_UPDATE_FAILED_V1")
         else:
             summary = msg.text
-            status = "progress"
-            task_id = f"oc-reply-{msg.oac_session_id}"
-            merge_key = msg.oac_session_id
+            status = (
+                msg.status
+                if msg.status in {"progress", "completed", "failed"}
+                else "progress"
+            )
+            reply_key = (
+                msg.correlation_id
+                if self._work_runtime_v1 is not None
+                else msg.oac_session_id
+            )
+            task_id = f"oc-reply-{reply_key}"
+            merge_key = reply_key
 
         notification = TaskNotification(
             task_id=task_id,
@@ -174,16 +332,95 @@ class OcReplyBridge:
             merge_key=merge_key,
         )
         self._task_queue.push(notification)
-        logger.info(
-            f"[OcReplyBridge] Routed OC reply to TaskNotificationQueue "
-            f"(session={msg.oac_session_id}, type={status}, len={len(msg.text)})"
-        )
+        logger.info("OC_REPLY_ROUTED_V1")
 
         if status == "approval_needed":
             self._proactive_wake.set()
-            logger.info(
-                f"[OcReplyBridge] Set proactive_wake for approval {task_id}"
+            logger.info("OC_PROACTIVE_WAKE_SET_V1")
+
+    def handle_reply(self, msg: OcReplyMessage) -> bool:
+        """Route a callback only through its server-owned pending work."""
+
+        runtime = self._work_runtime_v1
+        if runtime is None:
+            self._route_reply_v1(msg)
+            return False
+        correlation_id = msg.correlation_id
+        if not correlation_id:
+            logger.info("LATE_CALLBACK_DROPPED OC_REPLY_MISSING")
+            return True
+        with self._pending_lock_v1:
+            pending = self._pending_v1.get(correlation_id)
+        if pending is None:
+            logger.info("LATE_CALLBACK_DROPPED OC_REPLY_UNKNOWN")
+            return True
+        with pending.callback_lock_v1:
+            with self._pending_lock_v1:
+                if self._pending_v1.get(correlation_id) is not pending:
+                    logger.info("LATE_CALLBACK_DROPPED OC_REPLY_UNKNOWN")
+                    return True
+
+            callback_status = msg.status
+            if callback_status not in {
+                "progress",
+                "completed",
+                "failed",
+            }:
+                logger.info(
+                    "LATE_CALLBACK_DROPPED OC_REPLY_STATUS_INVALID"
+                )
+                return True
+            terminal = callback_status in {"completed", "failed"}
+            work = pending.work_item_v1.registered_work
+            live = runtime.validate_work_v1(
+                work,
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
             )
+            try:
+                if live:
+                    def deliver_reply() -> None:
+                        if pending.route_to_notifications:
+                            self._route_reply_v1(msg)
+                        elif terminal:
+                            pending.reply = msg
+                            pending.reply_event.set()
+                        if terminal:
+                            pending.terminal_event.set()
+
+                    if not runtime.perform_if_live_v1(
+                        work,
+                        WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        deliver_reply,
+                    ):
+                        runtime.log_late_drop_v1(
+                            work,
+                            "OC_REPLY_MUTATION_RACE",
+                        )
+                else:
+                    runtime.log_late_drop_v1(
+                        work,
+                        "OC_REPLY_AFTER_RETIREMENT",
+                    )
+                return True
+            finally:
+                if terminal:
+                    with self._pending_lock_v1:
+                        if (
+                            self._pending_v1.get(correlation_id)
+                            is pending
+                        ):
+                            self._pending_v1.pop(
+                                correlation_id,
+                                None,
+                            )
+                    self._channel_client.reply_queue.unregister_callback(
+                        correlation_id
+                    )
+                    pending.terminal_event.set()
+                    pending.reply_event.set()
+                    if pending.deadline_timer_v1 is not None:
+                        pending.deadline_timer_v1.cancel()
+                    pending.work_item_v1.release_once_v1(runtime)
 
     @staticmethod
     def register(
@@ -192,6 +429,7 @@ class OcReplyBridge:
         task_queue: TaskNotificationQueue,
         pending_mgr: Optional[PendingConfirmationsManager],
         proactive_wake: threading.Event,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
     ) -> Optional["OcReplyBridge"]:
         """Create an OcReplyBridge and register it on the channel client.
 
@@ -201,7 +439,17 @@ class OcReplyBridge:
         if not channel_client:
             return None
 
-        bridge = OcReplyBridge(task_queue, pending_mgr, proactive_wake)
+        bridge = OcReplyBridge(
+            task_queue,
+            pending_mgr,
+            proactive_wake,
+            channel_client,
+            work_runtime_v1,
+        )
+        if work_runtime_v1 is not None:
+            channel_client.reply_queue.require_registered_correlation_v1()
+            logger.info("OC_SECURE_REPLY_BRIDGE_READY_V1")
+            return bridge
 
         channel_client.reply_queue.register_callback(
             session_id, bridge.handle_reply
@@ -210,8 +458,5 @@ class OcReplyBridge:
         channel_client.reply_queue.register_callback(
             prefixed_key, bridge.handle_reply
         )
-        logger.info(
-            f"[OcReplyBridge] Registered callbacks for session "
-            f"{session_id} and {prefixed_key}"
-        )
+        logger.info("OC_LEGACY_REPLY_BRIDGE_READY_V1")
         return bridge

@@ -56,8 +56,8 @@ class OcMcpClient:
         future = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
         try:
             self._available = future.result(timeout=30.0)
-        except Exception as e:
-            logger.warning(f"[OcMcpClient] Connection failed: {e}")
+        except Exception:
+            logger.warning("OC_MCP_CONNECTION_FAILED_V1")
             self._available = False
 
         self._started = True
@@ -150,8 +150,8 @@ class OcMcpClient:
                 f"{tool_names}"
             )
             return True
-        except Exception as e:
-            logger.warning(f"[OcMcpClient] Plugin Tools MCP init failed: {e}")
+        except Exception:
+            logger.warning("OC_MCP_INIT_FAILED_V1")
             return False
 
     async def _disconnect(self):
@@ -191,9 +191,9 @@ class OcMcpClient:
                 return json.loads(text_result)
             except (json.JSONDecodeError, ValueError):
                 return {"result": text_result}
-        except Exception as e:
-            logger.error(f"[OcMcpClient] Tool call failed ({tool_name}): {e}")
-            return {"error": str(e)}
+        except Exception:
+            logger.error("OC_MCP_TOOL_CALL_FAILED_V1")
+            return {"error": "OC MCP tool call failed"}
 
     async def _list_tools(self) -> List[Dict[str, Any]]:
         tools = []

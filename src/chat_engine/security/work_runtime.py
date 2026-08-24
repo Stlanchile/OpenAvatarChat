@@ -347,6 +347,7 @@ class SessionWorkRuntimeV1:
         item: WorkBoundItemV1,
         consumer_capability: ConsumerCapabilityV1 | None,
         action: Callable[[], Awaitable[Any]],
+        abort_action_v1: Callable[[], Awaitable[Any] | Any],
     ) -> bool:
         """Compose M2 with controller-serialized awaited M3 egress."""
 
@@ -362,6 +363,7 @@ class SessionWorkRuntimeV1:
             item.registered_work.fence,
             WorkValidationBoundaryV1.BEFORE_EGRESS,
             action,
+            abort_action_v1,
         )
 
     def item_egress_is_allowed_v1(
@@ -415,6 +417,11 @@ class SessionWorkRuntimeV1:
 
     def is_usable_v1(self) -> bool:
         return self.__controller.is_usable_v1()
+
+    async def wait_for_retirement_settled_async_v1(self) -> bool:
+        """Expose only the controller's bounded teardown-ordering barrier."""
+
+        return await self.__controller.wait_for_retirement_settled_async_v1()
 
     def _controller_for_test_v1(self) -> SessionWorkControllerV1:
         return self.__controller

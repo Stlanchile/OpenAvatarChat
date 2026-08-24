@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any, Dict
 
 from loguru import logger
 
+from chat_engine.security.work_fence import WorkValidationBoundaryV1
+from chat_engine.security.work_runtime import SessionWorkRuntimeV1
 from handlers.agent.tools.base_tool import BaseTool, ToolResult
 
 if TYPE_CHECKING:
@@ -30,10 +32,12 @@ class ExecApproveTool(BaseTool):
         oc_channel_client=None,
         oac_session_id: str = "",
         pending_mgr: PendingConfirmationsManager | None = None,
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
     ):
         self._oc_channel_client = oc_channel_client
         self._oac_session_id = oac_session_id
         self._pending_mgr = pending_mgr
+        self._work_runtime_v1 = work_runtime_v1
 
     @property
     def name(self) -> str:
@@ -87,18 +91,39 @@ class ExecApproveTool(BaseTool):
             )
         if not self._oc_channel_client:
             return ToolResult(success=False, error="OC channel client not available")
+        runtime = self._work_runtime_v1
+        work = runtime.current_work_v1() if runtime is not None else None
+        if runtime is not None and (
+            work is None
+            or not runtime.validate_work_v1(
+                work,
+                WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+            )
+        ):
+            return ToolResult(
+                success=False,
+                error="OC secure work admission denied",
+            )
 
         approve_text = f"/approve {approval_id} {decision}"
-        logger.info(
-            f"[ExecApprove] Sending approval: {approve_text} "
-            f"(session={self._oac_session_id})"
-        )
+        logger.info("OC_EXEC_APPROVAL_DECISION_SENT_V1")
 
         result = self._oc_channel_client.send_message(
             oac_session_id=self._oac_session_id,
             text=approve_text,
             sender_name="OAC Agent",
         )
+        if runtime is not None and (
+            work is None
+            or not runtime.validate_work_v1(
+                work,
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+            )
+        ):
+            return ToolResult(
+                success=False,
+                error="OC secure work retired",
+            )
 
         if "error" in result:
             return ToolResult(
@@ -115,11 +140,29 @@ class ExecApproveTool(BaseTool):
         if self._pending_mgr:
             resolved_status = "denied" if decision == "deny" else "confirmed"
             try:
-                self._pending_mgr.upsert(
-                    [{"id": approval_id, "status": resolved_status}]
-                )
-            except Exception as e:
-                logger.warning(f"[ExecApprove] Failed to update pending item: {e}")
+                def update() -> None:
+                    self._pending_mgr.upsert(
+                        [
+                            {
+                                "id": approval_id,
+                                "status": resolved_status,
+                            }
+                        ]
+                    )
+
+                if runtime is None:
+                    update()
+                elif work is None or not runtime.perform_if_live_v1(
+                    work,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    update,
+                ):
+                    return ToolResult(
+                        success=False,
+                        error="OC secure work retired",
+                    )
+            except Exception:
+                logger.warning("OC_EXEC_APPROVAL_STATE_UPDATE_FAILED_V1")
 
         return ToolResult(
             success=True,

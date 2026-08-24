@@ -39,13 +39,9 @@ class TaskNotificationQueue:
         with self._lock:
             self._queue.append(notification)
             if len(self._queue) > self._max_size:
-                dropped = self._queue.pop(0)
-                logger.warning(
-                    f"[TaskNotifQueue] Dropped oldest notification: {dropped.task_id}"
-                )
-        logger.info(
-            f"[TaskNotifQueue] Pushed: {notification.task_id} ({notification.status})"
-        )
+                self._queue.pop(0)
+                logger.warning("OC_NOTIFICATION_QUEUE_DROP_V1")
+        logger.info("OC_NOTIFICATION_QUEUED_V1")
 
     def drain(self) -> List[TaskNotification]:
         """Drain all pending notifications. Returns list and clears the queue."""
@@ -72,6 +68,12 @@ class TaskNotificationQueue:
     def peek(self) -> List[TaskNotification]:
         with self._lock:
             return list(self._queue)
+
+    def clear_v1(self) -> None:
+        """Discard generation-bound deferred notifications."""
+
+        with self._lock:
+            self._queue.clear()
 
     @property
     def size(self) -> int:
@@ -127,8 +129,7 @@ class TaskNotificationQueue:
             ))
             if len(group) > 1:
                 logger.info(
-                    f"[TaskNotifQueue] Merged {len(group)} notifications "
-                    f"for merge_key={key}"
+                    f"[TaskNotifQueue] Merged {len(group)} notifications"
                 )
 
         merged.sort(key=lambda n: n.timestamp)

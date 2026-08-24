@@ -58,7 +58,7 @@ class MemoryRetriever:
             )
 
             if "error" in result:
-                logger.debug(f"[MemoryRetriever] Search failed: {result['error']}")
+                logger.debug("OC_MEMORY_SEARCH_FAILED_V1")
                 return ""
 
             formatted = self._format_results(result)
@@ -74,8 +74,8 @@ class MemoryRetriever:
                 )
             return formatted
 
-        except Exception as e:
-            logger.warning(f"[MemoryRetriever] Error: {e}")
+        except Exception:
+            logger.warning("OC_MEMORY_RETRIEVAL_FAILED_V1")
             return ""
 
     def _format_results(self, result: dict) -> str:

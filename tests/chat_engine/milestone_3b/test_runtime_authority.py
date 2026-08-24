@@ -9,6 +9,7 @@ from chat_engine.security.authority import SecurityAuthorityV1
 from chat_engine.security.session_work_controller import (
     SessionWorkControllerV1,
     WorkAdmissionDeniedV1,
+    WorkControllerFailureReasonV1,
 )
 from chat_engine.security.work_fence import (
     WorkOperationKindV1,
@@ -134,6 +135,7 @@ async def test_awaited_ws_send_is_cancelled_before_retirement_publication():
             item,
             None,
             blocked_send,
+            lambda: None,
         )
     )
     await entered.wait()
@@ -147,7 +149,61 @@ async def test_awaited_ws_send_is_cancelled_before_retirement_publication():
     assert await controller.wait_for_cleanup_async_v1(
         retirement.cleanup_fence
     )
-    assert await controller.shutdown_async()
+    assert not await controller.shutdown_async()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_resistant_egress_is_quarantined_before_resume():
+    controller = SessionWorkControllerV1()
+    runtime = SessionWorkRuntimeV1(controller)
+    work = _register(controller, WorkOperationKindV1.WS_EGRESS)
+    item = WorkBoundItemV1(payload=b"public", registered_work=work)
+    entered = asyncio.Event()
+    quarantined = asyncio.Event()
+    transport_open = True
+    sent: list[bytes] = []
+
+    async def stubborn_send() -> None:
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await quarantined.wait()
+        if transport_open:
+            sent.append(b"public")
+
+    def abort_transport() -> None:
+        nonlocal transport_open
+        transport_open = False
+        quarantined.set()
+
+    send_task = asyncio.create_task(
+        runtime.perform_item_egress_async_if_live_v1(
+            item,
+            None,
+            stubborn_send,
+            abort_transport,
+        )
+    )
+    await entered.wait()
+    retirement = await controller.retire_generation_async_v1()
+
+    assert not await send_task
+    assert quarantined.is_set()
+    assert sent == []
+    assert (
+        controller.failure_reason_v1()
+        is WorkControllerFailureReasonV1.EGRESS_TRANSPORT_ABORTED
+    )
+    with pytest.raises(WorkAdmissionDeniedV1):
+        runtime.register_root_work_v1(
+            WorkOperationKindV1.CHAT_AGENT_LLM
+        )
+    assert item.release_once_v1(runtime)
+    assert await controller.wait_for_cleanup_async_v1(
+        retirement.cleanup_fence
+    )
+    assert not await controller.shutdown_async()
 
 
 @pytest.mark.asyncio
@@ -165,6 +221,7 @@ async def test_sync_retirement_rejects_event_loop_deadlock_with_active_send():
             work.fence,
             WorkValidationBoundaryV1.BEFORE_EGRESS,
             blocked_send,
+            lambda: None,
         )
     )
     await entered.wait()
@@ -181,7 +238,7 @@ async def test_sync_retirement_rejects_event_loop_deadlock_with_active_send():
     assert await controller.wait_for_cleanup_async_v1(
         retirement.cleanup_fence
     )
-    assert await controller.shutdown_async()
+    assert not await controller.shutdown_async()
 
 
 @pytest.mark.asyncio
@@ -212,6 +269,7 @@ async def test_m2_authorization_cannot_be_rescued_by_live_async_fence():
         item,
         public_consumer,
         send,
+        lambda: None,
     )
     assert sends == []
     assert item.release_once_v1(runtime)

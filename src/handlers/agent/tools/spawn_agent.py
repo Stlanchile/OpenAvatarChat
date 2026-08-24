@@ -10,11 +10,22 @@ Supports two backends:
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from loguru import logger
 
+from chat_engine.security.session_work_controller import (
+    WorkAdmissionDeniedV1,
+)
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
+from chat_engine.security.work_runtime import SessionWorkRuntimeV1
 from handlers.agent.tools.base_tool import BaseTool, ToolResult
+
+if TYPE_CHECKING:
+    from handlers.agent.oc_bridge.oc_reply_bridge import OcReplyBridge
 
 
 @dataclass
@@ -74,12 +85,16 @@ class SpawnAgentTool(BaseTool):
         oc_channel_client=None,
         tool_registry=None,
         oac_session_id: str = "",
+        work_runtime_v1: SessionWorkRuntimeV1 | None = None,
+        oc_reply_bridge: "OcReplyBridge | None" = None,
     ):
         self._agent_defs = agent_defs or DEFAULT_AGENT_DEFS
         self._llm_client = llm_client
         self._oc_channel_client = oc_channel_client
         self._tool_registry = tool_registry
         self._oac_session_id = oac_session_id
+        self._work_runtime_v1 = work_runtime_v1
+        self._oc_reply_bridge = oc_reply_bridge
 
     @property
     def name(self) -> str:
@@ -163,14 +178,83 @@ class SpawnAgentTool(BaseTool):
             {"role": "user", "content": prompt},
         ]
 
+        runtime = self._work_runtime_v1
+        parent_work = runtime.current_work_v1() if runtime is not None else None
+        envelope_ref = (
+            runtime.current_envelope_ref_v1()
+            if runtime is not None
+            else None
+        )
+        if runtime is not None and parent_work is None:
+            return ToolResult(
+                success=False,
+                error="local sub-agent work authority unavailable",
+            )
+
         final_text = ""
         for round_idx in range(agent_def.max_rounds):
+            llm_work = None
             try:
-                resp = self._llm_client.chat.completions.create(
-                    model=agent_def.model,
-                    messages=messages,
-                    tools=self._build_tool_specs(agent_def.allowed_tools),
-                )
+                if runtime is not None:
+                    if (
+                        parent_work is None
+                        or not runtime.validate_work_v1(
+                            parent_work,
+                            WorkValidationBoundaryV1.BEFORE_FOLLOW_ON_WORK,
+                        )
+                    ):
+                        return ToolResult(
+                            success=False,
+                            error="local sub-agent work retired",
+                        )
+                    try:
+                        llm_work = runtime.register_child_work_v1(
+                            parent_work,
+                            WorkOperationKindV1.CHAT_AGENT_LLM,
+                        )
+                    except WorkAdmissionDeniedV1:
+                        return ToolResult(
+                            success=False,
+                            error="local sub-agent work admission denied",
+                        )
+
+                if runtime is None or llm_work is None:
+                    resp = self._llm_client.chat.completions.create(
+                        model=agent_def.model,
+                        messages=messages,
+                        tools=self._build_tool_specs(
+                            agent_def.allowed_tools
+                        ),
+                    )
+                else:
+                    with runtime.activate_work_v1(
+                        llm_work,
+                        envelope_ref,
+                    ):
+                        if not runtime.validate_work_v1(
+                            llm_work,
+                            WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+                        ):
+                            return ToolResult(
+                                success=False,
+                                error="local sub-agent work retired",
+                            )
+                        resp = self._llm_client.chat.completions.create(
+                            model=agent_def.model,
+                            messages=messages,
+                            tools=self._build_tool_specs(
+                                agent_def.allowed_tools
+                            ),
+                        )
+                        if not runtime.validate_work_v1(
+                            llm_work,
+                            WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                        ):
+                            return ToolResult(
+                                success=False,
+                                error="local sub-agent work retired",
+                            )
+
                 choice = resp.choices[0]
 
                 if choice.finish_reason == "stop":
@@ -178,37 +262,135 @@ class SpawnAgentTool(BaseTool):
                     break
 
                 if choice.message.tool_calls:
-                    messages.append(choice.message)
+                    if runtime is None:
+                        messages.append(choice.message)
+                    elif llm_work is None or not runtime.perform_if_live_v1(
+                        llm_work,
+                        WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                        lambda: messages.append(choice.message),
+                    ):
+                        return ToolResult(
+                            success=False,
+                            error="local sub-agent work retired",
+                        )
                     for tc in choice.message.tool_calls:
                         fn = tc.function
-                        tool_args = json.loads(fn.arguments) if fn.arguments else {}
-                        tool = (
-                            self._tool_registry.get(fn.name)
-                            if self._tool_registry
-                            else None
+                        tool_args = (
+                            json.loads(fn.arguments)
+                            if fn.arguments
+                            else {}
                         )
-                        if tool:
-                            result = tool.execute(tool_args)
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": result.to_content_str(),
-                            })
+                        if runtime is None:
+                            tool = (
+                                self._tool_registry.get(fn.name)
+                                if self._tool_registry
+                                else None
+                            )
+                            if tool:
+                                result = tool.execute(tool_args)
+                            else:
+                                result = None
                         else:
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": '{"error": "no tool registry"}',
-                            })
-            except Exception as e:
-                logger.error(f"[SpawnAgent] local agent round {round_idx} failed: {e}")
+                            if (
+                                llm_work is None
+                                or not runtime.validate_work_v1(
+                                    llm_work,
+                                    WorkValidationBoundaryV1.BEFORE_FOLLOW_ON_WORK,
+                                )
+                            ):
+                                return ToolResult(
+                                    success=False,
+                                    error="local sub-agent work retired",
+                                )
+                            if self._tool_registry is None:
+                                result = None
+                            else:
+                                try:
+                                    tool_work = (
+                                        runtime.register_child_work_v1(
+                                            llm_work,
+                                            WorkOperationKindV1.TOOL_EXECUTION,
+                                        )
+                                    )
+                                except WorkAdmissionDeniedV1:
+                                    return ToolResult(
+                                        success=False,
+                                        error=(
+                                            "local sub-agent tool "
+                                            "admission denied"
+                                        ),
+                                    )
+                                try:
+                                    with runtime.activate_work_v1(
+                                        tool_work,
+                                        envelope_ref,
+                                    ):
+                                        result = self._tool_registry.execute(
+                                            fn.name,
+                                            tool_args,
+                                            _work_runtime_v1=runtime,
+                                            _registered_work_v1=tool_work,
+                                        )
+                                finally:
+                                    runtime.release_work_v1(tool_work)
+                                if result is None:
+                                    return ToolResult(
+                                        success=False,
+                                        error="local sub-agent work retired",
+                                    )
+
+                        tool_message = {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": (
+                                result.to_content_str()
+                                if result is not None
+                                else '{"error": "no tool registry"}'
+                            ),
+                        }
+                        if runtime is None:
+                            messages.append(tool_message)
+                        elif (
+                            llm_work is None
+                            or not runtime.perform_if_live_v1(
+                                llm_work,
+                                WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+                                lambda: messages.append(tool_message),
+                            )
+                        ):
+                            return ToolResult(
+                                success=False,
+                                error="local sub-agent work retired",
+                            )
+            except Exception as error:
+                if self._work_runtime_v1 is None:
+                    logger.error(
+                        f"[SpawnAgent] local agent round "
+                        f"{round_idx} failed: {error}"
+                    )
+                else:
+                    logger.error("LOCAL_SUBAGENT_ROUND_FAILED_V1")
                 break
+            finally:
+                if runtime is not None and llm_work is not None:
+                    runtime.release_work_v1(llm_work)
 
         duration = time.time() - start
-        logger.info(
-            f"[SpawnAgent] local agent '{agent_def.name}' done in {duration:.1f}s, "
-            f"result: {len(final_text)} chars"
-        )
+        if runtime is None:
+            logger.info(
+                f"[SpawnAgent] local agent '{agent_def.name}' done in "
+                f"{duration:.1f}s, result: {len(final_text)} chars"
+            )
+        else:
+            if parent_work is None or not runtime.validate_work_v1(
+                parent_work,
+                WorkValidationBoundaryV1.BEFORE_COMPLETION,
+            ):
+                return ToolResult(
+                    success=False,
+                    error="local sub-agent work retired",
+                )
+            logger.info("LOCAL_SUBAGENT_COMPLETED_V1")
 
         return ToolResult(
             success=True,
@@ -230,44 +412,126 @@ class SpawnAgentTool(BaseTool):
             return ToolResult(success=False, error="No OAC session ID configured")
 
         start = time.time()
-        result = self._oc_channel_client.send_message(
-            oac_session_id=self._oac_session_id,
-            text=prompt,
-            sender_name="OAC Agent",
-        )
+        runtime = self._work_runtime_v1
+        bridge = self._oc_reply_bridge
+        pending = None
+        if runtime is not None:
+            parent = runtime.current_work_v1()
+            if parent is None or bridge is None:
+                return ToolResult(
+                    success=False,
+                    error="OC secure work authority unavailable",
+                )
+            pending = bridge.begin_request_v1(
+                parent,
+                runtime.current_envelope_ref_v1(),
+                route_to_notifications=run_bg,
+            )
+            if pending is None:
+                return ToolResult(
+                    success=False,
+                    error="OC secure work admission denied",
+                )
+            child_work = pending.work_item_v1.registered_work
+            if not runtime.validate_work_v1(
+                child_work,
+                WorkValidationBoundaryV1.BEFORE_EXTERNAL_CALL,
+            ):
+                bridge.cancel_request_v1(pending)
+                return ToolResult(
+                    success=False,
+                    error="OC secure work admission denied",
+                )
+
+        if runtime is None or pending is None:
+            result = self._oc_channel_client.send_message(
+                oac_session_id=self._oac_session_id,
+                text=prompt,
+                sender_name="OAC Agent",
+            )
+        else:
+            with runtime.activate_work_v1(
+                pending.work_item_v1.registered_work,
+                pending.work_item_v1.envelope_ref,
+            ):
+                result = self._oc_channel_client.send_message(
+                    oac_session_id=self._oac_session_id,
+                    text=prompt,
+                    sender_name="OAC Agent",
+                    correlation_id=pending.correlation_id,
+                )
+            if not runtime.validate_work_v1(
+                pending.work_item_v1.registered_work,
+                WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+            ) and not pending.terminal_event.is_set():
+                return ToolResult(
+                    success=False,
+                    error="OC secure work retired",
+                )
 
         if "error" in result:
+            if pending is not None and bridge is not None:
+                bridge.cancel_request_v1(pending)
             return ToolResult(success=False, error=result["error"])
 
         if run_bg:
             duration = time.time() - start
+            result_data = {
+                "status": "submitted_async",
+                "content": (
+                    "任务已通过 OAC Bridge 渠道提交给 OpenClaw 处理，"
+                    "完成后会通知你。"
+                ),
+                "agent_type": agent_def.name,
+                "backend": "oc_channel",
+                "duration_ms": int(duration * 1000),
+            }
+            if runtime is None:
+                result_data["oac_session_id"] = self._oac_session_id
             return ToolResult(
                 success=True,
-                data={
-                    "status": "submitted_async",
-                    "content": "任务已通过 OAC Bridge 渠道提交给 OpenClaw 处理，完成后会通知你。",
-                    "agent_type": agent_def.name,
-                    "backend": "oc_channel",
-                    "oac_session_id": self._oac_session_id,
-                    "duration_ms": int(duration * 1000),
-                },
+                data=result_data,
             )
 
-        reply_msg = self._oc_channel_client.reply_queue.wait_for_reply(
-            self._oac_session_id, timeout=60.0
-        )
+        if pending is None or bridge is None:
+            reply_msg = self._oc_channel_client.reply_queue.wait_for_reply(
+                self._oac_session_id,
+                timeout=60.0,
+            )
+        else:
+            reply_msg = None
+            wait_deadline = time.monotonic() + 60.0
+            while time.monotonic() < wait_deadline:
+                reply_msg = bridge.wait_for_reply_v1(
+                    pending,
+                    timeout=min(
+                        0.1,
+                        wait_deadline - time.monotonic(),
+                    ),
+                )
+                if reply_msg is not None:
+                    break
+                if pending.work_item_v1.cancellation.is_cancelled:
+                    return ToolResult(
+                        success=False,
+                        error="OC secure work retired",
+                    )
+            if reply_msg is None:
+                bridge.cancel_request_v1(pending)
         duration = time.time() - start
 
         reply_text = reply_msg.text if reply_msg else ""
+        result_data = {
+            "content": reply_text or "OC 已接收任务（暂无即时结果）",
+            "agent_type": agent_def.name,
+            "backend": "oc_channel",
+            "duration_ms": int(duration * 1000),
+        }
+        if runtime is None:
+            result_data["oac_session_id"] = self._oac_session_id
         return ToolResult(
             success=True,
-            data={
-                "content": reply_text or "OC 已接收任务（暂无即时结果）",
-                "agent_type": agent_def.name,
-                "backend": "oc_channel",
-                "oac_session_id": self._oac_session_id,
-                "duration_ms": int(duration * 1000),
-            },
+            data=result_data,
         )
 
     def _build_tool_specs(self, allowed_tools: List[str]) -> Optional[List[dict]]:

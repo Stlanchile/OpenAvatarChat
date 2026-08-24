@@ -630,6 +630,7 @@ class ClientHandlerRtc(ClientHandlerBase):
                 work_item_v1,
                 work_runtime_v1,
                 consumer_capability_v1,
+                secure_stream_v1=stream,
             )
 
         loop = getattr(stream, "chat_channel_loop", None)

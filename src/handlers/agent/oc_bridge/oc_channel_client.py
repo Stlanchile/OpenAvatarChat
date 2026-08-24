@@ -13,7 +13,6 @@ import time
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urljoin
 
 import requests
 from loguru import logger
@@ -22,10 +21,19 @@ from loguru import logger
 class OcReplyMessage:
     """A single reply from OC delivered via callback."""
 
-    def __init__(self, oac_session_id: str, text: str, timestamp: float):
+    def __init__(
+        self,
+        oac_session_id: str,
+        text: str,
+        timestamp: float,
+        correlation_id: str | None = None,
+        status: str | None = None,
+    ):
         self.oac_session_id = oac_session_id
         self.text = text
         self.timestamp = timestamp
+        self.correlation_id = correlation_id
+        self.status = status
 
 
 class OcReplyQueue:
@@ -35,50 +43,68 @@ class OcReplyQueue:
         self._lock = threading.Lock()
         self._queues: Dict[str, List[OcReplyMessage]] = defaultdict(list)
         self._events: Dict[str, threading.Event] = {}
-        self._callbacks: Dict[str, Callable[[OcReplyMessage], None]] = {}
+        self._callbacks: Dict[
+            str, Callable[[OcReplyMessage], bool | None]
+        ] = {}
+        self._require_registered_correlation_v1 = False
 
     def push(self, msg: OcReplyMessage):
+        reply_key = msg.correlation_id or msg.oac_session_id
         with self._lock:
-            self._queues[msg.oac_session_id].append(msg)
-            evt = self._events.get(msg.oac_session_id)
-            cb = self._callbacks.get(msg.oac_session_id)
-        if evt:
-            evt.set()
+            cb = self._callbacks.get(reply_key)
+            strict = self._require_registered_correlation_v1
         if cb:
             try:
-                cb(msg)
-            except Exception as e:
-                logger.warning(f"[OcReplyQueue] callback error: {e}")
+                if cb(msg):
+                    return
+            except Exception:
+                logger.warning("OC_REPLY_CALLBACK_FAILED_V1")
+                if strict:
+                    return
+        elif strict:
+            logger.info("LATE_CALLBACK_DROPPED OC_REPLY_UNKNOWN")
+            return
+        with self._lock:
+            self._queues[reply_key].append(msg)
+            evt = self._events.get(reply_key)
+        if evt:
+            evt.set()
 
     def wait_for_reply(
-        self, oac_session_id: str, timeout: float = 60.0
+        self, reply_key: str, timeout: float = 60.0
     ) -> Optional[OcReplyMessage]:
         """Block until a reply arrives for this session, or timeout."""
         evt = threading.Event()
         with self._lock:
-            pending = self._queues.get(oac_session_id)
+            pending = self._queues.get(reply_key)
             if pending:
                 return pending.pop(0)
-            self._events[oac_session_id] = evt
+            self._events[reply_key] = evt
 
         evt.wait(timeout=timeout)
 
         with self._lock:
-            self._events.pop(oac_session_id, None)
-            pending = self._queues.get(oac_session_id)
+            self._events.pop(reply_key, None)
+            pending = self._queues.get(reply_key)
             if pending:
                 return pending.pop(0)
         return None
 
     def register_callback(
-        self, oac_session_id: str, cb: Callable[[OcReplyMessage], None]
+        self,
+        reply_key: str,
+        cb: Callable[[OcReplyMessage], bool | None],
     ):
         with self._lock:
-            self._callbacks[oac_session_id] = cb
+            self._callbacks[reply_key] = cb
 
-    def unregister_callback(self, oac_session_id: str):
+    def unregister_callback(self, reply_key: str):
         with self._lock:
-            self._callbacks.pop(oac_session_id, None)
+            self._callbacks.pop(reply_key, None)
+
+    def require_registered_correlation_v1(self) -> None:
+        with self._lock:
+            self._require_registered_correlation_v1 = True
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -128,12 +154,10 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             oac_session_id=oac_session_id,
             text=text,
             timestamp=data.get("timestamp", time.time()),
+            correlation_id=data.get("correlation_id"),
+            status=data.get("status"),
         )
-        logger.info(
-            f"[OcCallbackServer] Received OC reply "
-            f"(session={oac_session_id}, len={len(text)}): "
-            f"{text[:120]}..."
-        )
+        logger.info("OC_REPLY_RECEIVED_V1")
         if self.reply_queue:
             self.reply_queue.push(msg)
 
@@ -143,7 +167,8 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"status":"ok"}')
 
     def log_message(self, format, *args):
-        logger.debug(f"[OcCallbackServer] {format % args}")
+        del format, args
+        logger.debug("OC_CALLBACK_HTTP_REQUEST_V1")
 
 
 class OcChannelClient:
@@ -208,8 +233,8 @@ class OcChannelClient:
                 f"{self._callback_host}:{self._callback_port}"
             )
             return True
-        except Exception as e:
-            logger.error(f"[OcChannelClient] Failed to start callback server: {e}")
+        except Exception:
+            logger.error("OC_CALLBACK_SERVER_START_FAILED_V1")
             return False
 
     def stop(self):
@@ -225,6 +250,7 @@ class OcChannelClient:
         text: str,
         sender_name: str = "OAC User",
         timeout: float = 10.0,
+        correlation_id: str | None = None,
     ) -> Dict[str, Any]:
         """Send a message to OC via the oac-bridge webhook."""
         url = f"{self._gateway_url}{self._webhook_path}"
@@ -237,14 +263,16 @@ class OcChannelClient:
             "text": text,
             "sender_name": sender_name,
         }
+        if correlation_id:
+            payload["correlation_id"] = correlation_id
 
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
             resp.raise_for_status()
             return resp.json()
-        except requests.RequestException as e:
-            logger.error(f"[OcChannelClient] send_message failed: {e}")
-            return {"error": str(e)}
+        except requests.RequestException:
+            logger.error("OC_CHANNEL_SEND_FAILED_V1")
+            return {"error": "OC channel request failed"}
 
     def send_and_wait(
         self,
@@ -252,11 +280,20 @@ class OcChannelClient:
         text: str,
         sender_name: str = "OAC User",
         wait_timeout: float = 60.0,
+        correlation_id: str | None = None,
     ) -> Optional[str]:
         """Send a message and wait for the reply."""
-        result = self.send_message(oac_session_id, text, sender_name)
+        result = self.send_message(
+            oac_session_id,
+            text,
+            sender_name,
+            correlation_id=correlation_id,
+        )
         if "error" in result:
             return None
 
-        reply = self._reply_queue.wait_for_reply(oac_session_id, timeout=wait_timeout)
+        reply = self._reply_queue.wait_for_reply(
+            correlation_id or oac_session_id,
+            timeout=wait_timeout,
+        )
         return reply.text if reply else None

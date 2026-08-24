@@ -240,6 +240,9 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         self.connection_lock = asyncio.Lock()
         self.primary_connection_id: Optional[int] = None
         self.primary_tasks: List[asyncio.Task] = []
+        self._quarantined_connection_tasks_v1: set[
+            asyncio.Task
+        ] = set()
 
         # 订阅配置
         self.subscriptions: set[str] = set(self.AVAILABLE_SUBSCRIPTIONS)
@@ -549,32 +552,114 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                 await info.websocket.close(code=code, reason=reason or "connection closed")
         except Exception:
             pass
-        logger.info(f"Connection closed for session {self.session_id}, role={info.role}, id={connection_id}")
+        if self.work_runtime_v1 is None:
+            logger.info(
+                f"Connection closed for session {self.session_id}, "
+                f"role={info.role}, id={connection_id}"
+            )
+        else:
+            logger.info("WS_CONNECTION_CLOSED_V1")
 
     async def _close_all_connections(self):
         async with self.connection_lock:
             connection_ids = list(self.connection_infos.keys())
         for connection_id in connection_ids:
             await self._close_connection(connection_id)
-        logger.info(f"All connections closed for session {self.session_id}")
+        if self.work_runtime_v1 is None:
+            logger.info(
+                f"All connections closed for session {self.session_id}"
+            )
+        else:
+            logger.info("WS_CONNECTIONS_CLOSED_V1")
+
+    def _abort_connection_egress_v1(
+        self,
+        info: ConnectionInfo,
+    ):
+        """Synchronously quarantine one socket, then return its close awaitable."""
+
+        info.quit.set()
+        return self._close_connection(
+            info.connection_id,
+            code=1012,
+            reason="application egress retired",
+        )
+
+    async def _cancel_connection_tasks_v1(
+        self,
+        tasks,
+        reason_code: str,
+    ) -> list[asyncio.Task]:
+        task_list = [
+            task
+            for task in tasks
+            if task is not asyncio.current_task()
+        ]
+        for task in task_list:
+            if not task.done():
+                task.cancel()
+        if not task_list:
+            return []
+        if self.work_runtime_v1 is None:
+            await asyncio.gather(
+                *task_list,
+                return_exceptions=True,
+            )
+            return []
+        done, pending = await asyncio.wait(
+            task_list,
+            timeout=1.0,
+        )
+        for completed in done:
+            if completed.cancelled():
+                continue
+            try:
+                completed.exception()
+            except Exception:  # noqa: BLE001 - payload-free reap
+                continue
+        if pending:
+            logger.error(reason_code)
+        for task in pending:
+            if task in self._quarantined_connection_tasks_v1:
+                continue
+            self._quarantined_connection_tasks_v1.add(task)
+
+            def forget_task_v1(
+                done_task: asyncio.Task,
+            ) -> None:
+                self._quarantined_connection_tasks_v1.discard(
+                    done_task
+                )
+                if done_task.cancelled():
+                    return
+                try:
+                    done_task.exception()
+                except Exception:  # noqa: BLE001 - payload-free reap
+                    return
+
+            task.add_done_callback(forget_task_v1)
+        return list(pending)
 
     async def retire_transport_async_v1(self) -> None:
         """Close application tasks and sockets after controller cleanup."""
 
         self.quit.set()
+        await self._close_all_connections()
         current_task = asyncio.current_task()
         tasks = tuple(
             task
-            for task in self.primary_tasks
+            for task in {
+                *self.primary_tasks,
+                *self._quarantined_connection_tasks_v1,
+            }
             if task is not current_task
         )
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self.primary_tasks = []
-        await self._close_all_connections()
+        pending = await self._cancel_connection_tasks_v1(
+            tasks,
+            "WS_TRANSPORT_TASK_DRAIN_TIMEOUT_V1",
+        )
+        self.primary_tasks = list(pending)
+        self._quarantined_connection_tasks_v1 = set(pending)
         self.clear_data()
 
     async def _get_connection_snapshot(self) -> List[ConnectionInfo]:
@@ -609,6 +694,11 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                                     self.work_consumer_capability_v1,
                                     lambda: info.websocket.send_json(
                                         json_data
+                                    ),
+                                    lambda info=info: (
+                                        self._abort_connection_egress_v1(
+                                            info
+                                        )
                                     ),
                                 )
                             )
@@ -664,6 +754,11 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                                     work_item_v1,
                                     self.work_consumer_capability_v1,
                                     lambda: info.websocket.send_bytes(data),
+                                    lambda info=info: (
+                                        self._abort_connection_egress_v1(
+                                            info
+                                        )
+                                    ),
                                 )
                             )
                             if not sent:
@@ -715,6 +810,9 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                             work_item_v1,
                             self.work_consumer_capability_v1,
                             lambda: info.websocket.send_bytes(data),
+                            lambda: self._abort_connection_egress_v1(
+                                info
+                            ),
                         )
                     )
                 else:
@@ -762,6 +860,9 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                             work_item_v1,
                             self.work_consumer_capability_v1,
                             lambda: info.websocket.send_json(json_data),
+                            lambda: self._abort_connection_egress_v1(
+                                info
+                            ),
                         )
                     )
                 else:
@@ -820,9 +921,18 @@ class WsInputSessionDelegate(ClientSessionDelegate):
     async def _send_message(self, websocket: WebSocket, message):
         """发送 JSON 消息"""
         work_item_v1 = None
+        connection_info_v1 = None
         try:
             json_data = serialize_message(message)
             if self.work_runtime_v1 is not None:
+                connection_info_v1 = self.connection_infos.get(
+                    id(websocket)
+                )
+                if (
+                    connection_info_v1 is None
+                    or connection_info_v1.websocket is not websocket
+                ):
+                    return
                 work_item_v1 = self._make_current_ws_item_v1(json_data)
                 if work_item_v1 is None:
                     return
@@ -837,6 +947,9 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                             work_item_v1,
                             self.work_consumer_capability_v1,
                             lambda: websocket.send_json(json_data),
+                            lambda: self._abort_connection_egress_v1(
+                                connection_info_v1
+                            ),
                         )
                     )
                 else:
@@ -2618,28 +2731,31 @@ class WsInputSessionDelegate(ClientSessionDelegate):
 
         try:
             # 等待任意任务结束
-            done, pending = await asyncio.wait(
+            await asyncio.wait(
                 self.primary_tasks,
                 return_when=asyncio.FIRST_COMPLETED
             )
 
-            # 取消其他任务
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-
         finally:
-            for task in self.primary_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*self.primary_tasks, return_exceptions=True)
-            self.primary_tasks = []
             self.quit.set()
-            await self._close_all_connections()
+            if self.work_runtime_v1 is not None:
+                await self._close_all_connections()
+            self.primary_tasks = await self._cancel_connection_tasks_v1(
+                self.primary_tasks,
+                "WS_PRIMARY_TASK_DRAIN_TIMEOUT_V1",
+            )
+            if self.work_runtime_v1 is None:
+                await self._close_all_connections()
             self.motion_welcome_sent = False
             self.motion_welcome_payload = None
             self.binary_stream_assembler.clear()
-            logger.info(f"Primary connection closed, session={self.session_id}")
+            if self.work_runtime_v1 is None:
+                logger.info(
+                    f"Primary connection closed, "
+                    f"session={self.session_id}"
+                )
+            else:
+                logger.info("WS_PRIMARY_CONNECTION_CLOSED_V1")
         return True
 
     async def _serve_listener_connection(self, info: ConnectionInfo):
@@ -2650,17 +2766,23 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         ]
 
         try:
-            done, pending = await asyncio.wait(
+            await asyncio.wait(
                 tasks,
                 return_when=asyncio.FIRST_COMPLETED
             )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
         finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await self._close_connection(info.connection_id)
-            logger.info(f"Listener connection closed, session={self.session_id}")
+            if self.work_runtime_v1 is not None:
+                await self._close_connection(info.connection_id)
+            await self._cancel_connection_tasks_v1(
+                tasks,
+                "WS_LISTENER_TASK_DRAIN_TIMEOUT_V1",
+            )
+            if self.work_runtime_v1 is None:
+                await self._close_connection(info.connection_id)
+            if self.work_runtime_v1 is None:
+                logger.info(
+                    f"Listener connection closed, "
+                    f"session={self.session_id}"
+                )
+            else:
+                logger.info("WS_LISTENER_CONNECTION_CLOSED_V1")

@@ -100,6 +100,232 @@ class _FencedAudioFrameV1:
 
 
 @dataclass(slots=True, repr=False)
+class _RtcControlAuthorityV1:
+    """One exact-generation authority reservation for FastRTC controls."""
+
+    work_item_v1: WorkBoundItemV1
+    work_runtime_v1: SessionWorkRuntimeV1
+    consumer_capability_v1: Any
+    secure_stream_v1: Any | None = None
+    _state_lock_v1: threading.Lock = dataclass_field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _complete_v1: bool = dataclass_field(
+        default=False,
+        init=False,
+        repr=False,
+    )
+    _lifetime_task_v1: asyncio.Task[None] | None = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    def arm_v1(self) -> None:
+        with self._state_lock_v1:
+            if self._complete_v1 or self._lifetime_task_v1 is not None:
+                return
+            task = asyncio.get_running_loop().create_task(
+                self._release_when_cancelled_or_expired_v1()
+            )
+            self._lifetime_task_v1 = task
+
+    async def _release_when_cancelled_or_expired_v1(self) -> None:
+        remaining = max(
+            0.0,
+            self.work_item_v1.fence.deadline_monotonic - time.monotonic(),
+        )
+        try:
+            await self.work_item_v1.cancellation.wait_async(remaining)
+        except asyncio.CancelledError:
+            return
+        self.release_once_v1()
+
+    def take_item_v1(self) -> WorkBoundItemV1 | None:
+        lifetime_task = None
+        with self._state_lock_v1:
+            if self._complete_v1:
+                return None
+            self._complete_v1 = True
+            lifetime_task = self._lifetime_task_v1
+            self._lifetime_task_v1 = None
+        current_task = None
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            pass
+        if (
+            lifetime_task is not None
+            and lifetime_task is not current_task
+            and not lifetime_task.done()
+        ):
+            lifetime_task.cancel()
+        return self.work_item_v1
+
+    def release_once_v1(self) -> bool:
+        item = self.take_item_v1()
+        if item is None:
+            return False
+        return item.release_once_v1(self.work_runtime_v1)
+
+    def __repr__(self) -> str:
+        return "_RtcControlAuthorityV1(<redacted>)"
+
+
+@dataclass(slots=True, repr=False)
+class _FencedRtcControlV1:
+    message_type_v1: str
+    payload_v1: Any
+    authority_v1: _RtcControlAuthorityV1
+    before_enqueue_v1: Callable[[], None] | None = None
+
+    def __repr__(self) -> str:
+        return "_FencedRtcControlV1(<redacted>)"
+
+
+class _SecureLocalCloseV1:
+    """Local track stop marker; it is not an application payload."""
+
+
+def _server_owned_secure_track_required_v1(event_handler: object) -> bool:
+    if getattr(
+        event_handler,
+        "_secure_admission_required_v1",
+        False,
+    ):
+        return True
+    delegate = getattr(
+        event_handler,
+        "client_session_delegate",
+        None,
+    )
+    return (
+        delegate is not None
+        and getattr(delegate, "work_runtime_v1", None) is not None
+    )
+
+
+def _server_owned_secure_emitter_required_v1(
+    next_frame: object,
+) -> bool:
+    candidates = [next_frame]
+    seen: set[int] = set()
+    while candidates:
+        candidate = candidates.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        if getattr(candidate, "_secure_rtc_track_v1", False):
+            return True
+        if _server_owned_secure_track_required_v1(candidate):
+            return True
+        owner = getattr(candidate, "__self__", None)
+        if owner is not None:
+            candidates.append(owner)
+        candidates.extend(getattr(candidate, "args", ()))
+        event_handler = getattr(candidate, "event_handler", None)
+        if event_handler is not None:
+            candidates.append(event_handler)
+    return False
+
+
+def _server_owned_secure_stream_v1(
+    source: object,
+    work_runtime_v1: SessionWorkRuntimeV1,
+) -> object | None:
+    """Resolve the owning secure stream without consulting payload metadata."""
+
+    candidates = [source]
+    seen: set[int] = set()
+    while candidates:
+        candidate = candidates.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        delegate = getattr(
+            candidate,
+            "client_session_delegate",
+            None,
+        )
+        if (
+            delegate is not None
+            and getattr(delegate, "work_runtime_v1", None)
+            is work_runtime_v1
+            and getattr(candidate, "trusted_rtc_admission", None)
+            is not None
+        ):
+            return candidate
+        owner = getattr(candidate, "__self__", None)
+        if owner is not None:
+            candidates.append(owner)
+        candidates.extend(getattr(candidate, "args", ()))
+        event_handler = getattr(candidate, "event_handler", None)
+        if event_handler is not None:
+            candidates.append(event_handler)
+    return None
+
+
+def _schedule_secure_rtc_abort_v1(
+    source: object,
+    work_runtime_v1: SessionWorkRuntimeV1,
+) -> None:
+    """Schedule existing peer/session teardown after controller retirement."""
+
+    stream = _server_owned_secure_stream_v1(source, work_runtime_v1)
+    if stream is None or getattr(
+        stream,
+        "_work_fence_abort_scheduled_v1",
+        False,
+    ):
+        return
+    trusted_admission = getattr(
+        stream,
+        "trusted_rtc_admission",
+        None,
+    )
+    abort_stream = getattr(trusted_admission, "abort_stream", None)
+    if not callable(abort_stream):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.error("RTC_WORK_FENCE_ABORT_SCHEDULE_FAILED_V1")
+        return
+
+    stream._work_fence_abort_scheduled_v1 = True
+
+    async def abort_after_retirement_v1() -> None:
+        settled = (
+            await work_runtime_v1.wait_for_retirement_settled_async_v1()
+        )
+        if not settled:
+            logger.error("RTC_WORK_FENCE_ABORT_ORDERING_TIMEOUT_V1")
+            return
+        await abort_stream(stream)
+
+    task = loop.create_task(abort_after_retirement_v1())
+    stream._work_fence_abort_task_v1 = task
+
+    def finish_abort_v1(done_task: asyncio.Task[None]) -> None:
+        if getattr(stream, "_work_fence_abort_task_v1", None) is done_task:
+            stream._work_fence_abort_task_v1 = None
+        if done_task.cancelled():
+            logger.error("RTC_WORK_FENCE_ABORT_CANCELLED_V1")
+            return
+        try:
+            exception = done_task.exception()
+        except asyncio.CancelledError:
+            logger.error("RTC_WORK_FENCE_ABORT_CANCELLED_V1")
+            return
+        if exception is not None:
+            logger.error("RTC_WORK_FENCE_ABORT_FAILED_V1")
+
+    task.add_done_callback(finish_abort_v1)
+
+
+@dataclass(slots=True, repr=False)
 class _RtpPublicationV1:
     work_item_v1: WorkBoundItemV1
     work_runtime_v1: SessionWorkRuntimeV1
@@ -143,6 +369,24 @@ class _RtpPublicationV1:
                 return
             self.owner_sender_v1 = sender
         sender._fenced_rtp_sender_v1 = True
+
+    def abort_egress_v1(self):
+        """Irreversibly stop the sender that owns this publication."""
+
+        sender = self.owner_sender_v1
+        if sender is None:
+            stop = getattr(self.owner_track_v1, "stop", None)
+            _schedule_secure_rtc_abort_v1(
+                self.owner_track_v1,
+                self.work_runtime_v1,
+            )
+            return stop() if callable(stop) else None
+        sender._fenced_rtp_aborted_v1 = True
+        _schedule_secure_rtc_abort_v1(
+            self.owner_track_v1,
+            self.work_runtime_v1,
+        )
+        return sender.stop()
 
     def _ensure_lifetime_task_v1(self) -> None:
         with self._complete_lock_v1:
@@ -320,6 +564,14 @@ class _FencedRtpTrackMixinV1:
             self._pending_rtp_publication_v1 = None
 
     def _release_all_rtp_publications_v1(self) -> None:
+        control_authority = getattr(
+            self,
+            "_pending_rtc_control_authority_v1",
+            None,
+        )
+        if control_authority is not None:
+            self._pending_rtc_control_authority_v1 = None
+            control_authority.release_once_v1()
         pending = getattr(
             self,
             "_pending_rtp_publication_v1",
@@ -342,9 +594,67 @@ class _FencedRtpTrackMixinV1:
         super().stop()
 
 
+def _make_rtc_control_authority_v1(
+    parent_item_v1: WorkBoundItemV1,
+    work_runtime_v1: SessionWorkRuntimeV1,
+    consumer_capability_v1: Any,
+    secure_stream_v1: object | None,
+) -> _RtcControlAuthorityV1 | None:
+    try:
+        child_work = work_runtime_v1.register_child_work_v1(
+            parent_item_v1.registered_work,
+            WorkOperationKindV1.RTC_EGRESS,
+        )
+    except WorkAdmissionDeniedV1:
+        return None
+    authority = _RtcControlAuthorityV1(
+        work_item_v1=WorkBoundItemV1(
+            payload=None,
+            registered_work=child_work,
+            envelope_ref=parent_item_v1.envelope_ref,
+        ),
+        work_runtime_v1=work_runtime_v1,
+        consumer_capability_v1=consumer_capability_v1,
+        secure_stream_v1=secure_stream_v1,
+    )
+    authority.arm_v1()
+    return authority
+
+
+def _publish_rtc_control_v1(
+    channel: DataChannel | None,
+    control_v1: _FencedRtcControlV1,
+) -> bool:
+    authority = control_v1.authority_v1
+    item = authority.take_item_v1()
+    if item is None:
+        return False
+    if channel is None:
+        item.release_once_v1(authority.work_runtime_v1)
+        return False
+    try:
+        return send_fenced_data_channel_v1(
+            channel,
+            create_message(
+                control_v1.message_type_v1,
+                control_v1.payload_v1,
+            ),
+            item,
+            authority.work_runtime_v1,
+            authority.consumer_capability_v1,
+            before_enqueue_v1=control_v1.before_enqueue_v1,
+            secure_stream_v1=authority.secure_stream_v1,
+        )
+    except BaseException:
+        item.release_once_v1(authority.work_runtime_v1)
+        raise
+
+
 def _release_audio_queue_entry_v1(entry: object) -> None:
     if isinstance(entry, _FencedAudioFrameV1):
         entry.work_item_v1.release_once_v1(entry.work_runtime_v1)
+    elif isinstance(entry, _FencedRtcControlV1):
+        entry.authority_v1.release_once_v1()
 
 
 async def fenced_player_worker_decode_v1(
@@ -362,6 +672,10 @@ async def fenced_player_worker_decode_v1(
     audio_samples = 0
     first_sample_rate = None
     secure_epoch = None
+    secure_output_required_v1 = (
+        _server_owned_secure_emitter_required_v1(next_frame)
+    )
+    control_authority_v1: _RtcControlAuthorityV1 | None = None
 
     def new_resampler():
         return av.AudioResampler(
@@ -389,6 +703,7 @@ async def fenced_player_worker_decode_v1(
                     audio_samples = 0
                     first_sample_rate = None
                 secure_epoch = epoch
+                secure_output_required_v1 = True
                 if not runtime.validate_work_v1(
                     parent_item.registered_work,
                     WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
@@ -396,6 +711,22 @@ async def fenced_player_worker_decode_v1(
                     audio_resampler = new_resampler()
                     audio_samples = 0
                     first_sample_rate = None
+                    continue
+                replacement_control_v1 = (
+                    _make_rtc_control_authority_v1(
+                        parent_item,
+                        runtime,
+                        fenced_payload.consumer_capability_v1,
+                        _server_owned_secure_stream_v1(
+                            next_frame,
+                            runtime,
+                        ),
+                    )
+                )
+                if control_authority_v1 is not None:
+                    control_authority_v1.release_once_v1()
+                control_authority_v1 = replacement_control_v1
+                if control_authority_v1 is None:
                     continue
                 frame = (
                     fenced_payload.sample_rate,
@@ -406,20 +737,68 @@ async def fenced_player_worker_decode_v1(
             else:
                 frame, outputs = split_output(raw_output)
 
-            if (
-                isinstance(outputs, AdditionalOutputs)
-                and set_additional_outputs
-                and channel
-                and channel()
-            ):
-                set_additional_outputs(outputs)
-                cast(DataChannel, channel()).send(create_message("fetch_output", []))
+            if isinstance(outputs, AdditionalOutputs):
+                if not secure_output_required_v1:
+                    if (
+                        set_additional_outputs
+                        and channel
+                        and channel()
+                    ):
+                        set_additional_outputs(outputs)
+                        cast(DataChannel, channel()).send(
+                            create_message("fetch_output", [])
+                        )
+                else:
+                    authority = control_authority_v1
+                    control_authority_v1 = None
+                    if authority is not None:
+                        current_channel = (
+                            cast(DataChannel, channel())
+                            if channel and channel()
+                            else None
+                        )
+                        _publish_rtc_control_v1(
+                            current_channel,
+                            _FencedRtcControlV1(
+                                message_type_v1="fetch_output",
+                                payload_v1=[],
+                                authority_v1=authority,
+                                before_enqueue_v1=(
+                                    (
+                                        lambda outputs=outputs: (
+                                            set_additional_outputs(outputs)
+                                        )
+                                    )
+                                    if set_additional_outputs
+                                    else None
+                                ),
+                            ),
+                        )
             if frame is None:
                 if isinstance(outputs, CloseStream):
-                    await output_queue.put(outputs)
+                    if not secure_output_required_v1:
+                        await output_queue.put(outputs)
+                    else:
+                        authority = control_authority_v1
+                        control_authority_v1 = None
+                        if authority is None:
+                            await output_queue.put(
+                                _SecureLocalCloseV1()
+                            )
+                        else:
+                            await output_queue.put(
+                                _FencedRtcControlV1(
+                                    message_type_v1="end_stream",
+                                    payload_v1=outputs.msg,
+                                    authority_v1=authority,
+                                )
+                            )
                 if quit_on_none:
                     await output_queue.put(None)
                     break
+                continue
+            if fenced_payload is None and secure_output_required_v1:
+                logger.warning("RTC_UNFENCED_AUDIO_OUTPUT_DROPPED_V1")
                 continue
             if (
                 not isinstance(frame, tuple)
@@ -488,10 +867,14 @@ async def fenced_player_worker_decode_v1(
                     frame_item.release_once_v1(runtime)
                     raise
             if isinstance(outputs, CloseStream):
-                await output_queue.put(outputs)
+                if not secure_output_required_v1:
+                    await output_queue.put(outputs)
         except TimeoutError:
             logger.warning("RTC_AUDIO_FRAME_SOURCE_TIMEOUT")
         except asyncio.CancelledError:
+            if control_authority_v1 is not None:
+                control_authority_v1.release_once_v1()
+                control_authority_v1 = None
             raise
         except Exception:  # noqa: BLE001 - stable payload-free media failure
             if fenced_payload is None:
@@ -503,6 +886,8 @@ async def fenced_player_worker_decode_v1(
                 fenced_payload.work_item_v1.release_once_v1(
                     fenced_payload.work_runtime_v1
                 )
+    if control_authority_v1 is not None:
+        control_authority_v1.release_once_v1()
 
 
 class FencedAudioCallbackV1(
@@ -510,6 +895,27 @@ class FencedAudioCallbackV1(
     AudioCallback,
 ):
     """Validate each buffered audio frame at aiortc track publication."""
+
+    def __init__(
+        self,
+        track,
+        event_handler,
+        context,
+        channel=None,
+        set_additional_outputs=None,
+    ) -> None:
+        super().__init__(
+            track,
+            event_handler,
+            context,
+            channel,
+            set_additional_outputs,
+        )
+        self._secure_rtc_track_v1 = (
+            _server_owned_secure_track_required_v1(
+                event_handler
+            )
+        )
 
     def clear_queue(self) -> None:
         while not self.queue.empty():
@@ -530,14 +936,36 @@ class FencedAudioCallbackV1(
                 current_channel.set(self.event_handler.channel)
             await self.start()
             entry = await self.queue.get()
-            if isinstance(entry, CloseStream):
-                cast(DataChannel, self.channel).send(
-                    create_message("end_stream", entry.msg)
+            if isinstance(entry, _FencedRtcControlV1):
+                _publish_rtc_control_v1(
+                    cast(DataChannel, self.channel),
+                    entry,
                 )
+                if entry.message_type_v1 == "end_stream":
+                    self.stop()
+                    return None
+                continue
+            if isinstance(entry, _SecureLocalCloseV1):
+                self.stop()
+                return None
+            if isinstance(entry, CloseStream):
+                if not getattr(
+                    self,
+                    "_secure_rtc_track_v1",
+                    False,
+                ):
+                    cast(DataChannel, self.channel).send(
+                        create_message("end_stream", entry.msg)
+                    )
                 self.stop()
                 return None
             fenced_frame = entry if isinstance(entry, _FencedAudioFrameV1) else None
             frame = fenced_frame.frame if fenced_frame is not None else entry
+            if fenced_frame is not None:
+                self._secure_rtc_track_v1 = True
+            elif getattr(self, "_secure_rtc_track_v1", False):
+                logger.warning("RTC_UNFENCED_AUDIO_FRAME_DROPPED_V1")
+                continue
             handed_to_sender = False
             try:
                 data_time = frame.time
@@ -605,10 +1033,38 @@ class FencedVideoStreamHandlerV1(
 ):
     """Validate video after FastRTC timing and immediately before return."""
 
+    def __init__(
+        self,
+        track,
+        event_handler,
+        context,
+        channel=None,
+        set_additional_outputs=None,
+        mode="send-receive",
+        fps=30,
+        skip_frames=False,
+    ) -> None:
+        super().__init__(
+            track,
+            event_handler,
+            context,
+            channel,
+            set_additional_outputs,
+            mode,
+            fps,
+            skip_frames,
+        )
+        self._secure_rtc_track_v1 = (
+            _server_owned_secure_track_required_v1(
+                event_handler
+            )
+        )
+
     async def recv(self):  # type: ignore[override]
         await self.start()
         while True:
             fenced_payload: FencedRtcVideoPayloadV1 | None = None
+            created_control_v1: _RtcControlAuthorityV1 | None = None
             handed_to_sender = False
             try:
                 handler = self.event_handler
@@ -618,23 +1074,108 @@ class FencedVideoStreamHandlerV1(
                     raw_output = handler.video_emit()
                 if isinstance(raw_output, FencedRtcVideoPayloadV1):
                     fenced_payload = raw_output
+                    if not raw_output.work_runtime_v1.validate_work_v1(
+                        raw_output.work_item_v1.registered_work,
+                        WorkValidationBoundaryV1.AFTER_RETURN_OR_CALLBACK,
+                    ):
+                        continue
+                    replacement_control_v1 = (
+                        _make_rtc_control_authority_v1(
+                            raw_output.work_item_v1,
+                            raw_output.work_runtime_v1,
+                            raw_output.consumer_capability_v1,
+                            _server_owned_secure_stream_v1(
+                                self.event_handler,
+                                raw_output.work_runtime_v1,
+                            ),
+                        )
+                    )
+                    created_control_v1 = replacement_control_v1
+                    previous_control_v1 = getattr(
+                        self,
+                        "_pending_rtc_control_authority_v1",
+                        None,
+                    )
+                    if previous_control_v1 is not None:
+                        previous_control_v1.release_once_v1()
+                    self._pending_rtc_control_authority_v1 = (
+                        replacement_control_v1
+                    )
+                    self._secure_rtc_track_v1 = True
+                    if replacement_control_v1 is None:
+                        continue
                     frame_array = raw_output.frame_array
                     outputs = None
                 else:
                     frame_array, outputs = split_output(raw_output)
-                if (
-                    isinstance(outputs, AdditionalOutputs)
-                    and self.set_additional_outputs
-                    and self.channel
-                ):
-                    self.set_additional_outputs(outputs)
-                    self.channel.send(create_message("fetch_output", []))
+                secure_track = getattr(
+                    self,
+                    "_secure_rtc_track_v1",
+                    False,
+                )
+                if isinstance(outputs, AdditionalOutputs):
+                    if not secure_track:
+                        if self.set_additional_outputs and self.channel:
+                            self.set_additional_outputs(outputs)
+                            self.channel.send(
+                                create_message("fetch_output", [])
+                            )
+                    else:
+                        authority = getattr(
+                            self,
+                            "_pending_rtc_control_authority_v1",
+                            None,
+                        )
+                        self._pending_rtc_control_authority_v1 = None
+                        if authority is not None:
+                            _publish_rtc_control_v1(
+                                cast(DataChannel, self.channel),
+                                _FencedRtcControlV1(
+                                    message_type_v1="fetch_output",
+                                    payload_v1=[],
+                                    authority_v1=authority,
+                                    before_enqueue_v1=(
+                                        (
+                                            lambda outputs=outputs: (
+                                                self.set_additional_outputs(
+                                                    outputs
+                                                )
+                                            )
+                                        )
+                                        if self.set_additional_outputs
+                                        else None
+                                    ),
+                                ),
+                            )
                 if isinstance(outputs, CloseStream):
-                    cast(DataChannel, self.channel).send(
-                        create_message("end_stream", outputs.msg)
-                    )
+                    if not secure_track:
+                        cast(DataChannel, self.channel).send(
+                            create_message("end_stream", outputs.msg)
+                        )
+                    else:
+                        authority = getattr(
+                            self,
+                            "_pending_rtc_control_authority_v1",
+                            None,
+                        )
+                        self._pending_rtc_control_authority_v1 = None
+                        if authority is not None:
+                            _publish_rtc_control_v1(
+                                cast(DataChannel, self.channel),
+                                _FencedRtcControlV1(
+                                    message_type_v1="end_stream",
+                                    payload_v1=outputs.msg,
+                                    authority_v1=authority,
+                                ),
+                            )
                     self.stop()
                     return None
+                if fenced_payload is None and secure_track:
+                    if frame_array is not None:
+                        logger.warning(
+                            "RTC_UNFENCED_VIDEO_OUTPUT_DROPPED_V1"
+                        )
+                        continue
                 if frame_array is None:
                     return None
                 new_frame = self.array_to_frame(frame_array)
@@ -678,6 +1219,15 @@ class FencedVideoStreamHandlerV1(
                     logger.error("RTC_FENCED_VIDEO_FRAME_PROCESSING_FAILED")
             finally:
                 if fenced_payload is not None and not handed_to_sender:
+                    current_control_v1 = getattr(
+                        self,
+                        "_pending_rtc_control_authority_v1",
+                        None,
+                    )
+                    if current_control_v1 is created_control_v1:
+                        self._pending_rtc_control_authority_v1 = None
+                        if created_control_v1 is not None:
+                            created_control_v1.release_once_v1()
                     fenced_payload.work_item_v1.release_once_v1(
                         fenced_payload.work_runtime_v1
                     )
@@ -690,6 +1240,7 @@ class _SctpPublicationV1:
     work_item_v1: WorkBoundItemV1
     work_runtime_v1: SessionWorkRuntimeV1
     consumer_capability_v1: Any
+    secure_stream_v1: Any | None = None
     _state_lock_v1: threading.Lock = dataclass_field(
         default_factory=threading.Lock,
         init=False,
@@ -793,6 +1344,20 @@ class _SctpPublicationV1:
         with self._state_lock_v1:
             self._send_complete_v1 = True
         self.release_if_settled_v1()
+
+    def abort_egress_v1(self):
+        """Irreversibly stop the SCTP transport for a stubborn send."""
+
+        transport = self._transport_v1
+        if transport is None:
+            return None
+        transport._fenced_sctp_aborted_v1 = True
+        if self.secure_stream_v1 is not None:
+            _schedule_secure_rtc_abort_v1(
+                self.secure_stream_v1,
+                self.work_runtime_v1,
+            )
+        return transport.stop()
 
     def release_if_settled_v1(self) -> None:
         transport = self._transport_v1
@@ -910,19 +1475,32 @@ async def _send_rtp_with_publication_v1(
         return True
     publication, is_last_payload, _retain_history = scope
 
-    async def send_and_commit() -> None:
-        await send_action()
-        if is_last_payload and publication.commit_v1 is not None:
-            publication.commit_v1()
-
     try:
         allowed = (
             await publication.work_runtime_v1.perform_item_egress_async_if_live_v1(
                 publication.work_item_v1,
                 publication.consumer_capability_v1,
-                send_and_commit,
+                send_action,
+                publication.abort_egress_v1,
             )
         )
+    except BaseException:
+        publication.release_once_v1()
+        raise
+    try:
+        if (
+            allowed
+            and is_last_payload
+            and publication.commit_v1 is not None
+        ):
+            allowed = (
+                publication.work_runtime_v1
+                .perform_item_egress_if_live_v1(
+                    publication.work_item_v1,
+                    publication.consumer_capability_v1,
+                    publication.commit_v1,
+                )
+            )
     except BaseException:
         publication.release_once_v1()
         raise
@@ -980,6 +1558,9 @@ def send_fenced_data_channel_v1(
     work_item_v1: WorkBoundItemV1,
     work_runtime_v1: SessionWorkRuntimeV1,
     consumer_capability_v1: Any,
+    *,
+    before_enqueue_v1: Callable[[], None] | None = None,
+    secure_stream_v1: object | None = None,
 ) -> bool:
     """Publish once, retaining authority through reliable SCTP completion."""
 
@@ -987,11 +1568,14 @@ def send_fenced_data_channel_v1(
         work_item_v1=work_item_v1,
         work_runtime_v1=work_runtime_v1,
         consumer_capability_v1=consumer_capability_v1,
+        secure_stream_v1=secure_stream_v1,
     )
 
     def enqueue_message() -> None:
         token = _SCTP_PUBLICATION_SCOPE_V1.set(publication)
         try:
+            if before_enqueue_v1 is not None:
+                before_enqueue_v1()
             channel.send(payload)
         finally:
             _SCTP_PUBLICATION_SCOPE_V1.reset(token)
@@ -1016,6 +1600,10 @@ def _data_channel_send_v1(
     data,
 ) -> None:
     publication = _SCTP_PUBLICATION_SCOPE_V1.get()
+    if getattr(transport, "_fenced_sctp_aborted_v1", False):
+        if publication is not None:
+            publication.release_once_v1()
+        return
     _ORIGINAL_DATA_CHANNEL_SEND_V1(transport, channel, data)
     if publication is None:
         return
@@ -1059,6 +1647,10 @@ async def _send_sctp_message_v1(
         transport,
         user_data,
     )
+    if getattr(transport, "_fenced_sctp_aborted_v1", False):
+        if publication is not None:
+            publication.release_once_v1()
+        return
     if publication is None:
         token = _SCTP_PUBLICATION_SCOPE_V1.set(None)
         try:
@@ -1074,52 +1666,72 @@ async def _send_sctp_message_v1(
         finally:
             _SCTP_PUBLICATION_SCOPE_V1.reset(token)
         return
-    if not publication.work_runtime_v1.item_egress_is_allowed_v1(
-        publication.work_item_v1,
-        publication.consumer_capability_v1,
-    ):
+    def enqueue_chunks_v1() -> None:
+        if ordered:
+            stream_seq = transport._outbound_stream_seq.get(
+                stream_id,
+                0,
+            )
+        else:
+            stream_seq = 0
+        fragments = math.ceil(
+            len(user_data) / _aiortc_sctp.USERDATA_MAX_LENGTH
+        )
+        pos = 0
+        for fragment in range(fragments):
+            chunk = DataChunk()
+            chunk.flags = 0
+            if not ordered:
+                chunk.flags = _aiortc_sctp.SCTP_DATA_UNORDERED
+            if fragment == 0:
+                chunk.flags |= _aiortc_sctp.SCTP_DATA_FIRST_FRAG
+            if fragment == fragments - 1:
+                chunk.flags |= _aiortc_sctp.SCTP_DATA_LAST_FRAG
+            chunk.tsn = transport._local_tsn
+            chunk.stream_id = stream_id
+            chunk.stream_seq = stream_seq
+            chunk.protocol = pp_id
+            chunk.user_data = (
+                user_data[
+                    pos : pos + _aiortc_sctp.USERDATA_MAX_LENGTH
+                ]
+            )
+            chunk._abandoned = False
+            chunk._acked = False
+            chunk._book_size = len(chunk.user_data)
+            chunk._expiry = expiry
+            chunk._max_retransmits = max_retransmits
+            chunk._misses = 0
+            chunk._retransmit = False
+            chunk._sent_count = 0
+            chunk._sent_time = None
+            publication.attach_chunk_v1(chunk)
+
+            pos += _aiortc_sctp.USERDATA_MAX_LENGTH
+            transport._local_tsn = _aiortc_sctp.tsn_plus_one(
+                transport._local_tsn
+            )
+            transport._outbound_queue.append(chunk)
+
+        if ordered:
+            transport._outbound_stream_seq[stream_id] = (
+                _aiortc_sctp.uint16_add(stream_seq, 1)
+            )
+
+    try:
+        queued = (
+            publication.work_runtime_v1.perform_item_egress_if_live_v1(
+                publication.work_item_v1,
+                publication.consumer_capability_v1,
+                enqueue_chunks_v1,
+            )
+        )
+    except BaseException:
+        publication.release_once_v1()
+        raise
+    if not queued:
         publication.release_once_v1()
         return
-
-    if ordered:
-        stream_seq = transport._outbound_stream_seq.get(stream_id, 0)
-    else:
-        stream_seq = 0
-    fragments = math.ceil(len(user_data) / _aiortc_sctp.USERDATA_MAX_LENGTH)
-    pos = 0
-    for fragment in range(fragments):
-        chunk = DataChunk()
-        chunk.flags = 0
-        if not ordered:
-            chunk.flags = _aiortc_sctp.SCTP_DATA_UNORDERED
-        if fragment == 0:
-            chunk.flags |= _aiortc_sctp.SCTP_DATA_FIRST_FRAG
-        if fragment == fragments - 1:
-            chunk.flags |= _aiortc_sctp.SCTP_DATA_LAST_FRAG
-        chunk.tsn = transport._local_tsn
-        chunk.stream_id = stream_id
-        chunk.stream_seq = stream_seq
-        chunk.protocol = pp_id
-        chunk.user_data = user_data[pos : pos + _aiortc_sctp.USERDATA_MAX_LENGTH]
-        chunk._abandoned = False
-        chunk._acked = False
-        chunk._book_size = len(chunk.user_data)
-        chunk._expiry = expiry
-        chunk._max_retransmits = max_retransmits
-        chunk._misses = 0
-        chunk._retransmit = False
-        chunk._sent_count = 0
-        chunk._sent_time = None
-        publication.attach_chunk_v1(chunk)
-
-        pos += _aiortc_sctp.USERDATA_MAX_LENGTH
-        transport._local_tsn = _aiortc_sctp.tsn_plus_one(transport._local_tsn)
-        transport._outbound_queue.append(chunk)
-
-    if ordered:
-        transport._outbound_stream_seq[stream_id] = _aiortc_sctp.uint16_add(
-            stream_seq, 1
-        )
     token = _SCTP_PUBLICATION_SCOPE_V1.set(publication)
     try:
         await transport._transmit()
@@ -1151,6 +1763,7 @@ async def _send_sctp_chunk_v1(
             transport,
             chunk,
         ),
+        publication.abort_egress_v1,
     )
     if not allowed:
         chunk._abandoned = True

@@ -135,7 +135,10 @@ async def test_chat_engine_retirement_orders_work_before_transport():
     async def stop_session(session_id: str) -> None:
         order.append(f"work:{session_id}")
 
-    async def teardown(session_id: str) -> None:
+    async def teardown(
+        session_id: str,
+        _deadline_monotonic=None,
+    ) -> None:
         order.append(f"transport:{session_id}")
 
     engine.stop_session_async = stop_session
@@ -190,6 +193,7 @@ async def test_combined_shutdown_cancels_all_subsystem_work_and_waits_release():
                 ws_work.fence,
                 WorkValidationBoundaryV1.BEFORE_EGRESS,
                 blocked_send,
+                lambda: None,
             )
         finally:
             runtime.release_work_v1(ws_work)

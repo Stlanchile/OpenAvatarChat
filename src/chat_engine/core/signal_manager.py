@@ -25,6 +25,8 @@ from chat_engine.security.work_runtime import (
     WorkBoundItemV1,
 )
 
+_SIGNAL_SHUTDOWN_SENTINEL_V1 = object()
+
 
 @dataclass(frozen=True, slots=True)
 class _SignalListenerRegistrationV1:
@@ -96,16 +98,26 @@ class SignalManager:
             args=(self.running_flags, self.signal_queue, self.signal_listeners))
         self.signal_distribute_thread.start()
 
-    def shutdown(self):
+    def shutdown(self, timeout: float | None = None) -> bool:
         self.running_flags[0] = False
+        self.signal_queue.put(_SIGNAL_SHUTDOWN_SENTINEL_V1)
         if self.signal_distribute_thread is not None:
             try:
-                self.signal_distribute_thread.join()
+                self.signal_distribute_thread.join(timeout=timeout)
             except RuntimeError:
                 pass
+            if self.signal_distribute_thread.is_alive():
+                return False
+        return self.finalize_shutdown_v1()
+
+    def finalize_shutdown_v1(self) -> bool:
+        thread = self.signal_distribute_thread
+        if thread is not None and thread.is_alive():
+            return False
         self.signal_distribute_thread = None
         self.drain_registered_work_v1()
         self.clear_listeners()
+        return True
 
     def drain_registered_work_v1(self) -> None:
         """Discard queued signals while releasing their work-owned leases."""
@@ -328,6 +340,8 @@ class SignalManager:
             try:
                 queued_item = signal_queue.get(block=True, timeout=0.5)
             except queue.Empty:
+                continue
+            if queued_item is _SIGNAL_SHUTDOWN_SENTINEL_V1:
                 continue
             runtime = self._work_runtime_v1
             if runtime is None:

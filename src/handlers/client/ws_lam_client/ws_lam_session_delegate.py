@@ -227,25 +227,30 @@ class WsLamClientSessionDelegate(WsInputSessionDelegate):
             )
 
         try:
-            done, pending = await asyncio.wait(
+            await asyncio.wait(
                 self.primary_tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
         finally:
-            for task in self.primary_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*self.primary_tasks, return_exceptions=True)
-            self.primary_tasks = []
             self.quit.set()
-            await self._close_all_connections()
+            if self.work_runtime_v1 is not None:
+                await self._close_all_connections()
+            self.primary_tasks = await self._cancel_connection_tasks_v1(
+                self.primary_tasks,
+                "LAM_PRIMARY_TASK_DRAIN_TIMEOUT_V1",
+            )
+            if self.work_runtime_v1 is None:
+                await self._close_all_connections()
             self.motion_welcome_sent = False
             self.motion_welcome_payload = None
             self.binary_stream_assembler.clear()
-            logger.info(f"LAM primary connection closed, session={self.session_id}")
+            if self.work_runtime_v1 is None:
+                logger.info(
+                    f"LAM primary connection closed, "
+                    f"session={self.session_id}"
+                )
+            else:
+                logger.info("LAM_PRIMARY_CONNECTION_CLOSED_V1")
         return True
 
     # ------------------------------------------------------------------

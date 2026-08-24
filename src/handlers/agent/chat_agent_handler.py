@@ -257,6 +257,9 @@ class ChatAgentContext(HandlerContext):
         # OC Bridge components (Phase 3+4)
         self.oc_mcp_client = None
         self.oc_channel_client = None  # OcChannelClient (Phase 4.3: oac-bridge HTTP channel)
+        self.oc_reply_bridge = None
+        self._oc_bridge_init_pending_v1 = False
+        self._oc_mcp_init_thread_v1: Optional[threading.Thread] = None
         self.persona_mgr = None       # PersonaSnapshotManager (deprecated: Phase 4.1 will use MCP)
         self.task_queue = None         # TaskNotificationQueue
         self.task_mirror = None        # TaskMirror — kept for compact rehydration
@@ -342,7 +345,10 @@ class ChatAgentHandler(HandlerBase, ABC):
 
         # OC Bridge initialization
         if context.config.oc_bridge.enabled:
-            self._init_oc_bridge(context)
+            if session_context.secure_dispatch_enabled_v1:
+                context._oc_bridge_init_pending_v1 = True
+            else:
+                self._init_oc_bridge(context)
         else:
             logger.info(
                 "[ChatAgent] OC Bridge 未启用：不会从 OpenClaw 拉取 L2 人格，"
@@ -357,6 +363,25 @@ class ChatAgentHandler(HandlerBase, ABC):
 
     def start_context(self, session_context: SessionContext, handler_context: HandlerContext):
         context = cast(ChatAgentContext, handler_context)
+        if context._oc_bridge_init_pending_v1:
+            runtime = context.work_runtime_v1
+            if runtime is not None:
+                try:
+                    init_work = runtime.register_root_work_v1(
+                        WorkOperationKindV1.GENERIC_EXTERNAL_CALL,
+                    )
+                except WorkAdmissionDeniedV1:
+                    init_work = None
+                if init_work is not None:
+                    try:
+                        with context.activate_work_v1(
+                            init_work,
+                            None,
+                        ):
+                            self._init_oc_bridge(context)
+                    finally:
+                        runtime.release_work_v1(init_work)
+            context._oc_bridge_init_pending_v1 = False
         proactive_cfg = context.config.proactive
         need_loop = proactive_cfg.enabled and (
             proactive_cfg.idle_trigger.enabled
@@ -603,6 +628,8 @@ class ChatAgentHandler(HandlerBase, ABC):
         context: ChatAgentContext,
         generation: int,
     ) -> None:
+        if context._secure_generation_v1 == generation:
+            return
         context.input_buffer = ""
         context.pending_events.clear()
         context.responded_events.clear()
@@ -610,6 +637,28 @@ class ChatAgentHandler(HandlerBase, ABC):
         context.active_stream_keys.clear()
         context.is_generating = False
         context._idle_triggered = False
+        clear_task_queue = getattr(
+            context.task_queue,
+            "clear_v1",
+            None,
+        )
+        if callable(clear_task_queue):
+            clear_task_queue()
+        clear_confirmations = getattr(
+            context.pending_confirmations,
+            "clear_v1",
+            None,
+        )
+        if callable(clear_confirmations):
+            clear_confirmations()
+        clear_oc_bridge = getattr(
+            context.oc_reply_bridge,
+            "reset_generation_state_v1",
+            None,
+        )
+        if callable(clear_oc_bridge):
+            clear_oc_bridge()
+        context._proactive_wake.clear()
         context._secure_generation_v1 = generation
 
     # ── PERCEPTION_CONTEXT ──
@@ -2540,6 +2589,11 @@ class ChatAgentHandler(HandlerBase, ABC):
                 lifecycle_work,
             )
         if context.oc_channel_client:
+            if context.oc_reply_bridge:
+                try:
+                    context.oc_reply_bridge.close_v1()
+                except Exception:
+                    pass
             try:
                 context.oc_channel_client.stop()
             except Exception:
@@ -2557,8 +2611,15 @@ class ChatAgentHandler(HandlerBase, ABC):
         context.tool_registry = None
         context.oc_mcp_client = None
         context.oc_channel_client = None
+        context.oc_reply_bridge = None
         context.persona_mgr = None
         context.task_queue = None
         context.task_mirror = None
         context.pending_confirmations = None
-        logger.info(f"ChatAgentContext destroyed for session {context.session_id}")
+        if context.work_runtime_v1 is None:
+            logger.info(
+                f"ChatAgentContext destroyed for session "
+                f"{context.session_id}"
+            )
+        else:
+            logger.info("CHAT_AGENT_CONTEXT_DESTROYED_V1")

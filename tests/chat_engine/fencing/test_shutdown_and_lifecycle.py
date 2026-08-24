@@ -18,7 +18,10 @@ from chat_engine.security.session_work_controller import (
     WorkAdmissionDeniedV1,
     WorkControllerFailureReasonV1,
 )
-from chat_engine.security.work_fence import WorkOperationKindV1
+from chat_engine.security.work_fence import (
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
 
 
 class SyntheticAdmissionV1:
@@ -124,6 +127,45 @@ def test_shutdown_with_forgotten_token_times_out_and_stays_failed():
     )
     assert not controller.shutdown()
     assert not controller.release_work_v1(work.lease)
+
+
+@pytest.mark.asyncio
+async def test_async_shutdown_uses_one_deadline_for_barrier_and_cleanup():
+    controller = SessionWorkControllerV1._create_for_test_v1(
+        cleanup_timeout_seconds=0.1
+    )
+    awaited_work = _register(controller)
+    forgotten_work = _register(controller)
+    entered = asyncio.Event()
+
+    async def delayed_cancel() -> None:
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.06)
+
+    action_task = asyncio.create_task(
+        controller.perform_if_live_async_v1(
+            awaited_work.fence,
+            WorkValidationBoundaryV1.BEFORE_EGRESS,
+            delayed_cancel,
+            lambda: None,
+        )
+    )
+    await entered.wait()
+    started = time.monotonic()
+
+    assert not await controller.shutdown_async()
+    elapsed = time.monotonic() - started
+
+    assert not await action_task
+    assert 0.08 <= elapsed < 0.14
+    assert forgotten_work.cancellation.is_cancelled
+    assert (
+        controller.failure_reason_v1()
+        is WorkControllerFailureReasonV1.CLEANUP_TIMEOUT
+    )
 
 
 def test_no_admission_after_shutdown_begins():
@@ -322,10 +364,10 @@ async def test_concurrent_sync_and_async_session_stop_finalize_once():
     )
     original_signal_shutdown = session.signal_manager.shutdown
 
-    def counted_signal_shutdown():
+    def counted_signal_shutdown(timeout=None):
         nonlocal signal_shutdown_calls
         signal_shutdown_calls += 1
-        original_signal_shutdown()
+        return original_signal_shutdown(timeout=timeout)
 
     session.signal_manager.shutdown = counted_signal_shutdown
     async_stop = asyncio.create_task(session.stop_async())
@@ -550,6 +592,447 @@ async def test_engine_shutdown_joins_existing_sync_session_stop():
 
     assert not stop_thread.is_alive()
     assert manager_destroy_states == [(True, True), (True, True)]
+
+
+@pytest.mark.asyncio
+async def test_stuck_handler_is_quarantined_until_later_engine_reap():
+    controller = SessionWorkControllerV1._create_for_test_v1(
+        cleanup_timeout_seconds=0.05
+    )
+    session_id = "quarantined-handler-session"
+    session = _secure_session(
+        session_id,
+        work_controller=controller,
+    )
+    handler_entered = threading.Event()
+    handler_release = threading.Event()
+    context_destroyed = threading.Event()
+
+    def blocking_handler() -> None:
+        handler_entered.set()
+        handler_release.wait()
+
+    class SyntheticHandlerV1:
+        @staticmethod
+        def destroy_context(_context) -> None:
+            context_destroyed.set()
+
+    pump_thread = threading.Thread(target=blocking_handler)
+    pump_thread.start()
+    assert handler_entered.wait(timeout=1.0)
+    session.handlers["blocking"] = SimpleNamespace(
+        pump_thread=pump_thread,
+        env=SimpleNamespace(
+            input_queue=queue.Queue(),
+            handler=SyntheticHandlerV1(),
+            context=object(),
+        ),
+    )
+
+    engine = ChatEngine()
+    engine.engine_config = ChatEngineConfigModel(
+        handler_configs={},
+        logic_configs={},
+    )
+    engine._certificate_capture_enabled_v1 = True
+    engine.sessions[session_id] = session
+    manager_destroy_calls: list[str] = []
+    engine.logic_manager.destroy = lambda: manager_destroy_calls.append(
+        "logic"
+    )
+    engine.handler_manager.destroy = lambda: manager_destroy_calls.append(
+        "handler"
+    )
+
+    started = time.monotonic()
+    assert not await engine.shutdown_async()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert session_id in engine.sessions
+    assert not session.is_fully_quiesced_v1()
+    assert not context_destroyed.is_set()
+    assert manager_destroy_calls == []
+    with pytest.raises(RuntimeError, match="already exists"):
+        engine._create_session(
+            SessionInfoData(
+                session_id=session_id,
+                timestamp_base=16_001,
+            ),
+            session_admission=SyntheticAdmissionV1(),
+        )
+
+    handler_release.set()
+    pump_thread.join(timeout=1.0)
+    assert not pump_thread.is_alive()
+    assert await engine.shutdown_async()
+
+    assert context_destroyed.is_set()
+    assert session_id not in engine.sessions
+    assert manager_destroy_calls == ["logic", "handler"]
+
+
+@pytest.mark.asyncio
+async def test_stuck_transport_blocks_manager_teardown_and_same_id_reuse():
+    controller = SessionWorkControllerV1._create_for_test_v1(
+        cleanup_timeout_seconds=0.05
+    )
+    session_id = "quarantined-transport-session"
+    session = _secure_session(
+        session_id,
+        work_controller=controller,
+    )
+    engine = ChatEngine()
+    engine.engine_config = ChatEngineConfigModel(
+        handler_configs={},
+        logic_configs={},
+    )
+    engine._certificate_capture_enabled_v1 = True
+    engine.sessions[session_id] = session
+    transport_released = False
+
+    async def teardown_transport(
+        _session_id: str,
+        _deadline_monotonic=None,
+    ) -> bool:
+        return transport_released
+
+    engine._teardown_session_transports_v1 = teardown_transport
+    manager_destroy_calls: list[str] = []
+    engine.logic_manager.destroy = lambda: manager_destroy_calls.append(
+        "logic"
+    )
+    engine.handler_manager.destroy = lambda: manager_destroy_calls.append(
+        "handler"
+    )
+
+    assert not await engine.shutdown_async()
+    assert session_id in engine.sessions
+    assert manager_destroy_calls == []
+    with pytest.raises(RuntimeError, match="already exists"):
+        engine._create_session(
+            SessionInfoData(
+                session_id=session_id,
+                timestamp_base=16_001,
+            ),
+            session_admission=SyntheticAdmissionV1(),
+        )
+
+    transport_released = True
+    assert await engine.shutdown_async()
+    assert session_id not in engine.sessions
+    assert manager_destroy_calls == ["logic", "handler"]
+
+
+@pytest.mark.asyncio
+async def test_timed_out_transport_teardown_task_is_reused_not_duplicated():
+    engine = ChatEngine()
+    session_id = "retained-transport-teardown-task"
+    teardown_started = asyncio.Event()
+    teardown_release = asyncio.Event()
+    teardown_calls = 0
+
+    class CancellationResistantTransportV1:
+        primary_tasks = ()
+        _quarantined_connection_tasks_v1 = ()
+
+        async def retire_transport_async_v1(self) -> None:
+            nonlocal teardown_calls
+            teardown_calls += 1
+            teardown_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                while not teardown_release.is_set():
+                    try:
+                        await asyncio.shield(
+                            teardown_release.wait()
+                        )
+                    except asyncio.CancelledError:
+                        continue
+
+    target = CancellationResistantTransportV1()
+    engine._quarantined_transports_v1[session_id] = [
+        ("delegate", target)
+    ]
+
+    assert not await engine._teardown_session_transports_v1(
+        session_id,
+        time.monotonic() + 0.02,
+    )
+    await teardown_started.wait()
+    assert teardown_calls == 1
+    assert session_id in engine._quarantined_transports_v1
+    assert engine._transport_teardown_tasks_v1
+    assert session_id in engine._transport_teardown_session_locks_v1
+
+    assert not await engine._teardown_session_transports_v1(
+        session_id,
+        time.monotonic() + 0.02,
+    )
+    assert teardown_calls == 1
+
+    teardown_release.set()
+    tracked_task = next(
+        iter(engine._transport_teardown_tasks_v1.values())
+    )
+    await asyncio.wait_for(
+        asyncio.shield(tracked_task),
+        timeout=1,
+    )
+    assert await engine._teardown_session_transports_v1(
+        session_id,
+        time.monotonic() + 0.1,
+    )
+
+    assert teardown_calls == 1
+    assert session_id not in engine._quarantined_transports_v1
+    assert engine._transport_teardown_tasks_v1 == {}
+    assert engine._transport_teardown_session_locks_v1 == {}
+
+
+def test_timed_out_sync_transport_teardown_thread_is_not_duplicated():
+    engine = ChatEngine()
+    session_id = "retained-sync-transport-teardown-thread"
+    teardown_started = threading.Event()
+    teardown_release = threading.Event()
+    teardown_calls = 0
+
+    class BlockingTransportV1:
+        def __init__(self) -> None:
+            self.quit = threading.Event()
+            self.primary_tasks = ()
+            self._quarantined_connection_tasks_v1 = ()
+
+        def clear_data(self) -> None:
+            nonlocal teardown_calls
+            teardown_calls += 1
+            teardown_started.set()
+            teardown_release.wait()
+
+    target = BlockingTransportV1()
+    engine._quarantined_transports_v1[session_id] = [
+        ("delegate", target)
+    ]
+
+    assert not engine._teardown_session_transports_sync_v1(
+        session_id,
+        time.monotonic() + 0.02,
+    )
+    assert teardown_started.wait(timeout=1)
+    assert teardown_calls == 1
+    assert engine._transport_teardown_threads_v1
+    assert session_id in engine._transport_teardown_session_locks_v1
+
+    assert not engine._teardown_session_transports_sync_v1(
+        session_id,
+        time.monotonic() + 0.02,
+    )
+    assert teardown_calls == 1
+
+    teardown_release.set()
+    tracked_thread, _failed = next(
+        iter(engine._transport_teardown_threads_v1.values())
+    )
+    tracked_thread.join(timeout=1)
+    assert not tracked_thread.is_alive()
+    assert engine._teardown_session_transports_sync_v1(
+        session_id,
+        time.monotonic() + 0.1,
+    )
+
+    assert teardown_calls == 1
+    assert engine._transport_teardown_threads_v1 == {}
+    assert engine._transport_teardown_session_locks_v1 == {}
+
+
+@pytest.mark.asyncio
+async def test_async_transport_owner_rejects_concurrent_sync_duplicate():
+    engine = ChatEngine()
+    session_id = "async-owned-cross-mode-transport"
+    teardown_started = asyncio.Event()
+    teardown_release = asyncio.Event()
+    async_calls = 0
+    sync_calls = 0
+
+    class CrossModeTransportV1:
+        primary_tasks = ()
+        _quarantined_connection_tasks_v1 = ()
+        quit = threading.Event()
+
+        async def retire_transport_async_v1(self) -> None:
+            nonlocal async_calls
+            async_calls += 1
+            teardown_started.set()
+            await teardown_release.wait()
+
+        def clear_data(self) -> None:
+            nonlocal sync_calls
+            sync_calls += 1
+
+    target = CrossModeTransportV1()
+    engine._quarantined_transports_v1[session_id] = [
+        ("delegate", target)
+    ]
+    async_owner = asyncio.create_task(
+        engine._teardown_session_transports_v1(
+            session_id,
+            time.monotonic() + 1,
+        )
+    )
+    await teardown_started.wait()
+
+    assert not engine._teardown_session_transports_sync_v1(
+        session_id,
+        time.monotonic() + 0.1,
+    )
+    assert async_calls == 1
+    assert sync_calls == 0
+    teardown_release.set()
+    assert await async_owner
+
+    assert async_calls == 1
+    assert sync_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_transport_owner_rejects_concurrent_async_duplicate():
+    engine = ChatEngine()
+    session_id = "sync-owned-cross-mode-transport"
+    teardown_started = threading.Event()
+    teardown_release = threading.Event()
+    async_calls = 0
+    sync_calls = 0
+    sync_results: list[bool] = []
+
+    class CrossModeTransportV1:
+        primary_tasks = ()
+        _quarantined_connection_tasks_v1 = ()
+
+        def __init__(self) -> None:
+            self.quit = threading.Event()
+
+        async def retire_transport_async_v1(self) -> None:
+            nonlocal async_calls
+            async_calls += 1
+
+        def clear_data(self) -> None:
+            nonlocal sync_calls
+            sync_calls += 1
+            teardown_started.set()
+            teardown_release.wait()
+
+    target = CrossModeTransportV1()
+    engine._quarantined_transports_v1[session_id] = [
+        ("delegate", target)
+    ]
+
+    def run_sync_owner() -> None:
+        sync_results.append(
+            engine._teardown_session_transports_sync_v1(
+                session_id,
+                time.monotonic() + 1,
+            )
+        )
+
+    sync_owner = threading.Thread(target=run_sync_owner)
+    sync_owner.start()
+    assert teardown_started.wait(timeout=1)
+
+    assert not await engine._teardown_session_transports_v1(
+        session_id,
+        time.monotonic() + 0.1,
+    )
+    assert sync_calls == 1
+    assert async_calls == 0
+    teardown_release.set()
+    sync_owner.join(timeout=1)
+
+    assert not sync_owner.is_alive()
+    assert sync_results == [True]
+    assert sync_calls == 1
+    assert async_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_shutdown_stays_blocked_by_cross_mode_transport_owner():
+    controller = SessionWorkControllerV1._create_for_test_v1(
+        cleanup_timeout_seconds=0.5
+    )
+    session_id = "cross-mode-manager-transport-owner"
+    session = _secure_session(
+        session_id,
+        work_controller=controller,
+    )
+    engine = ChatEngine()
+    engine.engine_config = ChatEngineConfigModel(
+        handler_configs={},
+        logic_configs={},
+    )
+    engine._certificate_capture_enabled_v1 = True
+    engine.sessions[session_id] = session
+    manager_destroy_calls: list[str] = []
+    engine.logic_manager.destroy = lambda: manager_destroy_calls.append(
+        "logic"
+    )
+    engine.handler_manager.destroy = lambda: manager_destroy_calls.append(
+        "handler"
+    )
+    teardown_started = asyncio.Event()
+    teardown_release = asyncio.Event()
+    teardown_calls = 0
+
+    class StubbornTransportV1:
+        primary_tasks = ()
+        _quarantined_connection_tasks_v1 = ()
+
+        async def retire_transport_async_v1(self) -> None:
+            nonlocal teardown_calls
+            teardown_calls += 1
+            teardown_started.set()
+            await teardown_release.wait()
+
+    target = StubbornTransportV1()
+    engine._quarantined_transports_v1[session_id] = [
+        ("delegate", target)
+    ]
+    async_retirement = asyncio.create_task(
+        engine.retire_secure_session_v1(session_id)
+    )
+    await teardown_started.wait()
+
+    engine.retire_secure_session_sync_v1(session_id)
+    assert not engine.shutdown()
+    assert manager_destroy_calls == []
+    assert session_id in engine._transport_retirement_ids_v1
+    assert teardown_calls == 1
+
+    teardown_release.set()
+    await async_retirement
+    assert await engine.shutdown_async()
+
+    assert teardown_calls == 1
+    assert manager_destroy_calls == ["logic", "handler"]
+
+
+@pytest.mark.asyncio
+async def test_completed_transport_claims_do_not_accumulate_by_session():
+    engine = ChatEngine()
+
+    for index in range(32):
+        session_id = f"completed-transport-claim-{index}"
+        if index % 2:
+            assert engine._teardown_session_transports_sync_v1(
+                session_id,
+                time.monotonic() + 0.1,
+            )
+        else:
+            assert await engine._teardown_session_transports_v1(
+                session_id,
+                time.monotonic() + 0.1,
+            )
+
+    assert engine._transport_teardown_session_locks_v1 == {}
 
 
 def test_unusable_injected_controller_fails_secure_session_creation():

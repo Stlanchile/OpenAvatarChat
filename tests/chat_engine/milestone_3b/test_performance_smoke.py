@@ -137,6 +137,7 @@ async def test_awaited_ws_egress_performance_smoke():
             item,
             None,
             immediate_send,
+            lambda: None,
         )
     average_us = _average_microseconds(started, count)
 

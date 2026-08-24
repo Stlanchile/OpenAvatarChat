@@ -2,7 +2,9 @@ import asyncio
 import inspect
 import os
 import threading
+import time
 import uuid
+from _thread import LockType
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
 
@@ -18,11 +20,11 @@ from chat_engine.core.logic_manager import LogicManager
 from chat_engine.data_models.chat_engine_config_data import ChatEngineConfigModel
 from chat_engine.data_models.session_info_data import SessionInfoData
 from engine_utils.directory_info import DirectoryInfo
-from service.service_security.manager_authorization import (
-    require_manager_http_authorization_v1,
-)
 from service.service_security.certificate_session_control import (
     CERTIFICATE_SESSION_WORK_LIFECYCLE_ATTRIBUTE_V1,
+)
+from service.service_security.manager_authorization import (
+    require_manager_http_authorization_v1,
 )
 
 if TYPE_CHECKING:
@@ -50,7 +52,22 @@ class ChatEngine(object):
         self.sessions: Dict[str, ChatSession] = {}
         self._sessions_lock_v1 = threading.RLock()
         self._stopping_session_ids_v1: set[str] = set()
+        self._transport_retirement_ids_v1: set[str] = set()
         self._session_stop_events_v1: dict[str, threading.Event] = {}
+        self._quarantined_transports_v1: dict[
+            str, list[tuple[str, object]]
+        ] = {}
+        self._transport_teardown_tasks_v1: dict[
+            tuple[str, str, int], asyncio.Task
+        ] = {}
+        self._transport_teardown_threads_v1: dict[
+            tuple[str, str, int],
+            tuple[threading.Thread, threading.Event],
+        ] = {}
+        self._transport_teardown_state_lock_v1 = threading.RLock()
+        self._transport_teardown_session_locks_v1: dict[
+            str, LockType
+        ] = {}
 
     def initialize(self, engine_config: ChatEngineConfigModel, app=None, ui=None, parent_block=None):
         if self.states.inited:
@@ -126,6 +143,8 @@ class ChatEngine(object):
             if (
                 session_info.session_id in self.sessions
                 or session_info.session_id in self._stopping_session_ids_v1
+                or session_info.session_id
+                in self._transport_retirement_ids_v1
             ):
                 raise RuntimeError(
                     f"session {session_info.session_id} already exists"
@@ -169,6 +188,8 @@ class ChatEngine(object):
             if (
                 session_info.session_id in self.sessions
                 or session_info.session_id in self._stopping_session_ids_v1
+                or session_info.session_id
+                in self._transport_retirement_ids_v1
             ):
                 msg = f"Session {session_info.session_id} already exists."
                 raise RuntimeError(msg)
@@ -229,6 +250,7 @@ class ChatEngine(object):
             with self._sessions_lock_v1:
                 if (
                     session._stop_complete_event_v1.is_set()
+                    and session.is_fully_quiesced_v1()
                     and self.sessions.get(session_id) is session
                 ):
                     self.sessions.pop(session_id, None)
@@ -263,6 +285,7 @@ class ChatEngine(object):
             with self._sessions_lock_v1:
                 if (
                     session._stop_complete_event_v1.is_set()
+                    and session.is_fully_quiesced_v1()
                     and self.sessions.get(session_id) is session
                 ):
                     self.sessions.pop(session_id, None)
@@ -273,9 +296,146 @@ class ChatEngine(object):
     async def _teardown_session_transports_v1(
         self,
         session_id: str,
+        deadline_monotonic: float | None = None,
+    ) -> bool:
+        claim = self._try_claim_transport_teardown_v1(
+            session_id
+        )
+        if claim is None:
+            return False
+        try:
+            return await self._teardown_session_transports_owned_v1(
+                session_id,
+                deadline_monotonic,
+            )
+        finally:
+            self._release_transport_teardown_claim_v1(
+                session_id,
+                claim,
+            )
+
+    def _try_claim_transport_teardown_v1(
+        self,
+        session_id: str,
+    ) -> LockType | None:
+        with self._transport_teardown_state_lock_v1:
+            claim = self._transport_teardown_session_locks_v1.get(
+                session_id
+            )
+            if claim is None:
+                claim = threading.Lock()
+                self._transport_teardown_session_locks_v1[
+                    session_id
+                ] = claim
+            if not claim.acquire(blocking=False):
+                return None
+            return claim
+
+    def _release_transport_teardown_claim_v1(
+        self,
+        session_id: str,
+        claim: LockType,
     ) -> None:
+        with self._transport_teardown_state_lock_v1:
+            claim.release()
+            if (
+                self._transport_teardown_session_locks_v1.get(
+                    session_id
+                )
+                is not claim
+            ):
+                return
+            if not self._quarantined_transports_v1.get(
+                session_id
+            ):
+                self._transport_teardown_session_locks_v1.pop(
+                    session_id,
+                    None,
+                )
+
+    async def _teardown_session_transports_owned_v1(
+        self,
+        session_id: str,
+        deadline_monotonic: float | None = None,
+    ) -> bool:
         """Tear down client transports after fenced session cleanup."""
 
+        async def await_bounded_v1(
+            target_kind: str,
+            target: object,
+            action,
+            reason_code: str,
+        ) -> bool:
+            task_key = (session_id, target_kind, id(target))
+            thread_state = self._transport_teardown_threads_v1.get(
+                task_key
+            )
+            if thread_state is not None:
+                worker, failed = thread_state
+                if worker.is_alive():
+                    logger.error(reason_code)
+                    return False
+                self._transport_teardown_threads_v1.pop(
+                    task_key,
+                    None,
+                )
+                if not failed.is_set():
+                    return True
+            task = self._transport_teardown_tasks_v1.get(
+                task_key
+            )
+            if task is None:
+                async def invoke_action_v1() -> None:
+                    if inspect.iscoroutinefunction(action):
+                        result = action()
+                    else:
+                        result = await asyncio.to_thread(action)
+                    if inspect.isawaitable(result):
+                        await result
+
+                task = asyncio.create_task(invoke_action_v1())
+                self._transport_teardown_tasks_v1[task_key] = task
+            await asyncio.sleep(0)
+            remaining = (
+                max(0.0, deadline_monotonic - time.monotonic())
+                if deadline_monotonic is not None
+                else None
+            )
+            done, pending = await asyncio.wait(
+                (task,),
+                timeout=remaining,
+            )
+            if pending:
+                task.cancel()
+                logger.error(reason_code)
+                return False
+            for completed in done:
+                try:
+                    completed.result()
+                except asyncio.CancelledError:
+                    self._transport_teardown_tasks_v1.pop(
+                        task_key,
+                        None,
+                    )
+                    logger.error(reason_code)
+                    return False
+                except Exception:  # noqa: BLE001 - payload-free teardown
+                    self._transport_teardown_tasks_v1.pop(
+                        task_key,
+                        None,
+                    )
+                    logger.error(reason_code)
+                    return False
+            self._transport_teardown_tasks_v1.pop(
+                task_key,
+                None,
+            )
+            return True
+
+        targets = self._quarantined_transports_v1.pop(
+            session_id,
+            [],
+        )
         registries = self.handler_manager.get_enabled_handler_registries()
         for registry in registries:
             handler = registry.handler
@@ -301,45 +461,205 @@ class ChatEngine(object):
                 else None
             )
             if stream is not None:
+                targets.append(("stream", stream))
+            if session_delegate is not None:
+                targets.append(("delegate", session_delegate))
+
+        quarantined: list[tuple[str, object]] = []
+        seen_targets: set[int] = set()
+        for target_kind, target in targets:
+            if id(target) in seen_targets:
+                continue
+            seen_targets.add(id(target))
+            succeeded = True
+            if target_kind == "stream":
+                target.owns_session = False
                 shutdown_async = getattr(
-                    stream,
+                    target,
                     "shutdown_async",
                     None,
                 )
                 if callable(shutdown_async):
-                    result = shutdown_async()
-                    if inspect.isawaitable(result):
-                        await result
+                    try:
+                        succeeded = await await_bounded_v1(
+                            target_kind,
+                            target,
+                            shutdown_async,
+                            "RTC_TRANSPORT_SHUTDOWN_FAILED_V1",
+                        )
+                    except Exception:  # noqa: BLE001
+                        succeeded = False
                 else:
-                    shutdown = getattr(stream, "shutdown", None)
+                    shutdown = getattr(target, "shutdown", None)
                     if callable(shutdown):
-                        result = shutdown()
-                        if inspect.isawaitable(result):
-                            await result
-
-            if session_delegate is not None:
+                        try:
+                            succeeded = await await_bounded_v1(
+                                target_kind,
+                                target,
+                                shutdown,
+                                "RTC_TRANSPORT_SHUTDOWN_FAILED_V1",
+                            )
+                        except Exception:  # noqa: BLE001
+                            succeeded = False
+            else:
                 retire_transport = getattr(
-                    session_delegate,
+                    target,
                     "retire_transport_async_v1",
                     None,
                 )
                 if callable(retire_transport):
-                    result = retire_transport()
-                    if inspect.isawaitable(result):
-                        await result
+                    try:
+                        succeeded = await await_bounded_v1(
+                            target_kind,
+                            target,
+                            retire_transport,
+                            "CLIENT_TRANSPORT_SHUTDOWN_FAILED_V1",
+                        )
+                    except Exception:  # noqa: BLE001
+                        succeeded = False
                 else:
                     clear_data = getattr(
-                        session_delegate,
+                        target,
                         "clear_data",
                         None,
                     )
                     if callable(clear_data):
-                        clear_data()
+                        try:
+                            succeeded = await await_bounded_v1(
+                                target_kind,
+                                target,
+                                clear_data,
+                                "CLIENT_TRANSPORT_SHUTDOWN_FAILED_V1",
+                            )
+                        except Exception:  # noqa: BLE001
+                            succeeded = False
+                transport_tasks = (
+                    *getattr(target, "primary_tasks", ()),
+                    *getattr(
+                        target,
+                        "_quarantined_connection_tasks_v1",
+                        (),
+                    ),
+                )
+                if any(not task.done() for task in transport_tasks):
+                    succeeded = False
+            if not succeeded:
+                quarantined.append((target_kind, target))
+
+        if quarantined:
+            self._quarantined_transports_v1[session_id] = quarantined
+            return False
+        return True
 
     def _teardown_session_transports_sync_v1(
         self,
         session_id: str,
-    ) -> None:
+        deadline_monotonic: float | None = None,
+    ) -> bool:
+        claim = self._try_claim_transport_teardown_v1(
+            session_id
+        )
+        if claim is None:
+            return False
+        try:
+            return self._teardown_session_transports_owned_sync_v1(
+                session_id,
+                deadline_monotonic,
+            )
+        finally:
+            self._release_transport_teardown_claim_v1(
+                session_id,
+                claim,
+            )
+
+    def _teardown_session_transports_owned_sync_v1(
+        self,
+        session_id: str,
+        deadline_monotonic: float | None = None,
+    ) -> bool:
+        def invoke_bounded_v1(
+            target_kind: str,
+            target: object,
+            action,
+            reason_code: str,
+        ) -> bool:
+            thread_key = (session_id, target_kind, id(target))
+            async_task = self._transport_teardown_tasks_v1.get(
+                thread_key
+            )
+            if async_task is not None:
+                if not async_task.done():
+                    logger.error(reason_code)
+                    return False
+                self._transport_teardown_tasks_v1.pop(
+                    thread_key,
+                    None,
+                )
+                try:
+                    async_task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 - payload-free retry state
+                    pass
+                else:
+                    return True
+            existing = self._transport_teardown_threads_v1.get(
+                thread_key
+            )
+            if existing is not None:
+                worker, failed = existing
+                if worker.is_alive():
+                    logger.error(reason_code)
+                    return False
+                self._transport_teardown_threads_v1.pop(
+                    thread_key,
+                    None,
+                )
+                if not failed.is_set():
+                    return True
+
+            failed = threading.Event()
+
+            def invoke() -> None:
+                try:
+                    action()
+                except Exception:  # noqa: BLE001 - payload-free teardown
+                    failed.set()
+                    logger.error(reason_code)
+
+            worker = threading.Thread(
+                target=invoke,
+                name="secure_transport_cleanup_v1",
+                daemon=True,
+            )
+            self._transport_teardown_threads_v1[thread_key] = (
+                worker,
+                failed,
+            )
+            worker.start()
+            worker.join(
+                timeout=(
+                    max(
+                        0.0,
+                        deadline_monotonic - time.monotonic(),
+                    )
+                    if deadline_monotonic is not None
+                    else None
+                )
+            )
+            if worker.is_alive():
+                logger.error(reason_code)
+                return False
+            self._transport_teardown_threads_v1.pop(
+                thread_key,
+                None,
+            )
+            return not failed.is_set()
+
+        targets = self._quarantined_transports_v1.pop(
+            session_id,
+            [],
+        )
         for registry in self.handler_manager.get_enabled_handler_registries():
             handler = registry.handler
             if not isinstance(handler, ClientHandlerBase):
@@ -363,32 +683,118 @@ class ChatEngine(object):
                 else None
             )
             if stream is not None:
-                shutdown = getattr(stream, "shutdown", None)
-                if callable(shutdown):
-                    shutdown()
+                targets.append(("stream", stream))
             if session_delegate is not None:
-                quit_event = getattr(session_delegate, "quit", None)
+                targets.append(("delegate", session_delegate))
+
+        quarantined: list[tuple[str, object]] = []
+        seen_targets: set[int] = set()
+        for target_kind, target in targets:
+            if id(target) in seen_targets:
+                continue
+            seen_targets.add(id(target))
+            succeeded = True
+            if target_kind == "stream":
+                target.owns_session = False
+                shutdown = getattr(target, "shutdown", None)
+                if callable(shutdown):
+                    succeeded = invoke_bounded_v1(
+                        target_kind,
+                        target,
+                        shutdown,
+                        "RTC_TRANSPORT_SHUTDOWN_FAILED_V1",
+                    )
+            else:
+                quit_event = getattr(target, "quit", None)
                 if quit_event is not None:
                     quit_event.set()
                 clear_data = getattr(
-                    session_delegate,
+                    target,
                     "clear_data",
                     None,
                 )
                 if callable(clear_data):
-                    clear_data()
+                    succeeded = invoke_bounded_v1(
+                        target_kind,
+                        target,
+                        clear_data,
+                        "CLIENT_TRANSPORT_SHUTDOWN_FAILED_V1",
+                    )
+                transport_tasks = (
+                    *getattr(target, "primary_tasks", ()),
+                    *getattr(
+                        target,
+                        "_quarantined_connection_tasks_v1",
+                        (),
+                    ),
+                )
+                if any(not task.done() for task in transport_tasks):
+                    succeeded = False
+            if not succeeded:
+                quarantined.append((target_kind, target))
+
+        if quarantined:
+            self._quarantined_transports_v1[session_id] = quarantined
+            return False
+        return True
 
     def retire_secure_session_sync_v1(self, session_id: str) -> None:
+        with self._sessions_lock_v1:
+            session = self.sessions.get(session_id)
+            self._transport_retirement_ids_v1.add(session_id)
         self.stop_session(session_id)
-        self._teardown_session_transports_sync_v1(session_id)
+        transport_succeeded = self._teardown_session_transports_sync_v1(
+            session_id,
+            (
+                session.shutdown_deadline_monotonic_v1()
+                if session is not None
+                else None
+            ),
+        )
+        with self._sessions_lock_v1:
+            if (
+                session is not None
+                and (
+                    not session.is_fully_quiesced_v1()
+                    or not transport_succeeded
+                )
+            ):
+                self.sessions.setdefault(session_id, session)
+            if transport_succeeded:
+                self._transport_retirement_ids_v1.discard(
+                    session_id
+                )
 
     async def retire_secure_session_v1(self, session_id: str) -> None:
         """Retire/cancel work, then tear down the owning client transport."""
 
+        with self._sessions_lock_v1:
+            session = self.sessions.get(session_id)
+            self._transport_retirement_ids_v1.add(session_id)
         await self.stop_session_async(session_id)
-        await self._teardown_session_transports_v1(session_id)
-    
-    def shutdown(self):
+        transport_succeeded = await self._teardown_session_transports_v1(
+            session_id,
+            (
+                session.shutdown_deadline_monotonic_v1()
+                if session is not None
+                else None
+            ),
+        )
+        with self._sessions_lock_v1:
+            if (
+                session is not None
+                and (
+                    not session.is_fully_quiesced_v1()
+                    or not transport_succeeded
+                )
+            ):
+                self.sessions.setdefault(session_id, session)
+            if transport_succeeded:
+                self._transport_retirement_ids_v1.discard(
+                    session_id
+                )
+
+    def shutdown(self) -> bool:
         logger.info("Shutting down chat engine...")
         with self._sessions_lock_v1:
             secure_session_ids = tuple(
@@ -398,10 +804,23 @@ class ChatEngine(object):
             )
         for session_id in secure_session_ids:
             self.retire_secure_session_sync_v1(session_id)
+        with self._sessions_lock_v1:
+            if any(
+                session._work_controller_v1 is not None
+                and not session.is_fully_quiesced_v1()
+                for session in self.sessions.values()
+            ) or self._quarantined_transports_v1 or (
+                self._transport_retirement_ids_v1
+            ) or self._transport_teardown_tasks_v1 or (
+                self._transport_teardown_threads_v1
+            ):
+                logger.error("SECURE_SESSION_MANAGER_TEARDOWN_BLOCKED_V1")
+                return False
         self.logic_manager.destroy()
         self.handler_manager.destroy()
+        return True
 
-    async def shutdown_async(self):
+    async def shutdown_async(self) -> bool:
         logger.info("Shutting down chat engine...")
         with self._sessions_lock_v1:
             secure_session_ids = tuple(
@@ -411,5 +830,18 @@ class ChatEngine(object):
             )
         for session_id in secure_session_ids:
             await self.retire_secure_session_v1(session_id)
+        with self._sessions_lock_v1:
+            if any(
+                session._work_controller_v1 is not None
+                and not session.is_fully_quiesced_v1()
+                for session in self.sessions.values()
+            ) or self._quarantined_transports_v1 or (
+                self._transport_retirement_ids_v1
+            ) or self._transport_teardown_tasks_v1 or (
+                self._transport_teardown_threads_v1
+            ):
+                logger.error("SECURE_SESSION_MANAGER_TEARDOWN_BLOCKED_V1")
+                return False
         self.logic_manager.destroy()
         self.handler_manager.destroy()
+        return True
