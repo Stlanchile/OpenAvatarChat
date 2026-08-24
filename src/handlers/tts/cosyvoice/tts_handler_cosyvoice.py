@@ -535,10 +535,12 @@ class HandlerTTS(HandlerBase, ABC):
         ):
             terminal_item.release_once_v1(runtime)
 
-    def drain_registered_work_v1(
+    def quiesce_normal_work_v1(
         self,
         context: HandlerContext,
     ) -> None:
+        """Cancel queued synthesis without stopping the reusable consumer."""
+
         context = cast(TTSContext, context)
         for task in tuple(context.task_queue):
             if task is None:
@@ -548,6 +550,23 @@ class HandlerTTS(HandlerBase, ABC):
                 self.cancelled_work_v1[
                     task.operation_ref_v1
                 ] = True
+
+    def clear_normal_semantic_state_v1(
+        self,
+        context: HandlerContext,
+        generation: int,
+    ) -> None:
+        context = cast(TTSContext, context)
+        context.input_text = ""
+        context.task_queue.clear()
+        context._secure_generation_v1 = generation
+
+    def drain_registered_work_v1(
+        self,
+        context: HandlerContext,
+    ) -> None:
+        context = cast(TTSContext, context)
+        self.quiesce_normal_work_v1(context)
         if not context.task_queue or context.task_queue[-1] is not None:
             context.task_queue.append(None)
 

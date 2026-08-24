@@ -28,6 +28,9 @@ class SessionContext(object):
             raise RuntimeError(
                 "secure dispatch requires authenticated session admission"
             )
+        self.certificate_capture_enabled_v1 = bool(
+            certificate_capture_enabled_v1
+        )
         self.session_info = session_info
         self.session_admission = session_admission
         # Admission is installed only by the Milestone 1 authenticated

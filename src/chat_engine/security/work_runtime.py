@@ -39,6 +39,9 @@ from chat_engine.security.work_fence import (
 
 if TYPE_CHECKING:
     from chat_engine.security.authority import SecurityAuthorityV1
+    from certificate_capture.isolation import (
+        NormalApplicationAdmissionViewV1,
+    )
 
 
 _DEFAULT_WORK_LIFETIME_SECONDS_V1: dict[WorkOperationKindV1, float] = {
@@ -108,6 +111,7 @@ class SessionWorkRuntimeV1:
 
     __slots__ = (
         "__controller",
+        "__normal_application_admission",
         "__scope_var",
         "__security_authority",
     )
@@ -116,11 +120,17 @@ class SessionWorkRuntimeV1:
         self,
         controller: SessionWorkControllerV1,
         security_authority: SecurityAuthorityV1 | None = None,
+        normal_application_admission: (
+            NormalApplicationAdmissionViewV1 | None
+        ) = None,
     ) -> None:
         if not isinstance(controller, SessionWorkControllerV1):
             raise TypeError("controller must be SessionWorkControllerV1")
         self.__controller = controller
         self.__security_authority = security_authority
+        self.__normal_application_admission = (
+            normal_application_admission
+        )
         self.__scope_var: contextvars.ContextVar[
             tuple[WorkExecutionScopeV1, ...]
         ] = contextvars.ContextVar(
@@ -195,6 +205,9 @@ class SessionWorkRuntimeV1:
         return self.__controller.register_work_v1(
             operation_kind,
             deadline,
+            _admission_guard_v1=(
+                self.normal_application_admission_is_open_v1
+            ),
         )
 
     def register_child_work_v1(
@@ -224,6 +237,9 @@ class SessionWorkRuntimeV1:
             parent_fence,
             operation_kind,
             deadline,
+            _admission_guard_v1=(
+                self.normal_application_admission_is_open_v1
+            ),
         )
 
     def make_child_item_v1(
@@ -260,7 +276,10 @@ class SessionWorkRuntimeV1:
         work: RegisteredWorkV1 | WorkFenceV1 | None,
         boundary: WorkValidationBoundaryV1,
     ) -> bool:
-        if work is None:
+        if (
+            work is None
+            or not self.normal_application_admission_is_open_v1()
+        ):
             return False
         fence = work.fence if isinstance(work, RegisteredWorkV1) else work
         return self.__controller.validate_work_v1(fence, boundary)
@@ -284,6 +303,9 @@ class SessionWorkRuntimeV1:
             fence,
             boundary,
             action,
+            _admission_guard_v1=(
+                self.normal_application_admission_is_open_v1
+            ),
         )
 
     def perform_current_if_live_v1(
@@ -364,6 +386,9 @@ class SessionWorkRuntimeV1:
             WorkValidationBoundaryV1.BEFORE_EGRESS,
             action,
             abort_action_v1,
+            _admission_guard_v1=(
+                self.normal_application_admission_is_open_v1
+            ),
         )
 
     def item_egress_is_allowed_v1(
@@ -417,6 +442,17 @@ class SessionWorkRuntimeV1:
 
     def is_usable_v1(self) -> bool:
         return self.__controller.is_usable_v1()
+
+    def normal_application_admission_is_open_v1(self) -> bool:
+        admission = self.__normal_application_admission
+        return admission is None or admission.is_open_v1()
+
+    def transport_keepalive_is_allowed_v1(self) -> bool:
+        admission = self.__normal_application_admission
+        return (
+            admission is None
+            or admission.transport_keepalive_is_allowed_v1()
+        )
 
     async def wait_for_retirement_settled_async_v1(self) -> bool:
         """Expose only the controller's bounded teardown-ordering barrier."""

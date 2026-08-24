@@ -3,6 +3,7 @@ import contextlib
 import queue
 import threading
 import time
+from collections.abc import Callable
 from typing import Dict, List, Iterable
 
 from loguru import logger
@@ -52,6 +53,12 @@ from chat_engine.security.work_runtime import (
     SessionWorkRuntimeV1,
     WorkBoundItemV1,
 )
+from certificate_capture.coordinator import CaptureCoordinatorV1
+from certificate_capture.epochs import CaptureEpochV1
+from certificate_capture.isolation import (
+    NormalApplicationAdmissionViewV1,
+)
+from certificate_capture.status import CaptureStatusV1
 
 
 class ChatSession:
@@ -69,8 +76,32 @@ class ChatSession:
         _security_authority_v1: SecurityAuthorityV1 | None = None,
         _security_registrar_v1: CoreRegistrarCapabilityV1 | None = None,
         _work_controller_v1: SessionWorkControllerV1 | None = None,
+        _capture_session_live_action_v1: (
+            Callable[[Callable[[], None]], bool] | None
+        ) = None,
+        _capture_feature_enabled_v1: (
+            Callable[[], bool] | None
+        ) = None,
+        _capture_failure_terminator_v1: (
+            Callable[[], None] | None
+        ) = None,
     ):
         self.session_context = session_context
+        self._stop_state_lock_v1 = threading.Lock()
+        self._stop_finalize_lock_v1 = threading.Lock()
+        self._stop_complete_event_v1 = threading.Event()
+        self._fully_quiesced_event_v1 = threading.Event()
+        self._stop_started_v1 = False
+        self._shutdown_deadline_monotonic_v1: float | None = None
+        self._shutdown_quarantined_v1 = False
+        self._signal_shutdown_started_v1 = False
+        self._context_cleanup_threads_v1: dict[
+            str, threading.Thread
+        ] = {}
+        self._context_cleanup_failures_v1: set[str] = set()
+        self._capture_external_session_live_action_v1 = (
+            _capture_session_live_action_v1
+        )
         self._security_authority: SecurityAuthorityV1 | None = None
         self._security_registrar_v1: (
             CoreRegistrarCapabilityV1 | None
@@ -132,11 +163,53 @@ class ChatSession:
             raise RuntimeError(
                 "work controller requires a secure session"
             )
+        self._capture_coordinator_v1: CaptureCoordinatorV1 | None = None
+        self._normal_application_admission_v1: (
+            NormalApplicationAdmissionViewV1 | None
+        ) = None
+        if self.session_context.certificate_capture_enabled_v1:
+            if (
+                self._work_controller_v1 is None
+                or self._security_authority is None
+            ):
+                raise RuntimeError(
+                    "capture coordinator security authority unavailable"
+                )
+            (
+                self._capture_coordinator_v1,
+                self._normal_application_admission_v1,
+            ) = CaptureCoordinatorV1._create_for_session_v1(
+                work_controller=self._work_controller_v1,
+                feature_enabled_v1=(
+                    _capture_feature_enabled_v1
+                    if _capture_feature_enabled_v1 is not None
+                    else (
+                        lambda: self.session_context
+                        .certificate_capture_enabled_v1
+                    )
+                ),
+                security_authority_usable_v1=(
+                    self._security_authority.is_usable_v1
+                ),
+                session_live_action_v1=(
+                    self._perform_if_capture_session_live_v1
+                ),
+                quiescence_drain_v1=(
+                    self._drain_capture_transition_work_v1
+                ),
+                semantic_cleanup_v1=(
+                    self._clear_capture_transition_semantic_state_v1
+                ),
+                failure_terminator_v1=(
+                    _capture_failure_terminator_v1
+                ),
+            )
         self._work_runtime_v1: SessionWorkRuntimeV1 | None = None
         if self._work_controller_v1 is not None:
             self._work_runtime_v1 = SessionWorkRuntimeV1(
                 self._work_controller_v1,
                 self._security_authority,
+                self._normal_application_admission_v1,
             )
         self.signal_manager = SignalManager(
             self.session_context.session_clock,
@@ -153,19 +226,57 @@ class ChatSession:
         self.data_sinks: Dict[ChatDataType, List[DataSink]] = {}
         self.handlers: Dict[str, HandlerRecord] = {}
         self._playback_begin_event_ids: Dict[str, str] = {}
-        self._stop_state_lock_v1 = threading.Lock()
-        self._stop_finalize_lock_v1 = threading.Lock()
-        self._stop_complete_event_v1 = threading.Event()
-        self._fully_quiesced_event_v1 = threading.Event()
-        self._stop_started_v1 = False
-        self._shutdown_deadline_monotonic_v1: float | None = None
-        self._shutdown_quarantined_v1 = False
-        self._signal_shutdown_started_v1 = False
-        self._context_cleanup_threads_v1: dict[
-            str, threading.Thread
-        ] = {}
-        self._context_cleanup_failures_v1: set[str] = set()
         self._register_playback_auto_recorder()
+
+    def _perform_if_capture_session_live_v1(
+        self,
+        action: Callable[[], None],
+    ) -> bool:
+        ran: list[bool] = []
+
+        def perform_locally() -> None:
+            with self._stop_state_lock_v1:
+                if (
+                    self._stop_started_v1
+                    or not self.session_context.shared_states.active
+                ):
+                    return
+                action()
+                ran.append(True)
+
+        external = self._capture_external_session_live_action_v1
+        if external is not None:
+            if not external(perform_locally):
+                return False
+        else:
+            perform_locally()
+        return bool(ran)
+
+    async def _begin_certificate_capture_v1(self) -> CaptureEpochV1:
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise RuntimeError("capture coordinator unavailable")
+        return await coordinator.begin_capture_v1()
+
+    async def _end_certificate_capture_v1(
+        self,
+        capture_epoch: CaptureEpochV1 | None = None,
+        *,
+        capture_seq: int | None = None,
+    ) -> CaptureStatusV1:
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise RuntimeError("capture coordinator unavailable")
+        return await coordinator.end_capture_v1(
+            capture_epoch,
+            capture_seq=capture_seq,
+        )
+
+    def _certificate_capture_status_v1(self) -> CaptureStatusV1:
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise RuntimeError("capture coordinator unavailable")
+        return coordinator.snapshot_v1()
 
     @classmethod
     def handler_pumper(
@@ -847,6 +958,14 @@ class ChatSession:
             return
         deadline = self._begin_shutdown_budget_v1()
         try:
+            if self._capture_coordinator_v1 is not None:
+                capture_cleanup_succeeded = (
+                    self._capture_coordinator_v1.shutdown_v1()
+                )
+                if not capture_cleanup_succeeded:
+                    logger.error(
+                        "CAPTURE_COORDINATOR_CLEANUP_FAILED_V1"
+                    )
             if self._work_controller_v1 is not None:
                 cleanup_succeeded = self._work_controller_v1.shutdown(
                     self._prepare_retired_work_cleanup_v1
@@ -873,6 +992,15 @@ class ChatSession:
             return
         deadline = self._begin_shutdown_budget_v1()
         try:
+            if self._capture_coordinator_v1 is not None:
+                capture_cleanup_succeeded = (
+                    await self._capture_coordinator_v1
+                    .shutdown_async_v1()
+                )
+                if not capture_cleanup_succeeded:
+                    logger.error(
+                        "CAPTURE_COORDINATOR_CLEANUP_FAILED_V1"
+                    )
             if self._work_controller_v1 is not None:
                 cleanup_succeeded = (
                     await self._work_controller_v1.shutdown_async(
@@ -971,6 +1099,101 @@ class ChatSession:
             except (queue.Empty, asyncio.QueueEmpty):
                 return
             self._release_queued_work_v1(queued_item)
+
+    def _drain_capture_transition_work_v1(
+        self,
+        new_epoch,
+    ) -> None:
+        """Drain fenced generic queues without stopping authenticated transport."""
+
+        controller = self._work_controller_v1
+        admission = self._normal_application_admission_v1
+        if (
+            controller is None
+            or admission is None
+            or admission.is_open_v1()
+            or controller.current_epoch_v1() is not new_epoch
+        ):
+            raise RuntimeError("capture quiescence authority mismatch")
+
+        for handler_record in tuple(self.handlers.values()):
+            self._drain_handler_input_queue_v1(handler_record)
+            handler = handler_record.env.handler
+            context = handler_record.env.context
+            quiesce = getattr(
+                handler,
+                "quiesce_normal_work_v1",
+                None,
+            )
+            if callable(quiesce):
+                quiesce(context)
+            delegate = getattr(
+                context,
+                "client_session_delegate",
+                None,
+            )
+            drain_delegate = getattr(
+                delegate,
+                "drain_application_output_v1",
+                None,
+            )
+            if callable(drain_delegate):
+                drain_delegate()
+        self.signal_manager.drain_registered_work_v1()
+
+    def _clear_capture_transition_semantic_state_v1(
+        self,
+        new_epoch,
+    ) -> None:
+        """Clear stale generic semantic state after the M3 barrier completes."""
+
+        controller = self._work_controller_v1
+        admission = self._normal_application_admission_v1
+        if (
+            controller is None
+            or admission is None
+            or admission.is_open_v1()
+            or controller.current_epoch_v1() is not new_epoch
+        ):
+            raise RuntimeError("capture semantic authority mismatch")
+
+        for handler_record in tuple(self.handlers.values()):
+            handler = handler_record.env.handler
+            context = handler_record.env.context
+            clear_handler = getattr(
+                handler,
+                "clear_normal_semantic_state_v1",
+                None,
+            )
+            if callable(clear_handler):
+                clear_handler(context, new_epoch.generation)
+            delegate = getattr(
+                context,
+                "client_session_delegate",
+                None,
+            )
+            clear_delegate = getattr(
+                delegate,
+                "clear_normal_semantic_state_v1",
+                None,
+            )
+            if callable(clear_delegate):
+                clear_delegate(new_epoch.generation)
+            (
+                handler_record.env.core_data_submitter
+                .clear_normal_semantic_state_v1()
+            )
+
+        self.stream_manager.clear_normal_semantic_state_v1()
+        if not (
+            self.session_context.session_history
+            .clear_pending_stream_accumulators_v1(
+                _security_writer_v1=(
+                    self._history_producer_authority
+                ),
+            )
+        ):
+            raise RuntimeError("pending history cleanup denied")
 
     def _prepare_retired_work_cleanup_v1(self) -> None:
         """Stop consumers and release queued application work after retirement."""

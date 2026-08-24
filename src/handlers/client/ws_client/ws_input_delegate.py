@@ -2060,6 +2060,30 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             return contextlib.nullcontext(None)
         return scope_factory()
 
+    def _normal_application_admission_is_open_v1(self) -> bool:
+        if self.work_runtime_v1 is None:
+            return True
+        if self.data_submitter is None:
+            return False
+        check = getattr(
+            self.data_submitter,
+            "normal_application_admission_is_open_v1",
+            None,
+        )
+        return bool(callable(check) and check())
+
+    def _transport_keepalive_is_allowed_v1(self) -> bool:
+        if self.work_runtime_v1 is None:
+            return True
+        if self.data_submitter is None:
+            return False
+        check = getattr(
+            self.data_submitter,
+            "transport_keepalive_is_allowed_v1",
+            None,
+        )
+        return bool(callable(check) and check())
+
     def _perform_ingress_mutation_v1(self, action) -> bool:
         if self.work_runtime_v1 is None:
             action()
@@ -2081,34 +2105,77 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             return True
 
         def reset_generation_state() -> None:
-            self.text_buffer.clear()
-            self.binary_stream_assembler.clear()
-            self.last_human_text = None
-            self.motion_welcome_sent = False
-            self.motion_welcome_payload = None
-            self._active_playback_stream_keys.clear()
-            self._cancelled_stream_keys.clear()
-            if (
-                self.initialized
-                and self.audio_format == "OPUS"
-                and is_opus_available()
-            ):
-                self._opus_decoder = OpusDecoder(
-                    sample_rate=16000,
-                    channels=1,
-                )
-                self._opus_encoder = OpusEncoder(
-                    sample_rate=24000,
-                    channels=1,
-                    frame_size_ms=self.opus_frame_size_ms,
-                )
-            self._secure_generation_v1 = generation
+            self.clear_normal_semantic_state_v1(generation)
 
         return runtime.perform_if_live_v1(
             work,
             WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
             reset_generation_state,
         )
+
+    def clear_normal_semantic_state_v1(self, generation: int) -> None:
+        """Clear generic input/output assembly without closing transport."""
+
+        self.text_buffer.clear()
+        self.binary_stream_assembler.clear()
+        self.last_human_text = None
+        self.motion_welcome_sent = False
+        self.motion_welcome_payload = None
+        self._active_playback_stream_keys.clear()
+        self._cancelled_stream_keys.clear()
+        if (
+            self.initialized
+            and self.audio_format == "OPUS"
+            and is_opus_available()
+        ):
+            self._opus_decoder = OpusDecoder(
+                sample_rate=16000,
+                channels=1,
+            )
+            self._opus_encoder = OpusEncoder(
+                sample_rate=24000,
+                channels=1,
+                frame_size_ms=self.opus_frame_size_ms,
+            )
+        self._secure_generation_v1 = generation
+
+    async def _process_transport_control_message_v1(
+        self,
+        websocket: WebSocket,
+        connection_info: ConnectionInfo,
+        raw_msg,
+    ) -> bool:
+        """Handle only non-application keepalive while the mode gate is shut."""
+
+        if not self._transport_keepalive_is_allowed_v1():
+            return False
+        raw_text = raw_msg.get("text") if isinstance(raw_msg, dict) else None
+        if not isinstance(raw_text, str):
+            return False
+        try:
+            decoded = json.loads(raw_text)
+            header = decoded.get("header")
+            if (
+                not isinstance(header, dict)
+                or header.get("name") != "TriggerHeartbeat"
+            ):
+                return False
+            message = parse_message(decoded)
+        except Exception:
+            return False
+        if not isinstance(message, TriggerHeartbeat):
+            return False
+
+        connection_info.last_heartbeat_time = time.time()
+        response = AvatarHeartbeat(
+            header=MessageHeader(
+                name="AvatarHeartbeat",
+                request_id=message.header.request_id,
+            )
+        )
+        async with self.websocket_send_lock:
+            await websocket.send_json(serialize_message(response))
+        return False
 
     async def _process_ws_input_message_v1(
         self,
@@ -2248,6 +2315,14 @@ class WsInputSessionDelegate(ClientSessionDelegate):
             try:
                 # 接收消息 (可能是 JSON 或二进制)
                 raw_msg = await asyncio.wait_for(websocket.receive(), timeout=0.1)
+                if not self._normal_application_admission_is_open_v1():
+                    if await self._process_transport_control_message_v1(
+                        websocket,
+                        connection_info,
+                        raw_msg,
+                    ):
+                        break
+                    continue
                 with self._ingress_work_scope_v1() as scope:
                     if self.work_runtime_v1 is not None and scope is None:
                         continue

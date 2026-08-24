@@ -374,3 +374,11 @@ class WsClientHandler(ClientHandlerBase):
             context.client_session_delegate.clear_data()
         
         logger.info(f"Context destroyed for session {context.session_id}")
+
+    def quiesce_normal_work_v1(
+        self,
+        context: HandlerContext,
+    ) -> None:
+        context = cast(WsClientContext, context)
+        if context.client_session_delegate is not None:
+            context.client_session_delegate.drain_application_output_v1()

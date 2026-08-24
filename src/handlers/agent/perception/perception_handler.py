@@ -568,6 +568,27 @@ class PerceptionHandler(HandlerBase, ABC):
         # 限制缓冲大小
         while len(context.frame_buffer) > context.config.max_buffer_frames:
             context.frame_buffer.pop(0)
+
+    def clear_normal_semantic_state_v1(
+        self,
+        context: HandlerContext,
+        generation: int,
+    ) -> None:
+        """Clear fenced generic perception state without changing config."""
+
+        context = cast(PerceptionContext, context)
+        context.frame_buffer.clear()
+        context.current_perception = None
+        context.previous_frame = None
+        context.last_event_times.clear()
+        context.last_summary_time = 0.0
+        context.last_frame_time = 0.0
+        context.frame_stall_warned = False
+        context.frame_resumed_after_stall = False
+        context.fps_start_time = 0.0
+        context.fps_frame_count = 0
+        context.current_fps = 0.0
+        context._secure_generation_v1 = generation
     
     def _generate_and_emit_perception(self, context: PerceptionContext,
                                       output_definitions: Dict[ChatDataType, HandlerDataInfo]):

@@ -756,6 +756,12 @@ class ClientHandlerRtc(ClientHandlerBase):
         if stream is not None:
             stream.drain_application_egress_v1()
 
+    def quiesce_normal_work_v1(
+        self,
+        context: HandlerContext,
+    ) -> None:
+        self.drain_registered_work_v1(context)
+
     def destroy_context(self, context: HandlerContext):
         self.drain_registered_work_v1(context)
 

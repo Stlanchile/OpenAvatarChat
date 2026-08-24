@@ -56,6 +56,8 @@ class SessionGenerationOverflowV1(RuntimeError):
 
 class GenerationRetirementReasonV1(str, Enum):
     GENERIC = "GENERIC"
+    CAPTURE_BEGIN = "CAPTURE_BEGIN"
+    CAPTURE_END = "CAPTURE_END"
     SESSION_SHUTDOWN = "SESSION_SHUTDOWN"
 
 
@@ -425,6 +427,49 @@ class SessionWorkControllerV1:
                 and not self._destroyed
             )
 
+    def _perform_current_epoch_control_action_v1(
+        self,
+        expected_epoch: SessionEpochV1,
+        action: Callable[[], None],
+    ) -> bool:
+        """Run one short core control-plane action on the exact live epoch.
+
+        Capture mode uses this only to linearize its separate admission gate
+        with M3 registration/retirement. It neither retires a generation nor
+        treats generation publication as capture readiness.
+        """
+
+        if not isinstance(expected_epoch, SessionEpochV1) or not callable(action):
+            return False
+        with self._lock:
+            self._expire_due_cleanups_locked_v1(self._now_v1())
+            if (
+                self._current_epoch is not expected_epoch
+                or not self._active
+                or not self._admission_open
+                or self._failed
+                or self._shutdown_started
+                or self._destroyed
+                or self._retirement_pending_generation is not None
+            ):
+                return False
+            action()
+            return True
+
+    def _mode_admission_is_open_locked_v1(
+        self,
+        admission_guard_v1: Callable[[], bool] | None,
+    ) -> bool:
+        if admission_guard_v1 is None:
+            return True
+        try:
+            admitted = bool(admission_guard_v1())
+        except Exception:
+            admitted = False
+        if not admitted:
+            self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
+        return admitted
+
     def snapshot_v1(self) -> SessionWorkControllerSnapshotV1:
         with self._lock:
             self._expire_due_cleanups_locked_v1(self._now_v1())
@@ -487,6 +532,8 @@ class SessionWorkControllerV1:
         self,
         operation_kind: WorkOperationKindV1,
         deadline_monotonic: float,
+        *,
+        _admission_guard_v1: Callable[[], bool] | None = None,
     ) -> RegisteredWorkV1:
         """Atomically bind a new operation and cleanup-owning lease."""
 
@@ -502,6 +549,12 @@ class SessionWorkControllerV1:
                 now = self._now_v1()
                 self._expire_due_cleanups_locked_v1(now)
                 self._ensure_normal_admission_locked_v1()
+                if not self._mode_admission_is_open_locked_v1(
+                    _admission_guard_v1
+                ):
+                    raise WorkAdmissionDeniedV1(
+                        "normal application admission is closed"
+                    )
                 if not isinstance(operation_kind, WorkOperationKindV1):
                     self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
                     raise WorkAdmissionDeniedV1("invalid work operation kind")
@@ -570,6 +623,8 @@ class SessionWorkControllerV1:
         parent_fence: object,
         operation_kind: WorkOperationKindV1,
         deadline_monotonic: float,
+        *,
+        _admission_guard_v1: Callable[[], bool] | None = None,
     ) -> RegisteredWorkV1:
         """Atomically register work under one exact live parent generation.
 
@@ -596,6 +651,12 @@ class SessionWorkControllerV1:
                 now = self._now_v1()
                 self._expire_due_cleanups_locked_v1(now)
                 self._ensure_normal_admission_locked_v1()
+                if not self._mode_admission_is_open_locked_v1(
+                    _admission_guard_v1
+                ):
+                    raise WorkAdmissionDeniedV1(
+                        "normal application admission is closed"
+                    )
                 parent = self._registered_state_for_fence_locked_v1(
                     parent_fence
                 )
@@ -876,6 +937,8 @@ class SessionWorkControllerV1:
         fence: object,
         boundary: WorkValidationBoundaryV1,
         action: Callable[[], Any],
+        *,
+        _admission_guard_v1: Callable[[], bool] | None = None,
     ) -> bool:
         """Serialize a short protected side effect against retirement.
 
@@ -893,10 +956,15 @@ class SessionWorkControllerV1:
             )
             now = self._now_v1()
             self._expire_due_cleanups_locked_v1(now)
-            if not self._work_fence_is_live_locked_v1(
-                fence,
-                now,
-                audit_denial=True,
+            if (
+                not self._mode_admission_is_open_locked_v1(
+                    _admission_guard_v1
+                )
+                or not self._work_fence_is_live_locked_v1(
+                    fence,
+                    now,
+                    audit_denial=True,
+                )
             ):
                 return False
             if nested_protected_action:
@@ -915,6 +983,8 @@ class SessionWorkControllerV1:
         boundary: WorkValidationBoundaryV1,
         action: Callable[[], Awaitable[Any]],
         abort_action_v1: Callable[[], Awaitable[Any] | Any],
+        *,
+        _admission_guard_v1: Callable[[], bool] | None = None,
     ) -> bool:
         """Run one awaited side effect without racing retirement publication.
 
@@ -941,10 +1011,15 @@ class SessionWorkControllerV1:
         with self._lock:
             now = self._now_v1()
             self._expire_due_cleanups_locked_v1(now)
-            if not self._work_fence_is_live_locked_v1(
-                fence,
-                now,
-                audit_denial=True,
+            if (
+                not self._mode_admission_is_open_locked_v1(
+                    _admission_guard_v1
+                )
+                or not self._work_fence_is_live_locked_v1(
+                    fence,
+                    now,
+                    audit_denial=True,
+                )
             ):
                 return False
             registered = self._registered_state_for_fence_locked_v1(fence)
@@ -1219,6 +1294,41 @@ class SessionWorkControllerV1:
                 return False
             state.released = True
             self._cleanup_tokens.pop(state.token.token_id, None)
+            return True
+
+    def _close_cleanup_participant_v1(self, token: object) -> bool:
+        """Abandon one exact core participant during fail-closed teardown.
+
+        This private seam never authorizes ordinary work. It lets the
+        participant owner relinquish its authenticated token whether task
+        cancellation happened just before or just after retirement
+        publication, so an abandoned control transition cannot manufacture a
+        cleanup-token leak.
+        """
+
+        with self._lock:
+            self._ensure_no_protected_action_reentry_locked_v1()
+            if self._destroyed:
+                return False
+            state = self._cleanup_token_state_locked_v1(token)
+            if state is None or state.released:
+                return False
+            generation = state.token.session_epoch.generation
+            record = self._retired_generations.get(generation)
+            if record is not None:
+                if (
+                    state.token.token_id
+                    not in record.outstanding_cleanup_token_ids
+                ):
+                    return False
+                record.outstanding_cleanup_token_ids.remove(
+                    state.token.token_id
+                )
+            state.released = True
+            self._cleanup_tokens.pop(state.token.token_id, None)
+            if record is not None:
+                self._maybe_complete_cleanup_locked_v1(record)
+            self._condition.notify_all()
             return True
 
     def _fail_generation_overflow_locked_v1(self) -> None:

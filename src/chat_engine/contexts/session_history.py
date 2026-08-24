@@ -211,6 +211,20 @@ class SessionHistory:
         with self._accumulator_lock:
             self._stream_chunk_hashes.pop(stream_key, None)
             return self._stream_accumulators.pop(stream_key, None)
+
+    def clear_pending_stream_accumulators_v1(
+        self,
+        *,
+        _security_writer_v1: object = None,
+    ) -> bool:
+        """Discard unfinished generation-local text without erasing history."""
+
+        if not self._security_write_allowed_v1(_security_writer_v1):
+            return False
+        with self._accumulator_lock:
+            self._stream_accumulators.clear()
+            self._stream_chunk_hashes.clear()
+        return True
     
     def add_event(
         self,

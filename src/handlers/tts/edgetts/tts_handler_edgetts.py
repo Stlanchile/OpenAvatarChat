@@ -303,6 +303,17 @@ class HandlerTTS(HandlerBase, ABC):
         finally:
             runtime.release_work_v1(terminal_work)
 
+    def clear_normal_semantic_state_v1(
+        self,
+        context: HandlerContext,
+        generation: int,
+    ) -> None:
+        """Discard unfinished generic text after its generation is fenced."""
+
+        context = cast(TTSContext, context)
+        context.input_text = ""
+        context._secure_generation_v1 = generation
+
     def destroy_context(self, context: HandlerContext):
         context = cast(TTSContext, context)
         logger.info('destroy context')

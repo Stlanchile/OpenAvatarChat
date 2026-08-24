@@ -454,7 +454,7 @@ class HandlerTTS(HandlerBase, ABC):
                     context.api_links.pop(key, None)
                     return
 
-    def drain_registered_work_v1(
+    def quiesce_normal_work_v1(
         self,
         context: HandlerContext,
     ) -> None:
@@ -464,6 +464,21 @@ class HandlerTTS(HandlerBase, ABC):
                 session.reset()
             except Exception:
                 logger.warning("BAILIAN_TTS_CANCEL_FAILED")
+
+    def clear_normal_semantic_state_v1(
+        self,
+        context: HandlerContext,
+        generation: int,
+    ) -> None:
+        context = cast(TTSContext, context)
+        context.api_links.clear()
+        context._secure_generation_v1 = generation
+
+    def drain_registered_work_v1(
+        self,
+        context: HandlerContext,
+    ) -> None:
+        self.quiesce_normal_work_v1(context)
 
     def destroy_context(self, context: HandlerContext):
         context = cast(TTSContext, context)

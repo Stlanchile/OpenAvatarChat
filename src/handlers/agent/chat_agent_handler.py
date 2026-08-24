@@ -661,6 +661,18 @@ class ChatAgentHandler(HandlerBase, ABC):
         context._proactive_wake.clear()
         context._secure_generation_v1 = generation
 
+    def clear_normal_semantic_state_v1(
+        self,
+        context: HandlerContext,
+        generation: int,
+    ) -> None:
+        """Clear fenced generic/proactive state while retaining chat memory."""
+
+        self._reset_generation_state_v1(
+            cast(ChatAgentContext, context),
+            generation,
+        )
+
     # ── PERCEPTION_CONTEXT ──
 
     def _handle_perception_context(self, context: ChatAgentContext, inputs: ChatData):

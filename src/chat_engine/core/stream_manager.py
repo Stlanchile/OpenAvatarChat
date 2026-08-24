@@ -677,6 +677,13 @@ class ChatStreamer:
     def data_definition(self):
         return self._data_definition
 
+    def clear_normal_semantic_state_v1(self) -> None:
+        """Discard generation-local stream ancestry after fenced cleanup."""
+
+        self._input_stream_ids.clear()
+        self._input_security_refs.clear()
+        self._current_stream.stream = None
+
     def update_input_stream(self, chat_data: ChatData):
         self._cleanup_input_streams()
         if chat_data.stream_id is None:
@@ -1542,6 +1549,19 @@ class StreamManager:
         self._stream_storage.streams.clear()
         self._stream_storage._finished_at.clear()
 
+    def clear_normal_semantic_state_v1(self) -> None:
+        """Clear stale generic stream graph without closing M2 authority."""
+
+        for stream in self._stream_storage.streams.values():
+            stream._metadata.clear()
+            stream._inheritable_metadata.clear()
+            stream.source_streams.clear()
+            stream.ancestor_streams.clear()
+            stream.cancelable_ancestors.clear()
+            stream.ref_by.clear()
+        self._stream_storage.streams.clear()
+        self._stream_storage._finished_at.clear()
+
     def find_stream(self, stream_id: ChatStreamIdentity):
         if stream_id is None:
             return None
@@ -2111,6 +2131,22 @@ class ChatDataSubmitter:
     def get_streamer_by_name(self, name: str):
         return self.streamer_name_map.get(name, None)
 
+    def normal_application_admission_is_open_v1(self) -> bool:
+        runtime = self._work_runtime_v1
+        return (
+            runtime is None
+            or runtime.normal_application_admission_is_open_v1()
+        )
+
+    def transport_keepalive_is_allowed_v1(self) -> bool:
+        runtime = self._work_runtime_v1
+        return runtime is None or runtime.transport_keepalive_is_allowed_v1()
+
+    def clear_normal_semantic_state_v1(self) -> None:
+        for streamer_list in self.streamers.values():
+            for streamer in streamer_list:
+                streamer.clear_normal_semantic_state_v1()
+
     def submit(
         self,
         data: Union[
@@ -2398,6 +2434,15 @@ class ChatDataSubmitterConsumerViewV1:
 
     def ingress_work_scope_v1(self):
         return self.__submitter.ingress_work_scope_v1()
+
+    def normal_application_admission_is_open_v1(self) -> bool:
+        return (
+            self.__submitter
+            .normal_application_admission_is_open_v1()
+        )
+
+    def transport_keepalive_is_allowed_v1(self) -> bool:
+        return self.__submitter.transport_keepalive_is_allowed_v1()
 
     def make_current_work_item_v1(
         self,

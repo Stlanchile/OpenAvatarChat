@@ -29,6 +29,7 @@ from service.service_security.manager_authorization import (
 
 if TYPE_CHECKING:
     from service.service_security.certificate_session_authority import (
+        CertificateSessionAuthorityV1,
         ConsumedSessionAdmissionV1,
     )
 
@@ -48,6 +49,10 @@ class ChatEngine(object):
         self.logic_manager: LogicManager = LogicManager(self)
         self.states = ChatEngineBaseStates()
         self._certificate_capture_enabled_v1 = False
+        self._certificate_session_authority_v1: (
+            CertificateSessionAuthorityV1 | None
+        ) = None
+        self._capture_failure_tasks_v1: set[asyncio.Task] = set()
 
         self.sessions: Dict[str, ChatSession] = {}
         self._sessions_lock_v1 = threading.RLock()
@@ -82,6 +87,27 @@ class ChatEngine(object):
                 False,
             )
         )
+        if self._certificate_capture_enabled_v1 and app is not None:
+            control_runtime = getattr(
+                app.state,
+                "certificate_session_control_v1",
+                None,
+            )
+            candidate_authority = getattr(
+                control_runtime,
+                "authority",
+                None,
+            )
+            if callable(
+                getattr(
+                    candidate_authority,
+                    "perform_if_consumed_session_live_v1",
+                    None,
+                )
+            ):
+                self._certificate_session_authority_v1 = (
+                    candidate_authority
+                )
 
         if app:
             @app.get("/version")
@@ -158,7 +184,48 @@ class ChatEngine(object):
                 ),
             )
 
-            session = ChatSession(session_context, self.engine_config)
+            session_authority = self._certificate_session_authority_v1
+            capture_session_live_action = None
+            if (
+                self._certificate_capture_enabled_v1
+                and session_admission is not None
+                and session_authority is not None
+            ):
+                capture_session_live_action = (
+                    lambda action: (
+                        session_authority
+                        .perform_if_consumed_session_live_v1(
+                            session_admission,
+                            action,
+                        )
+                    )
+                )
+            capture_failure_terminator = None
+            if (
+                self._certificate_capture_enabled_v1
+                and session_admission is not None
+            ):
+                capture_failure_terminator = (
+                    lambda: self
+                    ._schedule_capture_failure_termination_v1(
+                        session_info.session_id,
+                        session_admission,
+                    )
+                )
+
+            session = ChatSession(
+                session_context,
+                self.engine_config,
+                _capture_session_live_action_v1=(
+                    capture_session_live_action
+                ),
+                _capture_feature_enabled_v1=(
+                    lambda: self._certificate_capture_enabled_v1
+                ),
+                _capture_failure_terminator_v1=(
+                    capture_failure_terminator
+                ),
+            )
             handlers = self.handler_manager.get_enabled_handler_registries()
             for registry in handlers:
                 if isinstance(registry.handler, ClientHandlerBase):
@@ -176,6 +243,52 @@ class ChatEngine(object):
             #     session.create_logic_contexts(handlers, registry.logic, registry.base_info, registry.logic_config)
             self.sessions[session_info.session_id] = session
             return session
+
+    def _schedule_capture_failure_termination_v1(
+        self,
+        session_id: str,
+        session_admission: "ConsumedSessionAdmissionV1",
+    ) -> None:
+        """Schedule destructive exact-session retirement outside coordinator locks."""
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.error("CAPTURE_FAILURE_TERMINATION_UNAVAILABLE_V1")
+            return
+        task = loop.create_task(
+            self._retire_capture_failed_session_v1(
+                session_id,
+                session_admission,
+            )
+        )
+        self._capture_failure_tasks_v1.add(task)
+
+        def finish(done: asyncio.Task) -> None:
+            self._capture_failure_tasks_v1.discard(done)
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception:
+                logger.error("CAPTURE_FAILURE_TERMINATION_FAILED_V1")
+
+        task.add_done_callback(finish)
+
+    async def _retire_capture_failed_session_v1(
+        self,
+        session_id: str,
+        session_admission: "ConsumedSessionAdmissionV1",
+    ) -> None:
+        authority = self._certificate_session_authority_v1
+        if authority is None:
+            await self.retire_secure_session_v1(session_id)
+            return
+        async with authority.serialized_transition():
+            authority._revoke_consumed_session_for_runtime_failure_v1(
+                session_admission
+            )
+            await self.retire_secure_session_v1(session_id)
 
     def create_client_session(
         self,

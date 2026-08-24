@@ -547,6 +547,12 @@ class SecurityAuthorityV1:
     def audit_events_v1(self) -> tuple[SecurityAuditEventV1, ...]:
         return self._audit.snapshot()
 
+    def is_usable_v1(self) -> bool:
+        """Return only whether this session-local M2 authority remains live."""
+
+        with self._lock:
+            return not self._closed and not self._failed
+
     def close(self) -> None:
         with self._lock:
             self._closed = True

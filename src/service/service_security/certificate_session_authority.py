@@ -614,6 +614,87 @@ class CertificateSessionAuthorityV1:
                 )
             return state.ownership
 
+    def perform_if_consumed_session_live_v1(
+        self,
+        admission: ConsumedSessionAdmissionV1,
+        action: Callable[[], None],
+    ) -> bool:
+        """Linearize one short runtime action against revoke/replacement.
+
+        The callback executes while the existing Milestone 1 authority lock
+        proves that the exact consumed session remains current. It must not
+        block, await, or perform transport cleanup.
+        """
+
+        if not callable(action):
+            return False
+        with self._lock:
+            try:
+                self._ensure_open_locked()
+                now_epoch, now_monotonic = self._read_clocks_locked()
+                self._cleanup_expired_locked(
+                    now_epoch,
+                    now_monotonic,
+                )
+            except SessionAuthorityErrorV1:
+                return False
+            state = (
+                self._sessions.get(admission.session_id)
+                if isinstance(admission, ConsumedSessionAdmissionV1)
+                else None
+            )
+            if (
+                state is None
+                or not isinstance(
+                    admission.channel,
+                    SessionAdmissionChannelV1,
+                )
+                or state.ownership.owner_issuer
+                != admission.owner_issuer
+                or state.ownership.owner_subject
+                != admission.owner_subject
+            ):
+                return False
+            action()
+            return True
+
+    def _revoke_consumed_session_for_runtime_failure_v1(
+        self,
+        admission: ConsumedSessionAdmissionV1,
+    ) -> bool:
+        """Remove exact live authority after a fail-closed runtime failure.
+
+        This internal seam is valid only inside ``serialized_transition`` and
+        accepts no client capability or caller-selected identity.
+        """
+
+        with self._lock:
+            self._ensure_transition_access_locked()
+            try:
+                self._ensure_open_locked()
+                now_epoch, now_monotonic = self._read_clocks_locked()
+                self._cleanup_expired_locked(
+                    now_epoch,
+                    now_monotonic,
+                )
+            except SessionAuthorityErrorV1:
+                return False
+            state = (
+                self._sessions.get(admission.session_id)
+                if isinstance(admission, ConsumedSessionAdmissionV1)
+                else None
+            )
+            if (
+                state is None
+                or state.ownership.owner_issuer
+                != admission.owner_issuer
+                or state.ownership.owner_subject
+                != admission.owner_subject
+            ):
+                return False
+            self._remove_session_locked(admission.session_id)
+            return True
+
     def _consume_admission_ticket(
         self,
         *,
