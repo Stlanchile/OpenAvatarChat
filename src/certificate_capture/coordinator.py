@@ -23,6 +23,9 @@ from certificate_capture.contracts.admission_notice import (
     AdmissionNoticeExtractionV1,
     StoredAdmissionNoticeExtractionV1,
 )
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+)
 from certificate_capture.contracts.evidence import EvidenceFrameV1
 from certificate_capture.contracts.inference import InferenceIdentityV1
 from certificate_capture.contracts.ocr import (
@@ -249,8 +252,8 @@ class CaptureCoordinatorV1:
         "_accepted_frame_bytes_v1",
         "_active_capture_capability_v1",
         "_active_frame_upload_permits_v1",
-        "_admission_extraction_service_v1",
         "_active_transition",
+        "_admission_extraction_service_v1",
         "_audit",
         "_capability_authority_v1",
         "_capture_epoch",
@@ -623,6 +626,10 @@ class CaptureCoordinatorV1:
     ) -> BeginCaptureGrantV1:
         """Replay-protected Begin that delegates quiescence to Milestone 4A."""
 
+        if profile_id != HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.UNSUPPORTED_PROFILE
+            )
         await self._expire_active_capture_before_control_v1()
         request_digest = canonical_control_request_digest_v1(
             operation=ControlOperationV1.BEGIN,

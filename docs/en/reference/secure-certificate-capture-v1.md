@@ -282,6 +282,66 @@ admission-notice extractor for `name`, `source_province`, `college`, and
 behavior remain deferred to Milestone 7. Production seal therefore remains
 `PROCESSOR_NOT_READY` until that downstream processor exists.
 
+Milestone 6C binds that extractor to exactly one trusted server-owned template:
+
+```text
+template_id:       hbtc_admission_notice_v1
+institution_name:  湖北交通职业技术学院
+extractor_id:      admission-notice-extractor.v1
+```
+
+The BeginCapture `profile_id` accepts only that exact template ID. There is no
+runtime registry, plugin, arbitrary parsing profile, client-supplied
+institution name, OCR-derived institution authority, or network lookup.
+Generic multi-school admission-notice support is outside V1.
+
+Template matching is a deterministic parsing-compatibility check over bounded
+M6A OCR spans and their normalized geometry. The exact institution heading
+must reconstruct in the upper title region, including local same-line span
+splits or two related adjacent title lines. A match also requires at least
+three of the following four body anchors in their bounded body regions and
+plausible reading order. The three qualifying anchors must begin on at least
+three distinct reconstructed visual lines, so one- or two-line explanatory
+text cannot manufacture the body signature. Each occurrence also follows the
+existing M6B local grammar: a salutation boundary, the province/committee
+sentence structure, `批准` immediately governing `你被录取到我校`, or a
+bounded major immediately governing `专业学习`. Consecutive anchor polygons
+must overlap horizontally; the one closed exception is the known
+admission-body to major-study transition, whose normalized horizontal gap may
+not exceed `0.18`:
+
+```text
+同学
+高等学校招生委员会
+你被录取到我校
+专业学习
+```
+
+Footer occurrences cannot independently satisfy the body signature. A
+materially different institution-form heading in the narrow title band is
+`NOT_MATCHED`; non-prominent academic-unit text is not independently treated
+as another school identity. A missing title or fewer than three compatible
+body anchors is `INSUFFICIENT`. Across one to three OCR pages, any actual
+wrong-institution heading conflicts with a supported page; otherwise one
+clearly `MATCHED` page may establish compatibility. Repeated pages add no
+weight, and frame order does not select the template. Only pages that
+individually satisfy `MATCHED` may supply semantic field candidates; an
+`INSUFFICIENT` page cannot borrow a matching title from another frame.
+
+`MATCHED` means only that OCR text and layout are compatible with the fixed
+parser. Template `MATCHED` **does not mean** an authentic, valid, verified, or
+issuer-confirmed document. `NOT_MATCHED` and `INSUFFICIENT` stop before
+semantic extraction and produce no answerable four-field result. The trusted
+institution remains separate configuration; OCR semantic extraction remains
+exactly `name`, `source_province`, `college`, and `major`.
+
+The compatibility rule version and exact template identity are included in
+the existing encrypted extraction-result reuse identity. Matching runs inside
+the existing certificate-private `ADMISSION_NOTICE_EXTRACTION` work item and
+adds no authority, plaintext store, operation kind, public status, or public
+result API. It does not alter the independent real M6A Paddle/PP-OCRv6
+qualification blockers or the production `PROCESSOR_NOT_READY` gate.
+
 ### Evidence contract
 
 Use immutable versioned records:
@@ -605,4 +665,4 @@ Required results:
 - Private-UDS peer authorization, permissions, framing, size/deadline enforcement, purge acknowledgement, and absence of TCP/outbound transport must pass.
 - Any failed authentication, epoch, isolation, identity, deletion, calibration, confidence-interval, CPU backend, zero-GPU/CUDA, RSS, thread-count, latency, realtime-contention, UDS, or compatibility gate blocks production rollout.
 
-V1 excludes authenticity verification, issuer/QR networking, remote OCR/TTS, continuous background certificate detection, private voice ASR, ChatAgent tool triggering, arbitrary documents outside configured profiles, and queries after EndCapture.
+V1 excludes authenticity verification, issuer/QR networking, remote OCR/TTS, continuous background certificate detection, private voice ASR, ChatAgent tool triggering, arbitrary documents outside the fixed HBTC admission-notice template, and queries after EndCapture.

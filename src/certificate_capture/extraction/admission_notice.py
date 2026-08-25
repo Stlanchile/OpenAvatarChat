@@ -9,7 +9,6 @@ from certificate_capture.contracts.admission_notice import (
     MAX_ADMISSION_COLLEGE_CODEPOINTS_V1,
     MAX_ADMISSION_MAJOR_CODEPOINTS_V1,
     MAX_ADMISSION_NAME_CODEPOINTS_V1,
-    MAX_ADMISSION_NOTICE_SOURCE_RESULTS_V1,
     MAX_ADMISSION_NOTICE_SOURCE_SPANS_PER_FIELD_V1,
     MAX_ADMISSION_SOURCE_PROVINCE_CODEPOINTS_V1,
     AdmissionFieldStatusV1,
@@ -17,10 +16,24 @@ from certificate_capture.contracts.admission_notice import (
     AdmissionNoticeExtractionV1,
     ExtractedAdmissionFieldV1,
 )
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_TEMPLATE_MATCH_RULE_VERSION_V1,
+    AdmissionNoticeTemplateMatchStatusV1,
+    AdmissionNoticeTemplateMatchV1,
+)
 from certificate_capture.contracts.ocr import (
     OcrPageResultV1,
     OcrPointV1,
     OcrSpanV1,
+)
+from certificate_capture.extraction.hbtc_admission_notice import (
+    COLLEGE_ANCHOR_V1,
+    MAJOR_END_ANCHOR_V1,
+    MIN_RAW_ENGINE_SCORE_FOR_EXTRACTION_V1,
+    NAME_ANCHOR_V1,
+    AdmissionNoticeTemplateCompatibilityErrorV1,
+    HbtcAdmissionNoticeTemplateMatcherV1,
+    ordered_admission_notice_pages_v1,
 )
 from certificate_capture.extraction.identity import (
     DEFAULT_ADMISSION_NOTICE_EXTRACTION_IDENTITY_V1,
@@ -34,12 +47,11 @@ from certificate_capture.extraction.reading_order import (
     MappedTextV1,
     ReadingOrderV1,
     TextRunV1,
+    forward_run_paths_v1,
     reconstruct_reading_order_v1,
     source_polygon_for_spans_v1,
     span_geometry_v1,
 )
-
-MIN_RAW_ENGINE_SCORE_FOR_EXTRACTION_V1 = 0.50
 
 NAME_REGION_MIN_Y_V1 = 0.08
 NAME_REGION_MAX_Y_V1 = 0.48
@@ -50,9 +62,6 @@ COLLEGE_REGION_MAX_Y_V1 = 0.82
 MAJOR_REGION_MIN_Y_V1 = 0.18
 MAJOR_REGION_MAX_Y_V1 = 0.84
 
-NAME_ANCHOR_V1 = "同学"
-COLLEGE_ANCHOR_V1 = "你被录取到我校"
-MAJOR_END_ANCHOR_V1 = "专业学习"
 APPROVAL_ANCHOR_V1 = "批准"
 
 _PROVINCE_COMMITTEE_SUFFIXES_V1 = (
@@ -131,7 +140,6 @@ _STRUCTURAL_CHARACTERS_V1 = frozenset({":", "：", ",", "，", "。", ";", "；"
 _MAJOR_PUNCTUATION_V1 = frozenset(
     {"（", "）", "(", ")", "-", "－", "·", "•", "＋", "+"}
 )
-_MAX_FORWARD_PATHS_V1 = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,31 +469,6 @@ def _name_candidates_v1(
     return candidates
 
 
-def _forward_paths_v1(
-    reading: ReadingOrderV1,
-    start: TextRunV1,
-    *,
-    maximum_lines: int,
-) -> tuple[tuple[TextRunV1, ...], ...]:
-    paths: list[tuple[TextRunV1, ...]] = [(start,)]
-    frontier: list[tuple[TextRunV1, ...]] = [(start,)]
-    while frontier and len(paths) < _MAX_FORWARD_PATHS_V1:
-        path = frontier.pop(0)
-        if len(path) >= maximum_lines:
-            continue
-        next_line_index = path[-1].line_index + 1
-        for related in reading.related_runs_v1(
-            path[-1],
-            next_line_index,
-        ):
-            extended = path + (related,)
-            paths.append(extended)
-            frontier.append(extended)
-            if len(paths) >= _MAX_FORWARD_PATHS_V1:
-                break
-    return tuple(paths)
-
-
 def _province_candidates_v1(
     page: OcrPageResultV1,
     reading: ReadingOrderV1,
@@ -498,7 +481,7 @@ def _province_candidates_v1(
             first_mapped = run.mapped_text_v1()
             if "经" not in first_mapped.text:
                 continue
-            for path in _forward_paths_v1(
+            for path in forward_run_paths_v1(
                 reading,
                 run,
                 maximum_lines=3,
@@ -826,7 +809,7 @@ def _aggregate_field_v1(
 class AdmissionNoticeExtractorV1:
     """Backend-independent deterministic extractor over validated M6A pages."""
 
-    __slots__ = ("_identity",)
+    __slots__ = ("_identity", "_template_matcher")
 
     def __init__(
         self,
@@ -836,34 +819,36 @@ class AdmissionNoticeExtractorV1:
     ) -> None:
         if not isinstance(identity, AdmissionNoticeExtractionIdentityV1):
             raise TypeError("identity must be AdmissionNoticeExtractionIdentityV1")
+        if (
+            identity.template_match_rule_version
+            != HBTC_ADMISSION_NOTICE_TEMPLATE_MATCH_RULE_VERSION_V1
+        ):
+            raise ValueError("template matching identity is unsupported")
         self._identity = identity
+        self._template_matcher = HbtcAdmissionNoticeTemplateMatcherV1()
 
     @property
     def identity_v1(self) -> AdmissionNoticeExtractionIdentityV1:
         return self._identity
 
+    def match_pages_v1(
+        self,
+        pages: tuple[OcrPageResultV1, ...],
+    ) -> AdmissionNoticeTemplateMatchV1:
+        return self._template_matcher.match_pages_v1(pages)
+
     def extract_pages_v1(
         self,
         pages: tuple[OcrPageResultV1, ...],
     ) -> AdmissionNoticeExtractionV1:
-        if (
-            not isinstance(pages, tuple)
-            or not 1 <= len(pages) <= MAX_ADMISSION_NOTICE_SOURCE_RESULTS_V1
-            or not all(isinstance(page, OcrPageResultV1) for page in pages)
-        ):
-            raise ValueError("admission extraction input is invalid")
-        ordered = tuple(sorted(pages, key=lambda page: page.result_id.int))
+        ordered = ordered_admission_notice_pages_v1(pages)
+        template_match, matched_pages = (
+            self._template_matcher.match_and_select_pages_v1(ordered)
+        )
+        if template_match.status is not AdmissionNoticeTemplateMatchStatusV1.MATCHED:
+            raise AdmissionNoticeTemplateCompatibilityErrorV1(template_match.status)
         capture_epoch = ordered[0].capture_epoch
-        if (
-            any(page.capture_epoch is not capture_epoch for page in ordered)
-            or len({page.result_id for page in ordered}) != len(ordered)
-            or len({page.frame_id for page in ordered}) != len(ordered)
-        ):
-            raise ValueError("admission extraction input is invalid")
-        all_span_ids = tuple(span.span_id for page in ordered for span in page.spans)
-        if len(set(all_span_ids)) != len(all_span_ids):
-            raise ValueError("admission extraction span identity is invalid")
-        decisions = tuple(_page_decisions_v1(page) for page in ordered)
+        decisions = tuple(_page_decisions_v1(page) for page in matched_pages)
         return AdmissionNoticeExtractionV1(
             capture_epoch=capture_epoch,
             source_ocr_result_ids=tuple(

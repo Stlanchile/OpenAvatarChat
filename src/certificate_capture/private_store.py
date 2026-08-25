@@ -1634,6 +1634,13 @@ class PrivateEvidenceStoreV1:
                     WorkOperationKindV1.CAPTURE_EVIDENCE_AUXILIARY,
                     require_open=True,
                 )
+                if (
+                    partition.capture_set.profile_id
+                    != extraction.extraction_identity.template_id
+                ):
+                    raise PrivateEvidenceStoreErrorV1(
+                        PrivateEvidenceStoreReasonV1.INTEGRITY_FAILURE
+                    )
                 for page in ordered_pages:
                     ocr_key = OcrResultStorageKeyV1(
                         frame_id=page.frame_id,

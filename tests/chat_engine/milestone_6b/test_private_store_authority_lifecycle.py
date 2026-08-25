@@ -10,6 +10,10 @@ from certificate_capture.contracts.admission_notice import (
     AdmissionNoticeExtractionIdentityV1,
     StoredAdmissionNoticeExtractionV1,
 )
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+    HBTC_ADMISSION_NOTICE_TEMPLATE_MATCH_RULE_VERSION_V1,
+)
 from certificate_capture.epochs import CaptureEpochV1
 from certificate_capture.extraction.admission_notice import (
     AdmissionNoticeExtractorV1,
@@ -207,6 +211,10 @@ async def test_extractor_identity_change_creates_a_distinct_record(
     first = await harness.extract(grant, receipts)
     changed_identity = AdmissionNoticeExtractionIdentityV1(
         extractor_id="admission-notice-extractor.v1",
+        template_id=HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+        template_match_rule_version=(
+            HBTC_ADMISSION_NOTICE_TEMPLATE_MATCH_RULE_VERSION_V1
+        ),
         rule_set_version="admission-notice-rules.v1-revision-2",
         normalization_version="admission-notice-normalization.v1",
     )
@@ -265,7 +273,10 @@ async def test_store_rejects_typed_page_that_does_not_match_encrypted_ocr_payloa
     coordinator = harness.protocol.coordinator
     page = harness.ocr.read_result(grant, receipts[0])
     forged_spans = list(page.spans)
-    forged_spans[0] = synthetic_span_v1(
+    name_index = next(
+        index for index, span in enumerate(forged_spans) if span.text == "李明"
+    )
+    forged_spans[name_index] = synthetic_span_v1(
         "伪造内容",
         x=0.18,
         y=0.18,

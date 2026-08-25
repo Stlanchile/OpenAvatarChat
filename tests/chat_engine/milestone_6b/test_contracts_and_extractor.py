@@ -11,6 +11,10 @@ from certificate_capture.contracts.admission_notice import (
     ExtractedAdmissionFieldV1,
     admission_notice_extraction_from_canonical_json_v1,
 )
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+    HBTC_ADMISSION_NOTICE_TEMPLATE_MATCH_RULE_VERSION_V1,
+)
 from certificate_capture.contracts.ocr import OcrPointV1, OcrSpanV1
 from certificate_capture.extraction.admission_notice import (
     AdmissionNoticeExtractorV1,
@@ -54,6 +58,14 @@ def test_exact_minimal_contract_and_identity_are_versioned_and_immutable():
     assert result.name.schema_version == EXTRACTED_ADMISSION_FIELD_SCHEMA_VERSION_V1
     assert result.extraction_identity.extractor_id == ADMISSION_NOTICE_EXTRACTOR_ID_V1
     assert (
+        result.extraction_identity.template_id
+        == HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1
+    )
+    assert (
+        result.extraction_identity.template_match_rule_version
+        == HBTC_ADMISSION_NOTICE_TEMPLATE_MATCH_RULE_VERSION_V1
+    )
+    assert (
         result.extraction_identity.rule_set_version
         == ADMISSION_NOTICE_RULE_SET_VERSION_V1
     )
@@ -62,7 +74,16 @@ def test_exact_minimal_contract_and_identity_are_versioned_and_immutable():
         == ADMISSION_NOTICE_NORMALIZATION_VERSION_V1
     )
     assert not hasattr(result, "confidence")
+    assert not hasattr(result, "institution")
     assert not hasattr(result.name, "confidence")
+    assert set(result.extraction_identity.canonical_object_v1()) == {
+        "extractor_id",
+        "normalization_version",
+        "rule_set_version",
+        "schema_version",
+        "template_id",
+        "template_match_rule_version",
+    }
     assert set(result.canonical_object_v1()) == {
         "capture_epoch",
         "college",
@@ -257,7 +278,7 @@ def test_college_same_line_or_next_line_with_approved_unit_forms(
 )
 def test_major_preserves_meaningful_internal_punctuation(major):
     spans = list(standard_admission_spans_v1())
-    spans[-2] = synthetic_span_v1(
+    spans[8] = synthetic_span_v1(
         major,
         x=0.12,
         y=0.50,
@@ -272,7 +293,7 @@ def test_major_preserves_meaningful_internal_punctuation(major):
 
 def test_long_major_wrapped_across_two_adjacent_lines():
     spans = list(standard_admission_spans_v1())
-    spans[-2:] = [
+    spans[8:10] = [
         synthetic_span_v1(
             "智能制造装备技术（",
             x=0.12,
@@ -318,7 +339,7 @@ def test_nearby_unrelated_line_is_not_prepended_to_clear_major():
 
 def test_long_aligned_unrelated_line_is_not_prepended_to_short_clear_major():
     spans = list(standard_admission_spans_v1())
-    spans[-2:] = [
+    spans[8:10] = [
         synthetic_span_v1(
             "护理学",
             x=0.12,
@@ -349,7 +370,7 @@ def test_long_aligned_unrelated_line_is_not_prepended_to_short_clear_major():
 
 def test_shuffled_input_to_reading_order_is_identical():
     spans = standard_admission_spans_v1()
-    shuffled = [spans[index] for index in (7, 0, 9, 2, 5, 1, 8, 4, 6, 3)]
+    shuffled = tuple(reversed(spans))
 
     first = reconstruct_reading_order_v1(tuple(spans))
     second = reconstruct_reading_order_v1(tuple(shuffled))
@@ -490,7 +511,12 @@ def test_excessive_field_candidates_never_become_found(
 def test_empty_and_paragraph_sized_candidates_abstain():
     spans = list(standard_admission_spans_v1())
     spans[:3] = [synthetic_span_v1("同学：", x=0.18, y=0.18, width=0.10)]
-    spans[-2] = synthetic_span_v1(
+    major_index = next(
+        index
+        for index, span in enumerate(spans)
+        if span.text == "计算机应用技术（校企合作）"
+    )
+    spans[major_index] = synthetic_span_v1(
         "这是一整段说明文字。请认真阅读后办理相关手续。" * 6,
         x=0.01,
         y=0.50,

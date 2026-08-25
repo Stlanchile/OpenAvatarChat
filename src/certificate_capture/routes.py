@@ -504,6 +504,9 @@ def _capture_http_error_v1(
 ):
     status_by_reason = {
         CaptureProtocolReasonV1.INVALID_REQUEST: status.HTTP_400_BAD_REQUEST,
+        CaptureProtocolReasonV1.UNSUPPORTED_PROFILE: (
+            status.HTTP_400_BAD_REQUEST
+        ),
         CaptureProtocolReasonV1.SESSION_LIFETIME_INSUFFICIENT: (
             status.HTTP_409_CONFLICT
         ),

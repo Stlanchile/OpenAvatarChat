@@ -15,6 +15,9 @@ from certificate_capture.contracts.admission_notice import (
     AdmissionNoticeExtractionV1,
     StoredAdmissionNoticeExtractionV1,
 )
+from certificate_capture.contracts.admission_notice_template import (
+    AdmissionNoticeTemplateMatchStatusV1,
+)
 from certificate_capture.contracts.ocr import (
     OcrPageResultV1,
     StoredOcrResultV1,
@@ -22,6 +25,9 @@ from certificate_capture.contracts.ocr import (
 from certificate_capture.epochs import CaptureEpochV1
 from certificate_capture.extraction.admission_notice import (
     AdmissionNoticeExtractorV1,
+)
+from certificate_capture.extraction.hbtc_admission_notice import (
+    AdmissionNoticeTemplateCompatibilityErrorV1,
 )
 from certificate_capture.private_authority import (
     PrivateEvidenceAccessV1,
@@ -51,6 +57,8 @@ _EXTRACTION_SERVICE_CONSTRUCTION_AUTHORITY_V1 = object()
 
 class AdmissionNoticeExtractionFailureReasonV1(str, Enum):
     EXTRACTION_INPUT_INVALID = "EXTRACTION_INPUT_INVALID"
+    EXTRACTION_TEMPLATE_NOT_MATCHED = "EXTRACTION_TEMPLATE_NOT_MATCHED"
+    EXTRACTION_TEMPLATE_INSUFFICIENT = "EXTRACTION_TEMPLATE_INSUFFICIENT"
     EXTRACTION_RESULT_TOO_LARGE = "EXTRACTION_RESULT_TOO_LARGE"
     EXTRACTION_AUTHORITY_INVALID = "EXTRACTION_AUTHORITY_INVALID"
     EXTRACTION_STALE = "EXTRACTION_STALE"
@@ -451,6 +459,14 @@ class PrivateAdmissionNoticeExtractionServiceV1:
 
             try:
                 extraction = self._extractor.extract_pages_v1(pages)
+            except AdmissionNoticeTemplateCompatibilityErrorV1 as exception:
+                reason = (
+                    AdmissionNoticeExtractionFailureReasonV1.EXTRACTION_TEMPLATE_NOT_MATCHED
+                    if exception.status
+                    is AdmissionNoticeTemplateMatchStatusV1.NOT_MATCHED
+                    else AdmissionNoticeExtractionFailureReasonV1.EXTRACTION_TEMPLATE_INSUFFICIENT
+                )
+                raise AdmissionNoticeExtractionServiceErrorV1(reason) from None
             except (TypeError, ValueError):
                 raise AdmissionNoticeExtractionServiceErrorV1(
                     AdmissionNoticeExtractionFailureReasonV1.EXTRACTION_INPUT_INVALID

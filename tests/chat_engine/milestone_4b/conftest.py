@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 import pytest_asyncio
 from PIL import Image
 
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+)
 from certificate_capture.coordinator import CaptureCoordinatorV1
 from certificate_capture.frame_ingress import validate_private_jpeg_v1
 from certificate_capture.private_authority import (
@@ -106,7 +109,7 @@ class CaptureProtocolHarnessV1:
         *,
         request_id: uuid.UUID | None = None,
         control_seq: int = 1,
-        profile_id: str = "mock-no-profile-v1",
+        profile_id: str = HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
         remaining_seconds: float = 600.0,
     ) -> BeginCaptureGrantV1:
         return await self.coordinator.begin_capture_protocol_v1(

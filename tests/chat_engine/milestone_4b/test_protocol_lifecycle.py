@@ -7,6 +7,9 @@ from dataclasses import fields
 
 import pytest
 
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+)
 from certificate_capture.coordinator import CaptureCoordinatorV1
 from certificate_capture.protocol import (
     MAX_CAPTURE_ENCODED_BYTES_V1,
@@ -17,6 +20,10 @@ from certificate_capture.protocol import (
     CaptureProtocolReasonV1,
     SealOutcomeV1,
     SealReasonCodeV1,
+)
+from certificate_capture.replay import (
+    ControlOperationV1,
+    canonical_control_request_digest_v1,
 )
 from certificate_capture.state import CaptureStateV1
 from tests.chat_engine.milestone_4b.conftest import synthetic_jpeg_v1
@@ -128,7 +135,7 @@ async def test_begin_request_id_content_conflict_and_control_sequence_rules(
         )
     assert (
         changed.value.reason
-        is CaptureProtocolReasonV1.IDEMPOTENCY_CONFLICT
+        is CaptureProtocolReasonV1.UNSUPPORTED_PROFILE
     )
 
     with pytest.raises(CaptureProtocolErrorV1) as gap:
@@ -169,6 +176,39 @@ async def test_begin_request_id_content_conflict_and_control_sequence_rules(
         changed_operation.value.reason
         is CaptureProtocolReasonV1.IDEMPOTENCY_CONFLICT
     )
+
+
+@pytest.mark.asyncio
+async def test_unsupported_profile_is_rejected_before_begin_advances(
+    capture_protocol_harness_factory,
+):
+    harness = capture_protocol_harness_factory()
+
+    with pytest.raises(CaptureProtocolErrorV1) as rejected:
+        await harness.begin(profile_id="fabricated_school_notice_v1")
+
+    assert rejected.value.reason is CaptureProtocolReasonV1.UNSUPPORTED_PROFILE
+    assert harness.coordinator.snapshot_v1().state is CaptureStateV1.IDLE
+    assert harness.coordinator._replay_ledger_v1.snapshot_v1() == (0, 0)
+    assert harness.coordinator._private_evidence_store_v1.snapshot_v1().key_present is False
+
+
+def test_begin_replay_digest_still_binds_the_exact_profile_id():
+    request_id = uuid.uuid4()
+    supported = canonical_control_request_digest_v1(
+        operation=ControlOperationV1.BEGIN,
+        request_id=request_id,
+        control_seq=1,
+        profile_id=HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+    )
+    unsupported = canonical_control_request_digest_v1(
+        operation=ControlOperationV1.BEGIN,
+        request_id=request_id,
+        control_seq=1,
+        profile_id="fabricated_school_notice_v1",
+    )
+
+    assert supported != unsupported
 
 
 @pytest.mark.asyncio

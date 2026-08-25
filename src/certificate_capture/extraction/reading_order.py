@@ -20,6 +20,7 @@ SAME_LINE_MAX_CENTER_OFFSET_V1 = 0.012
 MAX_LOCAL_HORIZONTAL_GAP_V1 = 0.055
 MAX_ADJACENT_LINE_GAP_V1 = 0.080
 MAX_ADJACENT_LEFT_OFFSET_V1 = 0.180
+MAX_FORWARD_RUN_PATHS_V1 = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,9 +423,43 @@ def reconstruct_reading_order_v1(
     return ReadingOrderV1(lines=tuple(lines))
 
 
+def forward_run_paths_v1(
+    reading: ReadingOrderV1,
+    start: TextRunV1,
+    *,
+    maximum_lines: int,
+) -> tuple[tuple[TextRunV1, ...], ...]:
+    """Return bounded geometry-related forward paths from one run."""
+
+    if (
+        not isinstance(reading, ReadingOrderV1)
+        or not isinstance(start, TextRunV1)
+        or not 1 <= maximum_lines <= 3
+    ):
+        raise ValueError("forward run path input is invalid")
+    paths: list[tuple[TextRunV1, ...]] = [(start,)]
+    frontier: list[tuple[TextRunV1, ...]] = [(start,)]
+    while frontier and len(paths) < MAX_FORWARD_RUN_PATHS_V1:
+        path = frontier.pop(0)
+        if len(path) >= maximum_lines:
+            continue
+        next_line_index = path[-1].line_index + 1
+        for related in reading.related_runs_v1(
+            path[-1],
+            next_line_index,
+        ):
+            extended = path + (related,)
+            paths.append(extended)
+            frontier.append(extended)
+            if len(paths) >= MAX_FORWARD_RUN_PATHS_V1:
+                break
+    return tuple(paths)
+
+
 __all__ = [
     "MAX_ADJACENT_LEFT_OFFSET_V1",
     "MAX_ADJACENT_LINE_GAP_V1",
+    "MAX_FORWARD_RUN_PATHS_V1",
     "MAX_LOCAL_HORIZONTAL_GAP_V1",
     "MappedCharacterV1",
     "MappedTextV1",
@@ -432,6 +467,7 @@ __all__ = [
     "SpanGeometryV1",
     "TextRunV1",
     "VisualLineV1",
+    "forward_run_paths_v1",
     "reconstruct_reading_order_v1",
     "source_polygon_for_spans_v1",
     "span_geometry_v1",

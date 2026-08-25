@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_EXTRACTOR_ID_V1,
+    HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+)
 from certificate_capture.contracts.common import (
     canonical_json_bytes_v1,
     capture_epoch_object_v1,
@@ -108,6 +112,8 @@ class AdmissionNoticeExtractionIdentityV1:
     """Versioned identity for deterministic extraction behavior."""
 
     extractor_id: str
+    template_id: str
+    template_match_rule_version: str
     rule_set_version: str
     normalization_version: str
     schema_version: str = ADMISSION_NOTICE_EXTRACTION_IDENTITY_SCHEMA_VERSION_V1
@@ -118,7 +124,14 @@ class AdmissionNoticeExtractionIdentityV1:
             != ADMISSION_NOTICE_EXTRACTION_IDENTITY_SCHEMA_VERSION_V1
         ):
             raise ValueError("unsupported extraction identity schema")
-        _require_identity_component_v1("extractor_id", self.extractor_id)
+        if self.extractor_id != HBTC_ADMISSION_NOTICE_EXTRACTOR_ID_V1:
+            raise ValueError("extractor_id is unsupported")
+        if self.template_id != HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1:
+            raise ValueError("template_id is unsupported")
+        _require_identity_component_v1(
+            "template_match_rule_version",
+            self.template_match_rule_version,
+        )
         _require_identity_component_v1(
             "rule_set_version",
             self.rule_set_version,
@@ -134,6 +147,8 @@ class AdmissionNoticeExtractionIdentityV1:
             "normalization_version": self.normalization_version,
             "rule_set_version": self.rule_set_version,
             "schema_version": self.schema_version,
+            "template_id": self.template_id,
+            "template_match_rule_version": self.template_match_rule_version,
         }
 
     @property
@@ -436,6 +451,8 @@ def _identity_from_object_v1(
                 "normalization_version",
                 "rule_set_version",
                 "schema_version",
+                "template_id",
+                "template_match_rule_version",
             }
         ),
         name="admission extraction identity",
@@ -443,6 +460,8 @@ def _identity_from_object_v1(
     return AdmissionNoticeExtractionIdentityV1(
         schema_version=item["schema_version"],
         extractor_id=item["extractor_id"],
+        template_id=item["template_id"],
+        template_match_rule_version=item["template_match_rule_version"],
         rule_set_version=item["rule_set_version"],
         normalization_version=item["normalization_version"],
     )

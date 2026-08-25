@@ -17,6 +17,9 @@ from PIL import Image
 from starlette.requests import Request
 
 from certificate_capture.capabilities import CAPTURE_CAPABILITY_HEADER_V1
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
+)
 from certificate_capture.coordinator import CaptureCoordinatorV1
 from certificate_capture.frame_ingress import read_bounded_private_jpeg_v1
 from certificate_capture.private_authority import (
@@ -31,6 +34,7 @@ from certificate_capture.protocol import (
     CaptureProtocolReasonV1,
 )
 from certificate_capture.routes import install_certificate_capture_routes_v1
+from certificate_capture.state import CaptureStateV1
 from chat_engine.chat_engine import ChatEngine
 from chat_engine.data_models.chat_engine_config_data import ChatEngineConfigModel
 from chat_engine.data_models.session_info_data import SessionInfoData
@@ -330,7 +334,7 @@ async def _begin_v1(
     *,
     request_id: str | None = None,
     control_seq: int = 1,
-    profile_id: str = "mock-no-profile-v1",
+    profile_id: str = HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
 ):
     return await client.post(
         (
@@ -357,7 +361,7 @@ def _capture_headers_v1(
 
 
 @pytest.mark.asyncio
-async def test_begin_retains_profile_identifier_as_uninterpreted_opaque_text(
+async def test_begin_accepts_only_the_allowlisted_template_identifier(
     route_harness,
 ):
     async with httpx.AsyncClient(
@@ -367,7 +371,7 @@ async def test_begin_retains_profile_identifier_as_uninterpreted_opaque_text(
         begin = await _begin_v1(
             client,
             route_harness,
-            profile_id="opaque profile / 模拟-v1",
+            profile_id=HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
         )
         assert begin.status_code == 201
         body = begin.json()
@@ -387,6 +391,26 @@ async def test_begin_retains_profile_identifier_as_uninterpreted_opaque_text(
             },
         )
         assert end.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_begin_rejects_unknown_profile_without_lifecycle_advancement(
+    route_harness,
+):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=route_harness.app),
+        base_url="https://service.example.test",
+    ) as client:
+        rejected = await _begin_v1(
+            client,
+            route_harness,
+            profile_id="fabricated_school_notice_v1",
+        )
+
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"]["reason_code"] == "UNSUPPORTED_PROFILE"
+    assert route_harness.coordinator.snapshot_v1().state is CaptureStateV1.IDLE
+    assert route_harness.coordinator._replay_ledger_v1.snapshot_v1() == (0, 0)
 
 
 @pytest.mark.asyncio
@@ -638,7 +662,7 @@ async def test_begin_authentication_owner_and_scope_fail_without_oracles(
             json={
                 "request_id": str(uuid.uuid4()),
                 "control_seq": 1,
-                "profile_id": "mock-no-profile-v1",
+                "profile_id": HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
             },
         )
 
@@ -660,7 +684,7 @@ async def test_guessed_session_and_wrong_session_capability_are_indistinguishabl
             json={
                 "request_id": str(uuid.uuid4()),
                 "control_seq": 1,
-                "profile_id": "mock-no-profile-v1",
+                "profile_id": HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
             },
         )
         wrong_capability = await client.post(
@@ -675,7 +699,7 @@ async def test_guessed_session_and_wrong_session_capability_are_indistinguishabl
             json={
                 "request_id": str(uuid.uuid4()),
                 "control_seq": 1,
-                "profile_id": "mock-no-profile-v1",
+                "profile_id": HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
             },
         )
 
@@ -1041,7 +1065,7 @@ async def test_production_chat_engine_resolver_uses_exact_session_coordinator(
                 json={
                     "request_id": str(uuid.uuid4()),
                     "control_seq": 1,
-                    "profile_id": "mock-no-profile-v1",
+                    "profile_id": HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
                 },
             )
             assert begin.status_code == 201
@@ -1167,7 +1191,7 @@ async def test_session_replacement_or_revoke_destroys_active_capture_before_retu
                 json={
                     "request_id": str(uuid.uuid4()),
                     "control_seq": 1,
-                    "profile_id": "mock-no-profile-v1",
+                    "profile_id": HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1,
                 },
             )
             assert begin.status_code == 201

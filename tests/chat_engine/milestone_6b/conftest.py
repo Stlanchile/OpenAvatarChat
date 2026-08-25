@@ -8,6 +8,9 @@ from certificate_capture.contracts.admission_notice import (
     AdmissionNoticeExtractionV1,
     StoredAdmissionNoticeExtractionV1,
 )
+from certificate_capture.contracts.admission_notice_template import (
+    HBTC_ADMISSION_NOTICE_INSTITUTION_NAME_V1,
+)
 from certificate_capture.contracts.ocr import (
     OcrPageResultV1,
     OcrPointV1,
@@ -105,6 +108,13 @@ def standard_admission_spans_v1(
             x=0.61,
             y=0.501,
             width=0.16,
+        ),
+        synthetic_span_v1(
+            HBTC_ADMISSION_NOTICE_INSTITUTION_NAME_V1,
+            x=0.24,
+            y=0.055,
+            width=0.52,
+            height=0.045,
         ),
     )
 
