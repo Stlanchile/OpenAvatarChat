@@ -19,6 +19,10 @@ from certificate_capture.capabilities import (
     CaptureCapabilityAuthorityV1,
     CaptureCapabilityBindingV1,
 )
+from certificate_capture.contracts.admission_notice import (
+    AdmissionNoticeExtractionV1,
+    StoredAdmissionNoticeExtractionV1,
+)
 from certificate_capture.contracts.evidence import EvidenceFrameV1
 from certificate_capture.contracts.inference import InferenceIdentityV1
 from certificate_capture.contracts.ocr import (
@@ -26,6 +30,11 @@ from certificate_capture.contracts.ocr import (
     StoredOcrResultV1,
 )
 from certificate_capture.epochs import CaptureEpochV1
+from certificate_capture.extraction.service import (
+    AdmissionNoticeExtractionFailureReasonV1,
+    AdmissionNoticeExtractionServiceErrorV1,
+    PrivateAdmissionNoticeExtractionServiceV1,
+)
 from certificate_capture.isolation import (
     NormalApplicationAdmissionViewV1,
     _create_normal_mode_isolation_v1,
@@ -199,6 +208,7 @@ class _FrameRecordV1:
 class _DetachedPrivateCaptureWorkV1:
     capture_epoch: CaptureEpochV1 | None
     ocr_service: PrivateOcrServiceV1 | None
+    extraction_service: PrivateAdmissionNoticeExtractionServiceV1
     timer_task: asyncio.Task[None] | None
     processor_task: asyncio.Task[None] | None
     timer_work: RegisteredWorkV1 | None
@@ -239,6 +249,7 @@ class CaptureCoordinatorV1:
         "_accepted_frame_bytes_v1",
         "_active_capture_capability_v1",
         "_active_frame_upload_permits_v1",
+        "_admission_extraction_service_v1",
         "_active_transition",
         "_audit",
         "_capability_authority_v1",
@@ -417,6 +428,22 @@ class CaptureCoordinatorV1:
                 capture_is_live_v1=(
                     self._private_store_operation_is_live_v1
                 ),
+            )
+        )
+        self._admission_extraction_service_v1 = (
+            PrivateAdmissionNoticeExtractionServiceV1
+            ._create_for_coordinator_v1(
+                private_authority=private_evidence_authority_v1,
+                store=self._private_evidence_store_v1,
+                read_access=self._private_store_read_access_v1,
+                write_access=self._private_store_write_access_v1,
+                work_controller=work_controller,
+                capture_is_live_v1=(
+                    self
+                    ._private_admission_extraction_operation_is_live_v1
+                ),
+                fatal_store_failure_v1=self._fail_protocol_runtime_v1,
+                wall_clock_v1=self._wall_clock_v1,
             )
         )
 
@@ -1583,6 +1610,22 @@ class CaptureCoordinatorV1:
             )
         )
 
+    def _private_admission_extraction_operation_is_live_v1(
+        self,
+        capture_epoch: CaptureEpochV1,
+    ) -> bool:
+        return bool(
+            self._run_if_session_live_v1(lambda: None)
+            and self._security_authority_is_usable_v1()
+            and self._capture_work_admission_is_open_v1(
+                capture_epoch,
+                {
+                    CaptureStateV1.CAPTURING,
+                    CaptureStateV1.BUILDING_ASSERTIONS,
+                },
+            )
+        )
+
     async def _process_private_ocr_frames_v1(
         self,
         *,
@@ -1657,6 +1700,77 @@ class CaptureCoordinatorV1:
         def read() -> None:
             result.append(
                 self._private_evidence_store_v1.get_ocr_result_v1(
+                    access=access,
+                    capture_epoch=capture_epoch,
+                    fence=registered_work.fence,
+                    receipt=receipt,
+                )
+            )
+
+        if not self._run_if_session_live_v1(read) or not result:
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.ACCESS_DENIED
+            )
+        return result[0]
+
+    async def _process_private_admission_notice_extraction_v1(
+        self,
+        *,
+        capture_epoch: CaptureEpochV1,
+        ocr_receipts: tuple[StoredOcrResultV1, ...],
+        parent_work: RegisteredWorkV1,
+    ) -> StoredAdmissionNoticeExtractionV1:
+        """Trusted internal M6B API; plaintext never crosses this seam."""
+
+        if (
+            not isinstance(capture_epoch, CaptureEpochV1)
+            or not isinstance(parent_work, RegisteredWorkV1)
+        ):
+            raise AdmissionNoticeExtractionServiceErrorV1(
+                AdmissionNoticeExtractionFailureReasonV1
+                .EXTRACTION_INPUT_INVALID
+            )
+        with self._lock:
+            if (
+                self._capture_epoch is not capture_epoch
+                or self._state
+                not in {
+                    CaptureStateV1.CAPTURING,
+                    CaptureStateV1.BUILDING_ASSERTIONS,
+                }
+                or not self._private_evidence_authority_v1.is_usable_v1()
+            ):
+                raise AdmissionNoticeExtractionServiceErrorV1(
+                    AdmissionNoticeExtractionFailureReasonV1
+                    .EXTRACTION_AUTHORITY_INVALID
+                )
+            service = self._admission_extraction_service_v1
+        return await service.extract_v1(
+            capture_epoch=capture_epoch,
+            ocr_receipts=ocr_receipts,
+            parent_work=parent_work,
+        )
+
+    def _read_private_admission_extraction_for_test_v1(
+        self,
+        *,
+        capture_epoch: CaptureEpochV1,
+        receipt: StoredAdmissionNoticeExtractionV1,
+        registered_work: RegisteredWorkV1,
+        access: PrivateEvidenceAccessV1,
+    ) -> AdmissionNoticeExtractionV1:
+        """Authorized test seam for one encrypted extraction record."""
+
+        if not isinstance(registered_work, RegisteredWorkV1):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.ACCESS_DENIED
+            )
+        result: list[AdmissionNoticeExtractionV1] = []
+
+        def read() -> None:
+            result.append(
+                self._private_evidence_store_v1
+                .get_admission_notice_extraction_v1(
                     access=access,
                     capture_epoch=capture_epoch,
                     fence=registered_work.fence,
@@ -2518,6 +2632,7 @@ class CaptureCoordinatorV1:
     ) -> _DetachedPrivateCaptureWorkV1:
         capture_epoch = self._capture_epoch
         ocr_service = self._ocr_service_v1
+        extraction_service = self._admission_extraction_service_v1
         timer_task = self._inactivity_task_v1
         processor_task = self._processor_task_v1
         timer_work = self._inactivity_work_v1
@@ -2535,6 +2650,7 @@ class CaptureCoordinatorV1:
         return _DetachedPrivateCaptureWorkV1(
             capture_epoch=capture_epoch,
             ocr_service=ocr_service,
+            extraction_service=extraction_service,
             timer_task=timer_task,
             processor_task=processor_task,
             timer_work=timer_work,
@@ -2547,8 +2663,11 @@ class CaptureCoordinatorV1:
     ) -> None:
         capture_epoch = detached.capture_epoch
         ocr_service = detached.ocr_service
+        extraction_service = detached.extraction_service
         if capture_epoch is not None and ocr_service is not None:
             ocr_service.retire_capture_v1(capture_epoch)
+        if capture_epoch is not None:
+            extraction_service.retire_capture_v1(capture_epoch)
         for work in (detached.timer_work, detached.processor_work):
             if work is not None:
                 try:
@@ -2700,6 +2819,11 @@ class CaptureCoordinatorV1:
             and (
                 self._ocr_service_v1 is None
                 or self._ocr_service_v1.active_request_count_v1() == 0
+            )
+            and (
+                self._admission_extraction_service_v1
+                .active_request_count_v1()
+                == 0
             )
             and self._private_store_cleanup_token_v1 is None
             and self._private_evidence_store_v1.is_capture_clear_v1()
@@ -3692,6 +3816,7 @@ class CaptureCoordinatorV1:
                 )
         if ocr_service is not None:
             ocr_service.close_admission_v1()
+        self._admission_extraction_service_v1.close_admission_v1()
         if detached_work is not None:
             self._cancel_detached_private_capture_work_v1(detached_work)
         if transition is not None:

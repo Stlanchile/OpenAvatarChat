@@ -16,6 +16,14 @@ from enum import Enum
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from certificate_capture.contracts.admission_notice import (
+    MAX_ADMISSION_NOTICE_SOURCE_RESULTS_V1,
+    AdmissionFieldStatusV1,
+    AdmissionNoticeExtractionStorageKeyV1,
+    AdmissionNoticeExtractionV1,
+    StoredAdmissionNoticeExtractionV1,
+    admission_notice_extraction_from_canonical_json_v1,
+)
 from certificate_capture.contracts.common import (
     canonical_json_bytes_v1,
     require_epoch_seconds_v1,
@@ -81,11 +89,14 @@ MAX_PRIVATE_RECORDS_PER_CAPTURE_V1 = (
 MAX_CONCURRENT_PRIVATE_STORE_OPERATIONS_V1 = 4
 ENCRYPTED_RECORD_METADATA_ACCOUNTING_BYTES_V1 = 256
 OCR_RESULT_INDEX_ACCOUNTING_BYTES_V1 = 256
+ADMISSION_EXTRACTION_INDEX_ACCOUNTING_BYTES_V1 = 384
 MAX_PRIVATE_INDEX_ACCOUNTING_BYTES_V1 = (
     MAX_PRIVATE_RECORDS_PER_CAPTURE_V1
     * ENCRYPTED_RECORD_METADATA_ACCOUNTING_BYTES_V1
     + MAX_AUXILIARY_RECORDS_PER_CAPTURE_V1
     * OCR_RESULT_INDEX_ACCOUNTING_BYTES_V1
+    + MAX_AUXILIARY_RECORDS_PER_CAPTURE_V1
+    * ADMISSION_EXTRACTION_INDEX_ACCOUNTING_BYTES_V1
 )
 MAX_FRAME_STORED_CIPHERTEXT_BYTES_V1 = (
     MAX_CAPTURE_ENCODED_BYTES_V1
@@ -222,6 +233,7 @@ class PrivateEvidenceStoreSnapshotV1:
     frame_record_count: int
     auxiliary_record_count: int
     ocr_result_index_count: int
+    admission_extraction_index_count: int
     accepted_plaintext_encoded_bytes: int
     stored_frame_ciphertext_bytes: int
     stored_auxiliary_ciphertext_bytes: int
@@ -241,6 +253,10 @@ class _CapturePartitionV1:
     frame_id_by_seq: dict[int, uuid.UUID]
     auxiliary_record_ids: set[uuid.UUID]
     ocr_result_by_key: dict[OcrResultStorageKeyV1, StoredOcrResultV1]
+    admission_extraction_by_key: dict[
+        AdmissionNoticeExtractionStorageKeyV1,
+        StoredAdmissionNoticeExtractionV1,
+    ]
     accepted_plaintext_encoded_bytes: int
     auxiliary_plaintext_bytes: int
     stored_frame_ciphertext_bytes: int
@@ -554,6 +570,7 @@ class PrivateEvidenceStoreV1:
                         frame_id_by_seq={},
                         auxiliary_record_ids=set(),
                         ocr_result_by_key={},
+                        admission_extraction_by_key={},
                         accepted_plaintext_encoded_bytes=0,
                         auxiliary_plaintext_bytes=0,
                         stored_frame_ciphertext_bytes=0,
@@ -610,6 +627,7 @@ class PrivateEvidenceStoreV1:
                 or partition.evidence_by_frame_id
                 or partition.frame_id_by_seq
                 or partition.ocr_result_by_key
+                or partition.admission_extraction_by_key
                 or not self._key_authority.has_key_v1(capture_epoch)
                 or not self._private_authority._is_canonical_access_v1(
                     access,
@@ -646,6 +664,7 @@ class PrivateEvidenceStoreV1:
                 or partition.evidence_by_frame_id
                 or partition.frame_id_by_seq
                 or partition.ocr_result_by_key
+                or partition.admission_extraction_by_key
                 or not self._private_authority._is_canonical_access_v1(
                     access,
                     PrivateEvidenceAccessKindV1.CLEANUP,
@@ -1387,6 +1406,456 @@ class PrivateEvidenceStoreV1:
             )
         return result[0]
 
+    def find_admission_notice_extraction_v1(
+        self,
+        *,
+        access: PrivateEvidenceAccessV1,
+        capture_epoch: CaptureEpochV1,
+        fence: WorkFenceV1,
+        key: AdmissionNoticeExtractionStorageKeyV1,
+        _admission_guard_v1: Callable[[], bool],
+    ) -> StoredAdmissionNoticeExtractionV1 | None:
+        """Return opaque metadata for one exact live extraction identity."""
+
+        if (
+            not isinstance(key, AdmissionNoticeExtractionStorageKeyV1)
+            or not callable(_admission_guard_v1)
+        ):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.OPERATION_FAILED
+            )
+        result: list[StoredAdmissionNoticeExtractionV1 | None] = []
+
+        def find() -> None:
+            with self._lock:
+                self._require_access_v1(
+                    access,
+                    PrivateEvidenceAccessKindV1.READ,
+                )
+                partition = self._require_temporal_binding_locked_v1(
+                    capture_epoch,
+                    fence,
+                    WorkOperationKindV1.CAPTURE_EVIDENCE_READ,
+                    require_open=True,
+                )
+                stored = partition.admission_extraction_by_key.get(key)
+                if stored is None:
+                    result.append(None)
+                    return
+                if (
+                    stored.record_id not in partition.auxiliary_record_ids
+                    or stored.record_id not in partition.records
+                    or stored.key != key
+                ):
+                    raise PrivateEvidenceStoreErrorV1(
+                        PrivateEvidenceStoreReasonV1.INTEGRITY_FAILURE
+                    )
+                result.append(
+                    StoredAdmissionNoticeExtractionV1(
+                        record_id=stored.record_id,
+                        extraction_sha256=stored.extraction_sha256,
+                        key=stored.key,
+                        reused=True,
+                    )
+                )
+
+        with self._operation_slot_v1():
+            try:
+                performed = self._work_controller.perform_if_live_v1(
+                    fence,
+                    WorkValidationBoundaryV1.BEFORE_PRIVATE_STORE_READ,
+                    find,
+                    _admission_guard_v1=(
+                        lambda: self._capture_is_live_v1(capture_epoch)
+                        and _admission_guard_v1()
+                    ),
+                )
+            except PrivateEvidenceStoreErrorV1:
+                raise
+            except Exception:  # noqa: BLE001 - stable store boundary
+                raise PrivateEvidenceStoreErrorV1(
+                    PrivateEvidenceStoreReasonV1.OPERATION_FAILED
+                ) from None
+        if not performed or not result:
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.ACCESS_DENIED
+            )
+        return result[0]
+
+    @staticmethod
+    def _extraction_provenance_is_valid_v1(
+        extraction: AdmissionNoticeExtractionV1,
+        page_results: tuple[OcrPageResultV1, ...],
+    ) -> bool:
+        span_page_by_id: dict[uuid.UUID, OcrPageResultV1] = {}
+        span_by_id = {}
+        for page in page_results:
+            for span in page.spans:
+                if span.span_id in span_page_by_id:
+                    return False
+                span_page_by_id[span.span_id] = page
+                span_by_id[span.span_id] = span
+        for field in (
+            extraction.name,
+            extraction.source_province,
+            extraction.college,
+            extraction.major,
+        ):
+            if field.status is not AdmissionFieldStatusV1.FOUND:
+                continue
+            if any(
+                span_id not in span_page_by_id
+                for span_id in field.source_span_ids
+            ):
+                return False
+            if field.source_polygon is None:
+                continue
+            pages = {
+                span_page_by_id[span_id].result_id
+                for span_id in field.source_span_ids
+            }
+            if len(pages) != 1:
+                return False
+            spans = tuple(
+                span_by_id[span_id]
+                for span_id in field.source_span_ids
+            )
+            min_x = min(
+                point.x for span in spans for point in span.polygon
+            )
+            max_x = max(
+                point.x for span in spans for point in span.polygon
+            )
+            min_y = min(
+                point.y for span in spans for point in span.polygon
+            )
+            max_y = max(
+                point.y for span in spans for point in span.polygon
+            )
+            polygon = field.source_polygon
+            if (
+                polygon[0].x != min_x
+                or polygon[0].y != min_y
+                or polygon[1].x != max_x
+                or polygon[1].y != min_y
+                or polygon[2].x != max_x
+                or polygon[2].y != max_y
+                or polygon[3].x != min_x
+                or polygon[3].y != max_y
+            ):
+                return False
+        return True
+
+    def put_admission_notice_extraction_v1(
+        self,
+        *,
+        access: PrivateEvidenceAccessV1,
+        source_read_access: PrivateEvidenceAccessV1,
+        capture_epoch: CaptureEpochV1,
+        fence: WorkFenceV1,
+        page_results: tuple[OcrPageResultV1, ...],
+        extraction: AdmissionNoticeExtractionV1,
+        created_at_epoch_seconds: float,
+        _admission_guard_v1: Callable[[], bool],
+    ) -> StoredAdmissionNoticeExtractionV1:
+        """Atomically encrypt and index one deterministic M6B result."""
+
+        if (
+            not isinstance(page_results, tuple)
+            or not 1
+            <= len(page_results)
+            <= MAX_ADMISSION_NOTICE_SOURCE_RESULTS_V1
+            or not all(
+                isinstance(page, OcrPageResultV1)
+                and page.capture_epoch is capture_epoch
+                for page in page_results
+            )
+            or not isinstance(extraction, AdmissionNoticeExtractionV1)
+            or extraction.capture_epoch is not capture_epoch
+            or not callable(_admission_guard_v1)
+        ):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.OPERATION_FAILED
+            )
+        ordered_pages = tuple(
+            sorted(page_results, key=lambda page: page.result_id.int)
+        )
+        result_ids = tuple(page.result_id for page in ordered_pages)
+        frame_ids = tuple(
+            sorted(
+                (page.frame_id for page in ordered_pages),
+                key=lambda value: value.int,
+            )
+        )
+        if (
+            len(set(result_ids)) != len(result_ids)
+            or len(set(frame_ids)) != len(frame_ids)
+            or extraction.source_ocr_result_ids != result_ids
+            or extraction.source_frame_ids != frame_ids
+            or not self._extraction_provenance_is_valid_v1(
+                extraction,
+                ordered_pages,
+            )
+        ):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.OPERATION_FAILED
+            )
+        key = AdmissionNoticeExtractionStorageKeyV1(
+            source_ocr_result_ids=result_ids,
+            extraction_identity_sha256=(
+                extraction.extraction_identity
+                .extraction_identity_sha256
+            ),
+        )
+        canonical_json_payload = extraction.canonical_json_v1()
+        extraction_sha256 = extraction.extraction_sha256
+        if not 0 < len(
+            canonical_json_payload
+        ) <= MAX_AUXILIARY_CANONICAL_JSON_BYTES_V1:
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.CAPACITY_EXCEEDED
+            )
+        result: list[StoredAdmissionNoticeExtractionV1] = []
+
+        def put() -> None:
+            encoded_plaintext: bytes | None = None
+            with self._lock:
+                self._require_access_v1(
+                    access,
+                    PrivateEvidenceAccessKindV1.WRITE,
+                )
+                self._require_access_v1(
+                    source_read_access,
+                    PrivateEvidenceAccessKindV1.READ,
+                )
+                partition = self._require_temporal_binding_locked_v1(
+                    capture_epoch,
+                    fence,
+                    WorkOperationKindV1.CAPTURE_EVIDENCE_AUXILIARY,
+                    require_open=True,
+                )
+                for page in ordered_pages:
+                    ocr_key = OcrResultStorageKeyV1(
+                        frame_id=page.frame_id,
+                        inference_identity_sha256=(
+                            page.inference_identity_sha256
+                        ),
+                        preprocessing_identity_sha256=(
+                            page.preprocessing_identity_sha256
+                        ),
+                    )
+                    stored_ocr = partition.ocr_result_by_key.get(ocr_key)
+                    if (
+                        stored_ocr is None
+                        or stored_ocr.result_id != page.result_id
+                        or stored_ocr.record_id
+                        not in partition.auxiliary_record_ids
+                        or stored_ocr.record_id not in partition.records
+                    ):
+                        raise PrivateEvidenceStoreErrorV1(
+                            PrivateEvidenceStoreReasonV1.RECORD_NOT_FOUND
+                        )
+                    source_record = partition.records.get(stored_ocr.record_id)
+                    if source_record is None:
+                        raise PrivateEvidenceStoreErrorV1(
+                            PrivateEvidenceStoreReasonV1.INTEGRITY_FAILURE
+                        )
+                    source_payload: bytes | None = None
+                    try:
+                        source_payload = self._decrypt_record_locked_v1(
+                            partition,
+                            source_record,
+                            stored_ocr.record_id,
+                            PrivateEvidenceRecordTypeV1.AUXILIARY_CANONICAL_JSON,
+                        )
+                        if not hmac.compare_digest(
+                            source_payload,
+                            page.canonical_json_v1(),
+                        ):
+                            raise PrivateEvidenceStoreErrorV1(
+                                PrivateEvidenceStoreReasonV1.INTEGRITY_FAILURE
+                            )
+                    finally:
+                        if source_payload is not None:
+                            del source_payload
+                existing = partition.admission_extraction_by_key.get(key)
+                if existing is not None:
+                    if (
+                        existing.record_id
+                        not in partition.auxiliary_record_ids
+                        or existing.record_id not in partition.records
+                        or not hmac.compare_digest(
+                            existing.extraction_sha256,
+                            extraction_sha256,
+                        )
+                    ):
+                        raise PrivateEvidenceStoreErrorV1(
+                            PrivateEvidenceStoreReasonV1.INTEGRITY_FAILURE
+                        )
+                    result.append(
+                        StoredAdmissionNoticeExtractionV1(
+                            record_id=existing.record_id,
+                            extraction_sha256=(
+                                existing.extraction_sha256
+                            ),
+                            key=existing.key,
+                            reused=True,
+                        )
+                    )
+                    return
+                if (
+                    len(partition.auxiliary_record_ids)
+                    >= MAX_AUXILIARY_RECORDS_PER_CAPTURE_V1
+                    or len(partition.records)
+                    >= MAX_PRIVATE_RECORDS_PER_CAPTURE_V1
+                    or len(partition.admission_extraction_by_key)
+                    >= MAX_AUXILIARY_RECORDS_PER_CAPTURE_V1
+                    or partition.auxiliary_plaintext_bytes
+                    + len(canonical_json_payload)
+                    > MAX_AUXILIARY_CAPTURE_PLAINTEXT_BYTES_V1
+                ):
+                    raise PrivateEvidenceStoreErrorV1(
+                        PrivateEvidenceStoreReasonV1.CAPACITY_EXCEEDED
+                    )
+                self._call_fault_hook_v1(
+                    PrivateEvidenceStoreFaultPointV1.BEFORE_KEY_LOOKUP
+                )
+                if not self._key_authority.has_key_v1(capture_epoch):
+                    raise PrivateEvidenceStoreErrorV1(
+                        PrivateEvidenceStoreReasonV1.INVARIANT_FAILURE
+                    )
+                record_id = new_uuid7_v1()
+                nonce = self._next_nonce_locked_v1(partition)
+                aad = self._aad_v1(
+                    capture_epoch,
+                    record_id,
+                    PrivateEvidenceRecordTypeV1.AUXILIARY_CANONICAL_JSON,
+                )
+                previous_records = dict(partition.records)
+                previous_auxiliary_ids = set(
+                    partition.auxiliary_record_ids
+                )
+                previous_extractions = dict(
+                    partition.admission_extraction_by_key
+                )
+                previous_plaintext_bytes = (
+                    partition.auxiliary_plaintext_bytes
+                )
+                previous_ciphertext_bytes = (
+                    partition.stored_auxiliary_ciphertext_bytes
+                )
+                try:
+                    encoded_plaintext = encode_private_record_v1(
+                        PrivateEvidenceRecordTypeV1
+                        .AUXILIARY_CANONICAL_JSON,
+                        canonical_json_payload,
+                    )
+                    self._call_fault_hook_v1(
+                        PrivateEvidenceStoreFaultPointV1.BEFORE_ENCRYPTION
+                    )
+                    ciphertext = self._key_authority.encrypt_v1(
+                        capture_epoch,
+                        nonce,
+                        encoded_plaintext,
+                        aad,
+                    )
+                    self._call_fault_hook_v1(
+                        PrivateEvidenceStoreFaultPointV1
+                        .AFTER_ENCRYPTION_BEFORE_INSERTION
+                    )
+                    next_ciphertext_bytes = (
+                        partition.stored_auxiliary_ciphertext_bytes
+                        + len(ciphertext)
+                    )
+                    if (
+                        next_ciphertext_bytes
+                        > MAX_AUXILIARY_STORED_CIPHERTEXT_BYTES_V1
+                    ):
+                        raise PrivateEvidenceStoreErrorV1(
+                            PrivateEvidenceStoreReasonV1.CAPACITY_EXCEEDED
+                        )
+                    record = EncryptedRecordV1(
+                        record_id=record_id,
+                        record_type=(
+                            PrivateEvidenceRecordTypeV1
+                            .AUXILIARY_CANONICAL_JSON
+                        ),
+                        nonce=nonce,
+                        ciphertext=ciphertext,
+                        created_at_epoch_seconds=(
+                            created_at_epoch_seconds
+                        ),
+                        plaintext_length=len(encoded_plaintext),
+                    )
+                    stored = StoredAdmissionNoticeExtractionV1(
+                        record_id=record_id,
+                        extraction_sha256=extraction_sha256,
+                        key=key,
+                        reused=False,
+                    )
+                    partition.records[record_id] = record
+                    partition.auxiliary_record_ids.add(record_id)
+                    partition.admission_extraction_by_key[key] = stored
+                    partition.auxiliary_plaintext_bytes += len(
+                        canonical_json_payload
+                    )
+                    partition.stored_auxiliary_ciphertext_bytes = (
+                        next_ciphertext_bytes
+                    )
+                    self._call_fault_hook_v1(
+                        PrivateEvidenceStoreFaultPointV1
+                        .AFTER_INSERTION_BEFORE_METADATA_COMMIT
+                    )
+                    result.append(stored)
+                except BaseException:
+                    result.clear()
+                    partition.records = previous_records
+                    partition.auxiliary_record_ids = (
+                        previous_auxiliary_ids
+                    )
+                    partition.admission_extraction_by_key = (
+                        previous_extractions
+                    )
+                    partition.auxiliary_plaintext_bytes = (
+                        previous_plaintext_bytes
+                    )
+                    partition.stored_auxiliary_ciphertext_bytes = (
+                        previous_ciphertext_bytes
+                    )
+                    raise
+                finally:
+                    if encoded_plaintext is not None:
+                        del encoded_plaintext
+
+        with self._operation_slot_v1():
+            try:
+                performed = self._work_controller.perform_if_live_v1(
+                    fence,
+                    WorkValidationBoundaryV1.BEFORE_PRIVATE_STORE_WRITE,
+                    put,
+                    _admission_guard_v1=(
+                        lambda: self._capture_is_live_v1(capture_epoch)
+                        and _admission_guard_v1()
+                    ),
+                )
+            except PrivateEvidenceStoreErrorV1:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except (PrivateCodecErrorV1, _CaptureKeyUnavailableV1):
+                raise PrivateEvidenceStoreErrorV1(
+                    PrivateEvidenceStoreReasonV1.OPERATION_FAILED
+                ) from None
+            except Exception:  # noqa: BLE001 - stable store boundary
+                raise PrivateEvidenceStoreErrorV1(
+                    PrivateEvidenceStoreReasonV1.OPERATION_FAILED
+                ) from None
+        if not performed or not result:
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.ACCESS_DENIED
+            )
+        return result[0]
+
     def _decrypt_record_locked_v1(
         self,
         partition: _CapturePartitionV1,
@@ -1689,6 +2158,80 @@ class PrivateEvidenceStoreV1:
             )
         return page_result
 
+    def get_admission_notice_extraction_v1(
+        self,
+        *,
+        access: PrivateEvidenceAccessV1,
+        capture_epoch: CaptureEpochV1,
+        fence: WorkFenceV1,
+        receipt: StoredAdmissionNoticeExtractionV1,
+    ) -> AdmissionNoticeExtractionV1:
+        """Authorized transient read of one indexed encrypted extraction."""
+
+        if not isinstance(receipt, StoredAdmissionNoticeExtractionV1):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.OPERATION_FAILED
+            )
+        matching = self.find_admission_notice_extraction_v1(
+            access=access,
+            capture_epoch=capture_epoch,
+            fence=fence,
+            key=receipt.key,
+            _admission_guard_v1=(
+                lambda: self._capture_is_live_v1(capture_epoch)
+            ),
+        )
+        if (
+            matching is None
+            or matching.record_id != receipt.record_id
+            or not hmac.compare_digest(
+                matching.extraction_sha256,
+                receipt.extraction_sha256,
+            )
+        ):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.RECORD_NOT_FOUND
+            )
+        payload = self.get_record_v1(
+            access=access,
+            capture_epoch=capture_epoch,
+            fence=fence,
+            record_id=receipt.record_id,
+            expected_record_type=(
+                PrivateEvidenceRecordTypeV1.AUXILIARY_CANONICAL_JSON
+            ),
+        )
+        try:
+            extraction = (
+                admission_notice_extraction_from_canonical_json_v1(
+                    payload,
+                    expected_capture_epoch=capture_epoch,
+                )
+            )
+        except (TypeError, ValueError):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.INTEGRITY_FAILURE
+            ) from None
+        finally:
+            del payload
+        if (
+            not hmac.compare_digest(
+                extraction.extraction_sha256,
+                receipt.extraction_sha256,
+            )
+            or extraction.source_ocr_result_ids
+            != receipt.key.source_ocr_result_ids
+            or not hmac.compare_digest(
+                extraction.extraction_identity
+                .extraction_identity_sha256,
+                receipt.key.extraction_identity_sha256,
+            )
+        ):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.INTEGRITY_FAILURE
+            )
+        return extraction
+
     def delete_record_v1(
         self,
         *,
@@ -1727,11 +2270,28 @@ class PrivateEvidenceStoreV1:
                     raise PrivateEvidenceStoreErrorV1(
                         PrivateEvidenceStoreReasonV1.INVARIANT_FAILURE
                     )
+                removed_ocr_result_ids = {
+                    stored.result_id
+                    for stored in partition.ocr_result_by_key.values()
+                    if stored.record_id == record_id
+                }
+                if any(
+                    removed_ocr_result_ids.intersection(
+                        key.source_ocr_result_ids
+                    )
+                    for key in partition.admission_extraction_by_key
+                ):
+                    raise PrivateEvidenceStoreErrorV1(
+                        PrivateEvidenceStoreReasonV1.INVARIANT_FAILURE
+                    )
                 previous_records = dict(partition.records)
                 previous_auxiliary_ids = set(
                     partition.auxiliary_record_ids
                 )
                 previous_ocr_results = dict(partition.ocr_result_by_key)
+                previous_extractions = dict(
+                    partition.admission_extraction_by_key
+                )
                 previous_plaintext_bytes = (
                     partition.auxiliary_plaintext_bytes
                 )
@@ -1744,6 +2304,14 @@ class PrivateEvidenceStoreV1:
                     partition.ocr_result_by_key = {
                         key: stored
                         for key, stored in partition.ocr_result_by_key.items()
+                        if stored.record_id != record_id
+                    }
+                    partition.admission_extraction_by_key = {
+                        key: stored
+                        for (
+                            key,
+                            stored,
+                        ) in partition.admission_extraction_by_key.items()
                         if stored.record_id != record_id
                     }
                     partition.auxiliary_plaintext_bytes -= (
@@ -1761,6 +2329,9 @@ class PrivateEvidenceStoreV1:
                         previous_auxiliary_ids
                     )
                     partition.ocr_result_by_key = previous_ocr_results
+                    partition.admission_extraction_by_key = (
+                        previous_extractions
+                    )
                     partition.auxiliary_plaintext_bytes = (
                         previous_plaintext_bytes
                     )
@@ -1906,6 +2477,7 @@ class PrivateEvidenceStoreV1:
         partition.frame_id_by_seq.clear()
         partition.auxiliary_record_ids.clear()
         partition.ocr_result_by_key.clear()
+        partition.admission_extraction_by_key.clear()
         trace.append(PrivateEvidenceCleanupStepV1.INDICES_CLEARED)
         partition.capture_set = replace(
             partition.capture_set,
@@ -2014,6 +2586,7 @@ class PrivateEvidenceStoreV1:
                     frame_record_count=0,
                     auxiliary_record_count=0,
                     ocr_result_index_count=0,
+                    admission_extraction_index_count=0,
                     accepted_plaintext_encoded_bytes=0,
                     stored_frame_ciphertext_bytes=0,
                     stored_auxiliary_ciphertext_bytes=0,
@@ -2032,6 +2605,9 @@ class PrivateEvidenceStoreV1:
                     partition.auxiliary_record_ids
                 ),
                 ocr_result_index_count=len(partition.ocr_result_by_key),
+                admission_extraction_index_count=len(
+                    partition.admission_extraction_by_key
+                ),
                 accepted_plaintext_encoded_bytes=(
                     partition.accepted_plaintext_encoded_bytes
                 ),
@@ -2046,6 +2622,8 @@ class PrivateEvidenceStoreV1:
                     * ENCRYPTED_RECORD_METADATA_ACCOUNTING_BYTES_V1
                     + len(partition.ocr_result_by_key)
                     * OCR_RESULT_INDEX_ACCOUNTING_BYTES_V1
+                    + len(partition.admission_extraction_by_key)
+                    * ADMISSION_EXTRACTION_INDEX_ACCOUNTING_BYTES_V1
                 ),
                 last_destroyed_capture_seq=(
                     self._last_destroyed_capture_seq
@@ -2059,6 +2637,7 @@ class PrivateEvidenceStoreV1:
     def __repr__(self) -> str:
         return "PrivateEvidenceStoreV1(<encrypted-private-state>)"
 __all__ = [
+    "ADMISSION_EXTRACTION_INDEX_ACCOUNTING_BYTES_V1",
     "AES_256_KEY_BYTES_V1",
     "AES_GCM_NONCE_BYTES_V1",
     "AES_GCM_TAG_BYTES_V1",

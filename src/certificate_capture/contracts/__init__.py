@@ -1,5 +1,16 @@
 """Immutable Secure Certificate Capture V1 core evidence contracts."""
 
+from certificate_capture.contracts.admission_notice import (
+    ADMISSION_NOTICE_EXTRACTION_IDENTITY_SCHEMA_VERSION_V1,
+    ADMISSION_NOTICE_EXTRACTION_SCHEMA_VERSION_V1,
+    EXTRACTED_ADMISSION_FIELD_SCHEMA_VERSION_V1,
+    AdmissionFieldStatusV1,
+    AdmissionNoticeExtractionIdentityV1,
+    AdmissionNoticeExtractionStorageKeyV1,
+    AdmissionNoticeExtractionV1,
+    ExtractedAdmissionFieldV1,
+    StoredAdmissionNoticeExtractionV1,
+)
 from certificate_capture.contracts.evidence import (
     CAPTURE_SET_SCHEMA_VERSION_V1,
     EVIDENCE_FRAME_SCHEMA_VERSION_V1,
@@ -34,19 +45,27 @@ from certificate_capture.contracts.ocr import (
 )
 
 __all__ = [
+    "ADMISSION_NOTICE_EXTRACTION_IDENTITY_SCHEMA_VERSION_V1",
+    "ADMISSION_NOTICE_EXTRACTION_SCHEMA_VERSION_V1",
     "CALIBRATION_DEPENDENCY_SCHEMA_VERSION_V1",
     "CAPTURE_SET_SCHEMA_VERSION_V1",
     "EVIDENCE_FRAME_SCHEMA_VERSION_V1",
+    "EXTRACTED_ADMISSION_FIELD_SCHEMA_VERSION_V1",
     "INFERENCE_IDENTITY_SCHEMA_VERSION_V1",
     "OCR_PAGE_RESULT_SCHEMA_VERSION_V1",
     "OCR_SPAN_SCHEMA_VERSION_V1",
     "AcceleratorPolicyV1",
+    "AdmissionFieldStatusV1",
+    "AdmissionNoticeExtractionIdentityV1",
+    "AdmissionNoticeExtractionStorageKeyV1",
+    "AdmissionNoticeExtractionV1",
     "CalibrationDependencyV1",
     "CaptureSetV1",
     "CaptureWindowV1",
     "CpuRuntimeIdentityV1",
     "EvidenceFrameV1",
     "ExecutionIdentityV1",
+    "ExtractedAdmissionFieldV1",
     "HostProvenanceV1",
     "InferenceIdentityV1",
     "ModelConversionIdentityV1",
@@ -59,5 +78,6 @@ __all__ = [
     "ProcessingIdentityV1",
     "ServiceIdentityV1",
     "SoftwareIdentityV1",
+    "StoredAdmissionNoticeExtractionV1",
     "StoredOcrResultV1",
 ]

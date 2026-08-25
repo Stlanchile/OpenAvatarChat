@@ -274,11 +274,13 @@ The broader downstream `ObservationV1`, field/profile registry,
 `FieldHypothesisV1`, `AssertionV1`, statistical assertion calibration,
 certificate query/answer, private certificate speech, highlighted-evidence UI,
 and generic certificate WebUI roadmap below is deferred and superseded for the
-current implementation path. A later Milestone 6B may add a small
-admission-notice extractor and narrowly sanitized context, but Milestone 6A
-does not add `AdmissionNoticeV1`, `SanitizedAdmissionContextV1`, ChatAgent
-integration, or field semantics. Production seal therefore remains
-`PROCESSOR_NOT_READY` until that later processor exists.
+current implementation path. Milestone 6B adds only a deterministic
+admission-notice extractor for `name`, `source_province`, `college`, and
+`major`. It consumes exact encrypted M6A OCR records and ends at an encrypted
+`AdmissionNoticeExtractionV1`; it does not publish OCR or extraction results.
+`SanitizedAdmissionContextV1`, ChatAgent integration, and all client-facing
+behavior remain deferred to Milestone 7. Production seal therefore remains
+`PROCESSOR_NOT_READY` until that downstream processor exists.
 
 ### Evidence contract
 
