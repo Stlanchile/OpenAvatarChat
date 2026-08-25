@@ -23,12 +23,23 @@ from certificate_capture.contracts.inference import (
     ServiceIdentityV1,
     SoftwareIdentityV1,
 )
+from certificate_capture.contracts.ocr import (
+    OCR_PAGE_RESULT_SCHEMA_VERSION_V1,
+    OCR_SPAN_SCHEMA_VERSION_V1,
+    OcrPageResultV1,
+    OcrPointV1,
+    OcrResultStorageKeyV1,
+    OcrSpanV1,
+    StoredOcrResultV1,
+)
 
 __all__ = [
     "CALIBRATION_DEPENDENCY_SCHEMA_VERSION_V1",
     "CAPTURE_SET_SCHEMA_VERSION_V1",
     "EVIDENCE_FRAME_SCHEMA_VERSION_V1",
     "INFERENCE_IDENTITY_SCHEMA_VERSION_V1",
+    "OCR_PAGE_RESULT_SCHEMA_VERSION_V1",
+    "OCR_SPAN_SCHEMA_VERSION_V1",
     "AcceleratorPolicyV1",
     "CalibrationDependencyV1",
     "CaptureSetV1",
@@ -40,8 +51,13 @@ __all__ = [
     "InferenceIdentityV1",
     "ModelConversionIdentityV1",
     "ModelIdentityV1",
+    "OcrPageResultV1",
+    "OcrPointV1",
+    "OcrResultStorageKeyV1",
+    "OcrSpanV1",
     "PipelineIdentityV1",
     "ProcessingIdentityV1",
     "ServiceIdentityV1",
     "SoftwareIdentityV1",
+    "StoredOcrResultV1",
 ]

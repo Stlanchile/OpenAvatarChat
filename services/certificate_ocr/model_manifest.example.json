@@ -1,0 +1,26 @@
+{
+  "artifacts": [],
+  "backend": {
+    "cpu_threads": 4,
+    "device": "cpu",
+    "enable_hpi": false,
+    "engine": "paddle_static",
+    "ocr_version": "PP-OCRv6",
+    "text_detection_model_dir": "PP-OCRv6_medium_det",
+    "text_recognition_model_dir": "PP-OCRv6_medium_rec",
+    "use_doc_orientation_classify": false,
+    "use_doc_unwarping": false,
+    "use_textline_orientation": false
+  },
+  "identity": null,
+  "processing_timeout_seconds": 30.0,
+  "qualification_record_path": "qualification-record.json",
+  "qualification_record_sha256": null,
+  "qualification_status": "unqualified",
+  "schema_version": "oac.ocr-model-manifest.v1",
+  "warmup": {
+    "expected_minimum_spans": 1,
+    "jpeg_path": "fixtures/warmup.jpg",
+    "sha256": null
+  }
+}

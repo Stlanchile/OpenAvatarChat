@@ -20,12 +20,28 @@ from certificate_capture.capabilities import (
     CaptureCapabilityBindingV1,
 )
 from certificate_capture.contracts.evidence import EvidenceFrameV1
+from certificate_capture.contracts.inference import InferenceIdentityV1
+from certificate_capture.contracts.ocr import (
+    OcrPageResultV1,
+    StoredOcrResultV1,
+)
 from certificate_capture.epochs import CaptureEpochV1
 from certificate_capture.isolation import (
     NormalApplicationAdmissionViewV1,
     _create_normal_mode_isolation_v1,
     _NormalModeIsolationControllerV1,
 )
+from certificate_capture.ocr.client import (
+    OcrDeploymentConfigV1,
+    OcrTransportClientV1,
+)
+from certificate_capture.ocr.protocol import (
+    MAX_OCR_FRAMES_PER_OPERATION_V1,
+    OcrFailureReasonV1,
+    OcrHealthStatusV1,
+    OcrServiceErrorV1,
+)
+from certificate_capture.ocr.service import PrivateOcrServiceV1
 from certificate_capture.private_authority import (
     PrivateEvidenceAccessKindV1,
     PrivateEvidenceAccessV1,
@@ -179,6 +195,19 @@ class _FrameRecordV1:
         return "_FrameRecordV1(<private-metadata>)"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _DetachedPrivateCaptureWorkV1:
+    capture_epoch: CaptureEpochV1 | None
+    ocr_service: PrivateOcrServiceV1 | None
+    timer_task: asyncio.Task[None] | None
+    processor_task: asyncio.Task[None] | None
+    timer_work: RegisteredWorkV1 | None
+    processor_work: RegisteredWorkV1 | None
+
+    def __repr__(self) -> str:
+        return "_DetachedPrivateCaptureWorkV1(<private>)"
+
+
 class _TransitionFailureV1(RuntimeError):
     __slots__ = ("reason",)
 
@@ -237,6 +266,7 @@ class CaptureCoordinatorV1:
         "_last_session_generation",
         "_lock",
         "_monotonic_clock_v1",
+        "_ocr_service_v1",
         "_operation_idle",
         "_operation_lock",
         "_private_evidence_authority_v1",
@@ -354,6 +384,7 @@ class CaptureCoordinatorV1:
         self._inactivity_work_v1: RegisteredWorkV1 | None = None
         self._processor_task_v1: asyncio.Task[None] | None = None
         self._processor_work_v1: RegisteredWorkV1 | None = None
+        self._ocr_service_v1: PrivateOcrServiceV1 | None = None
         self._control_waiters_v1 = 0
         self._private_evidence_authority_v1 = (
             private_evidence_authority_v1
@@ -1424,6 +1455,221 @@ class CaptureCoordinatorV1:
             )
         return result[0]
 
+    async def _install_private_ocr_service_v1(
+        self,
+        client: OcrTransportClientV1,
+    ) -> None:
+        """Install one exact ready sidecar identity; no runtime switching."""
+
+        if (
+            not callable(getattr(client, "health_v1", None))
+            or not callable(getattr(client, "exchange_v1", None))
+            or not callable(getattr(client, "close_v1", None))
+        ):
+            raise OcrServiceErrorV1(OcrFailureReasonV1.OCR_UNAVAILABLE)
+        expected_identity = getattr(client, "expected_identity_v1", None)
+        expected_qualification = getattr(
+            client,
+            "expected_qualification_record_sha256_v1",
+            None,
+        )
+        if (
+            not isinstance(expected_identity, InferenceIdentityV1)
+            or not isinstance(expected_qualification, str)
+            or len(expected_qualification) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_qualification
+            )
+        ):
+            try:
+                await client.close_v1()
+            except Exception:  # noqa: BLE001, S110 - transport stays closed
+                pass
+            raise OcrServiceErrorV1(OcrFailureReasonV1.OCR_UNAVAILABLE)
+        try:
+            health = await client.health_v1()
+        except OcrServiceErrorV1:
+            try:
+                await client.close_v1()
+            except Exception:  # noqa: BLE001, S110 - transport stays closed
+                pass
+            raise
+        except Exception:  # noqa: BLE001 - stable installation boundary
+            try:
+                await client.close_v1()
+            except Exception:  # noqa: BLE001, S110 - transport stays closed
+                pass
+            raise OcrServiceErrorV1(
+                OcrFailureReasonV1.OCR_UNAVAILABLE
+            ) from None
+        if (
+            not isinstance(health, OcrHealthStatusV1)
+            or not hmac.compare_digest(
+                health.identity.inference_identity_sha256,
+                expected_identity.inference_identity_sha256,
+            )
+            or not hmac.compare_digest(
+                health.qualification_record_sha256,
+                expected_qualification,
+            )
+        ):
+            try:
+                await client.close_v1()
+            except Exception:  # noqa: BLE001, S110 - transport stays closed
+                pass
+            raise OcrServiceErrorV1(OcrFailureReasonV1.IDENTITY_MISMATCH)
+        service = PrivateOcrServiceV1._create_for_coordinator_v1(
+            client=client,
+            expected_identity=expected_identity,
+            expected_qualification_record_sha256=(
+                expected_qualification
+            ),
+            private_authority=self._private_evidence_authority_v1,
+            store=self._private_evidence_store_v1,
+            read_access=self._private_store_read_access_v1,
+            write_access=self._private_store_write_access_v1,
+            work_controller=self._work_controller,
+            capture_is_live_v1=self._private_ocr_operation_is_live_v1,
+            fatal_store_failure_v1=self._fail_protocol_runtime_v1,
+            wall_clock_v1=self._wall_clock_v1,
+            monotonic_clock_v1=self._monotonic_clock_v1,
+        )
+        installed = False
+        with self._lock:
+            if (
+                not self._destroyed
+                and not self._shutdown_started
+                and self._ocr_service_v1 is None
+                and self._security_authority_is_usable_v1()
+            ):
+                self._ocr_service_v1 = service
+                installed = True
+        if not installed:
+            try:
+                await client.close_v1()
+            except Exception:  # noqa: BLE001, S110 - transport stays closed
+                pass
+            raise OcrServiceErrorV1(OcrFailureReasonV1.OCR_UNAVAILABLE)
+
+    async def _bootstrap_private_ocr_runtime_v1(
+        self,
+        deployment: OcrDeploymentConfigV1,
+    ) -> None:
+        """Owner-only bootstrap for one reviewed, qualified UDS deployment."""
+
+        if (
+            not isinstance(deployment, OcrDeploymentConfigV1)
+            or not self._feature_is_enabled_v1()
+            or not self._security_authority_is_usable_v1()
+        ):
+            raise OcrServiceErrorV1(OcrFailureReasonV1.OCR_UNAVAILABLE)
+        await self._install_private_ocr_service_v1(
+            deployment.create_client_v1()
+        )
+
+    def _private_ocr_operation_is_live_v1(
+        self,
+        capture_epoch: CaptureEpochV1,
+    ) -> bool:
+        return bool(
+            self._security_authority_is_usable_v1()
+            and self._capture_work_admission_is_open_v1(
+                capture_epoch,
+                {
+                    CaptureStateV1.CAPTURING,
+                    CaptureStateV1.BUILDING_ASSERTIONS,
+                },
+            )
+        )
+
+    async def _process_private_ocr_frames_v1(
+        self,
+        *,
+        capture_epoch: CaptureEpochV1,
+        frame_ids: tuple[uuid.UUID, ...],
+    ) -> tuple[StoredOcrResultV1, ...]:
+        """Trusted internal M6A API; it never exposes OCR plaintext."""
+
+        if (
+            not isinstance(capture_epoch, CaptureEpochV1)
+            or not isinstance(frame_ids, tuple)
+            or not 1
+            <= len(frame_ids)
+            <= MAX_OCR_FRAMES_PER_OPERATION_V1
+            or len(set(frame_ids)) != len(frame_ids)
+            or any(
+                not isinstance(frame_id, uuid.UUID)
+                or frame_id.version != 7
+                or frame_id.variant != uuid.RFC_4122
+                for frame_id in frame_ids
+            )
+        ):
+            raise OcrServiceErrorV1(OcrFailureReasonV1.REQUEST_REJECTED)
+        with self._lock:
+            service = self._ocr_service_v1
+            if (
+                service is None
+                or self._capture_epoch is not capture_epoch
+                or self._state
+                not in {
+                    CaptureStateV1.CAPTURING,
+                    CaptureStateV1.BUILDING_ASSERTIONS,
+                }
+                or not self._private_evidence_authority_v1.is_usable_v1()
+            ):
+                raise OcrServiceErrorV1(
+                    OcrFailureReasonV1.OCR_UNAVAILABLE
+                )
+            evidence_by_id = {
+                record.evidence_frame.frame_id: record.evidence_frame
+                for record in self._frame_records_v1.values()
+            }
+            try:
+                evidence_frames = tuple(
+                    evidence_by_id[frame_id] for frame_id in frame_ids
+                )
+            except KeyError:
+                raise OcrServiceErrorV1(
+                    OcrFailureReasonV1.REQUEST_REJECTED
+                ) from None
+        return await service.process_frames_v1(
+            capture_epoch=capture_epoch,
+            evidence_frames=evidence_frames,
+        )
+
+    def _read_private_ocr_result_for_test_v1(
+        self,
+        *,
+        capture_epoch: CaptureEpochV1,
+        receipt: StoredOcrResultV1,
+        registered_work: RegisteredWorkV1,
+        access: PrivateEvidenceAccessV1,
+    ) -> OcrPageResultV1:
+        """Authorized test seam for inspecting one encrypted OCR record."""
+
+        if not isinstance(registered_work, RegisteredWorkV1):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.ACCESS_DENIED
+            )
+        result: list[OcrPageResultV1] = []
+
+        def read() -> None:
+            result.append(
+                self._private_evidence_store_v1.get_ocr_result_v1(
+                    access=access,
+                    capture_epoch=capture_epoch,
+                    fence=registered_work.fence,
+                    receipt=receipt,
+                )
+            )
+
+        if not self._run_if_session_live_v1(read) or not result:
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.ACCESS_DENIED
+            )
+        return result[0]
+
     async def capture_public_status_v1(
         self,
         *,
@@ -2267,7 +2513,11 @@ class CaptureCoordinatorV1:
         except RuntimeError:
             return
 
-    def _cancel_private_capture_work_locked_v1(self) -> None:
+    def _detach_private_capture_work_locked_v1(
+        self,
+    ) -> _DetachedPrivateCaptureWorkV1:
+        capture_epoch = self._capture_epoch
+        ocr_service = self._ocr_service_v1
         timer_task = self._inactivity_task_v1
         processor_task = self._processor_task_v1
         timer_work = self._inactivity_work_v1
@@ -2282,14 +2532,31 @@ class CaptureCoordinatorV1:
         self._processor_task_v1 = None
         self._processor_work_v1 = None
 
-        for work in (timer_work, processor_work):
+        return _DetachedPrivateCaptureWorkV1(
+            capture_epoch=capture_epoch,
+            ocr_service=ocr_service,
+            timer_task=timer_task,
+            processor_task=processor_task,
+            timer_work=timer_work,
+            processor_work=processor_work,
+        )
+
+    def _cancel_detached_private_capture_work_v1(
+        self,
+        detached: _DetachedPrivateCaptureWorkV1,
+    ) -> None:
+        capture_epoch = detached.capture_epoch
+        ocr_service = detached.ocr_service
+        if capture_epoch is not None and ocr_service is not None:
+            ocr_service.retire_capture_v1(capture_epoch)
+        for work in (detached.timer_work, detached.processor_work):
             if work is not None:
                 try:
                     self._work_controller.cancel_work_v1(work.fence)
                 except Exception:  # noqa: BLE001, S110 - fail closed
                     pass
-        self._cancel_task_v1(timer_task)
-        self._cancel_task_v1(processor_task)
+        self._cancel_task_v1(detached.timer_task)
+        self._cancel_task_v1(detached.processor_task)
 
     def _clear_private_capture_metadata_locked_v1(self) -> None:
         self._frame_records_v1.clear()
@@ -2299,7 +2566,9 @@ class CaptureCoordinatorV1:
         self._seal_attempt_seq_v1 = 0
         self._last_seal_result_v1 = None
 
-    def _prepare_private_capture_end_locked_v1(self) -> bool:
+    def _prepare_private_capture_end_locked_v1(
+        self,
+    ) -> tuple[bool, _DetachedPrivateCaptureWorkV1 | None]:
         """Close admission and work before retired-generation destruction."""
 
         capture_epoch = self._capture_epoch
@@ -2317,9 +2586,8 @@ class CaptureCoordinatorV1:
             except Exception:  # noqa: BLE001 - cleanup uncertainty is fatal
                 closed = False
             if not closed:
-                return False
-        self._cancel_private_capture_work_locked_v1()
-        return True
+                return False, None
+        return True, self._detach_private_capture_work_locked_v1()
 
     def _destroy_private_capture_with_cleanup_fence_v1(
         self,
@@ -2429,6 +2697,10 @@ class CaptureCoordinatorV1:
             and self._inactivity_work_v1 is None
             and self._processor_task_v1 is None
             and self._processor_work_v1 is None
+            and (
+                self._ocr_service_v1 is None
+                or self._ocr_service_v1.active_request_count_v1() == 0
+            )
             and self._private_store_cleanup_token_v1 is None
             and self._private_evidence_store_v1.is_capture_clear_v1()
         )
@@ -2602,12 +2874,15 @@ class CaptureCoordinatorV1:
         transition: _CaptureTransitionV1 | None,
         reason: CaptureFailureReasonV1,
     ) -> bool:
+        detached_work: _DetachedPrivateCaptureWorkV1 | None = None
         with self._lock:
             if self._destroyed:
                 return False
             if transition is not None and self._active_transition is not transition:
                 return False
-            cleanup_prepared = self._prepare_private_capture_end_locked_v1()
+            cleanup_prepared, detached_work = (
+                self._prepare_private_capture_end_locked_v1()
+            )
             self._isolation_controller.close_v1()
             self._isolation_controller.disable_transport_keepalive_v1()
             self._fatal_failure = reason
@@ -2616,6 +2891,8 @@ class CaptureCoordinatorV1:
             self._active_transition = None
             self._quiescence_complete = False
             self._record_v1(SecurityAuditEventCodeV1.CAPTURE_FAILED_CLOSED)
+        if detached_work is not None:
+            self._cancel_detached_private_capture_work_v1(detached_work)
         cleanup_succeeded = bool(
             cleanup_prepared
             and self._erase_failed_private_capture_v1(transition)
@@ -3041,6 +3318,7 @@ class CaptureCoordinatorV1:
         capture_seq: int | None,
     ) -> _CaptureTransitionV1:
         claimed: list[_CaptureTransitionV1] = []
+        detached_work: list[_DetachedPrivateCaptureWorkV1] = []
         rejected: list[CaptureFailureReasonV1] = []
         failed: list[_CaptureTransitionV1] = []
 
@@ -3132,13 +3410,23 @@ class CaptureCoordinatorV1:
                 self._active_transition = transition
                 self._state = CaptureStateV1.ENDING
                 self._quiescence_complete = False
-                if not self._prepare_private_capture_end_locked_v1():
+                prepared, detached = (
+                    self._prepare_private_capture_end_locked_v1()
+                )
+                if detached is not None:
+                    detached_work.append(detached)
+                if not prepared:
                     failed.append(transition)
                     return
                 self._record_v1(SecurityAuditEventCodeV1.CAPTURE_ENDING)
                 claimed.append(transition)
 
-        if not self._run_if_session_live_v1(claim):
+        try:
+            session_live = self._run_if_session_live_v1(claim)
+        finally:
+            for detached in detached_work:
+                self._cancel_detached_private_capture_work_v1(detached)
+        if not session_live:
             reason = CaptureFailureReasonV1.SESSION_AUTHORITY_UNAVAILABLE
             if self._enter_failed_closed_v1(None, reason):
                 self._request_failure_termination_v1()
@@ -3380,14 +3668,19 @@ class CaptureCoordinatorV1:
             self._request_failure_termination_v1()
 
     def _prepare_shutdown_v1(self) -> bool:
+        detached_work: _DetachedPrivateCaptureWorkV1 | None = None
+        ocr_service: PrivateOcrServiceV1 | None = None
         with self._lock:
             if self._destroyed:
                 return self._private_evidence_store_v1.is_capture_clear_v1()
             self._shutdown_started = True
+            ocr_service = self._ocr_service_v1
             was_active = self._state is not CaptureStateV1.IDLE
             transition = self._active_transition
             self._active_transition = None
-            cleanup_prepared = self._prepare_private_capture_end_locked_v1()
+            cleanup_prepared, detached_work = (
+                self._prepare_private_capture_end_locked_v1()
+            )
             if was_active:
                 self._state = CaptureStateV1.FAILED_CLOSED
                 self._failure_reason = (
@@ -3397,6 +3690,10 @@ class CaptureCoordinatorV1:
                 self._record_v1(
                     SecurityAuditEventCodeV1.CAPTURE_FAILED_CLOSED
                 )
+        if ocr_service is not None:
+            ocr_service.close_admission_v1()
+        if detached_work is not None:
+            self._cancel_detached_private_capture_work_v1(detached_work)
         if transition is not None:
             self._close_transition_cleanup_token_v1(transition)
         return cleanup_prepared
@@ -3543,6 +3840,17 @@ class CaptureCoordinatorV1:
             and operation_idle
         )
 
+    async def _close_ocr_transport_async_v1(self) -> bool:
+        with self._lock:
+            service = self._ocr_service_v1
+        if service is None:
+            return True
+        try:
+            await service.close_v1()
+        except Exception:  # noqa: BLE001 - shutdown remains fail closed
+            return False
+        return service.active_request_count_v1() == 0
+
     async def shutdown_async_v1(
         self,
         retired_cleanup_v1: Callable[[], None] | None = None,
@@ -3569,7 +3877,10 @@ class CaptureCoordinatorV1:
                 if time.monotonic() >= deadline:
                     return False
                 await asyncio.sleep(0.01)
-            return finalized
+            return bool(
+                finalized
+                and await self._close_ocr_transport_async_v1()
+            )
         finalized_before_controller = bool(
             not private_partition_active
             and self._finish_shutdown_v1(
@@ -3597,8 +3908,10 @@ class CaptureCoordinatorV1:
             cleanup_prepared=cleanup_prepared,
             controller_cleanup_succeeded=controller_cleanup_succeeded,
         )
+        ocr_transport_closed = await self._close_ocr_transport_async_v1()
         return bool(
             finalized
+            and ocr_transport_closed
             and (
                 finalized_before_controller
                 or controller_cleanup_succeeded

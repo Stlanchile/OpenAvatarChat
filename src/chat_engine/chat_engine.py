@@ -6,12 +6,19 @@ import time
 import uuid
 from _thread import LockType
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional
 
 from dotenv import load_dotenv
 from fastapi import HTTPException, Request
 from loguru import logger
 
+from certificate_capture.ocr.client import OcrDeploymentConfigV1
+from certificate_capture.ocr.deployment import (
+    OCR_DEPLOYMENT_MANIFEST_ENV_V1,
+    OcrDeploymentUnavailableV1,
+    load_ocr_deployment_config_v1,
+)
 from chat_engine.common.client_handler_base import ClientHandlerBase
 from chat_engine.contexts.session_context import SessionContext
 from chat_engine.core.chat_session import ChatSession
@@ -50,6 +57,9 @@ class ChatEngine(object):
         self.logic_manager: LogicManager = LogicManager(self)
         self.states = ChatEngineBaseStates()
         self._certificate_capture_enabled_v1 = False
+        self._certificate_ocr_deployment_v1: (
+            OcrDeploymentConfigV1 | None
+        ) = None
         self._certificate_session_authority_v1: (
             CertificateSessionAuthorityV1 | None
         ) = None
@@ -88,6 +98,46 @@ class ChatEngine(object):
                 False,
             )
         )
+        if self._certificate_capture_enabled_v1 and app is not None:
+            deployment_candidates: list[OcrDeploymentConfigV1] = []
+            deployment_invalid = False
+            state_candidate = getattr(
+                app.state,
+                "certificate_ocr_deployment_v1",
+                None,
+            )
+            if state_candidate is not None:
+                if isinstance(state_candidate, OcrDeploymentConfigV1):
+                    deployment_candidates.append(state_candidate)
+                else:
+                    deployment_invalid = True
+            deployment_manifest = os.environ.get(
+                OCR_DEPLOYMENT_MANIFEST_ENV_V1
+            )
+            if deployment_manifest:
+                try:
+                    deployment_candidates.append(
+                        load_ocr_deployment_config_v1(
+                            Path(deployment_manifest)
+                        )
+                    )
+                except OcrDeploymentUnavailableV1:
+                    deployment_invalid = True
+            if (
+                deployment_invalid
+                or (
+                    deployment_candidates
+                    and any(
+                        candidate != deployment_candidates[0]
+                        for candidate in deployment_candidates[1:]
+                    )
+                )
+            ):
+                logger.warning("CERTIFICATE_OCR_UNAVAILABLE_V1")
+            elif deployment_candidates:
+                self._certificate_ocr_deployment_v1 = (
+                    deployment_candidates[0]
+                )
         if self._certificate_capture_enabled_v1 and app is not None:
             control_runtime = getattr(
                 app.state,
@@ -268,6 +318,9 @@ class ChatEngine(object):
                 ),
                 _capture_failure_terminator_v1=(
                     capture_failure_terminator
+                ),
+                _certificate_ocr_deployment_v1=(
+                    self._certificate_ocr_deployment_v1
                 ),
             )
             handlers = self.handler_manager.get_enabled_handler_registries()

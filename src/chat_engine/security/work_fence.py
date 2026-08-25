@@ -15,9 +15,8 @@ from chat_engine.security.epochs import SessionEpochV1
 class WorkOperationKindV1(str, Enum):
     """Closed Milestone 3 operation kinds.
 
-    Milestone 5A additionally admits only encrypted evidence partition,
-    auxiliary-record, and authorized internal-read work. OCR/query/speech work
-    remains absent.
+    Milestone 6A additionally admits one CPU OCR inference kind. Extraction,
+    query, and certificate-speech work remain absent.
     """
 
     GENERIC_ASYNC = "GENERIC_ASYNC"
@@ -38,6 +37,7 @@ class WorkOperationKindV1(str, Enum):
     CAPTURE_EVIDENCE_PARTITION_OPEN = "CAPTURE_EVIDENCE_PARTITION_OPEN"
     CAPTURE_EVIDENCE_AUXILIARY = "CAPTURE_EVIDENCE_AUXILIARY"
     CAPTURE_EVIDENCE_READ = "CAPTURE_EVIDENCE_READ"
+    OCR_INFERENCE = "OCR_INFERENCE"
 
 
 class WorkValidationBoundaryV1(str, Enum):

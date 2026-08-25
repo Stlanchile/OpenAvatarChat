@@ -28,6 +28,9 @@ results
 /local_build.sh
 models/iic
 models
+!services/certificate_ocr/models/
+services/certificate_ocr/models/*
+!services/certificate_ocr/models/README.md
 resource/audio
 resource/avatar/*
 !resource/avatar/put_avatar_here.txt
@@ -36,6 +39,7 @@ dump_talk_audio.pcm
 dump_avatar_audio.pcm
 exp/
 uv.lock
+!services/certificate_ocr/uv.lock
 logs/
 .lock
 node_modules/

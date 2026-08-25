@@ -1,4 +1,4 @@
-"""Secure Certificate Capture V1 lifecycle and private Milestone 4B protocol."""
+"""Secure capture lifecycle and private encrypted CPU OCR foundations."""
 
 from certificate_capture.coordinator import (
     CaptureCoordinatorV1,

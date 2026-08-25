@@ -32,6 +32,7 @@ services:
       - ./models/musetalk/s3fd-619a316812/:/root/.cache/torch/hub/checkpoints/
       - ./exp:/root/open-avatar-chat/exp
       - ./resource:/root/open-avatar-chat/resource
+      - certificate_ocr_runtime:/run/openavatarchat-ocr
     ports:
       - "8282:8282"
     networks:
@@ -50,7 +51,65 @@ services:
               count: all
               capabilities: [ gpu ]
 
+  certificate-ocr-runtime-init:
+    profiles: ["certificate-ocr"]
+    image: open-avatar-chat-certificate-ocr:unqualified
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "chown 10001:10001 /run/openavatarchat-ocr && chmod 0750 /run/openavatarchat-ocr"
+    volumes:
+      - certificate_ocr_runtime:/run/openavatarchat-ocr
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  certificate-ocr:
+    profiles: ["certificate-ocr"]
+    build:
+      context: .
+      dockerfile: services/certificate_ocr/Dockerfile
+      args:
+        OCR_SOURCE_REVISION: ${CERTIFICATE_OCR_SOURCE_REVISION:-}
+    image: open-avatar-chat-certificate-ocr:unqualified
+    environment:
+      - OCR_CONTAINER_IMAGE_DIGEST=${CERTIFICATE_OCR_IMAGE_DIGEST:-}
+      - OCR_DEPENDENCY_LOCK_PATH=/opt/certificate-ocr/uv.lock
+      - OCR_MANIFEST_PATH=/opt/certificate-ocr/models/model_manifest.json
+      - OCR_MODEL_ROOT=/opt/certificate-ocr/models
+      - OCR_SOCKET_PATH=/run/openavatarchat-ocr/ocr.sock
+      - OCR_EXPECTED_CLIENT_UID=${CERTIFICATE_OCR_CLIENT_UID:-0}
+      - OCR_EXPECTED_CLIENT_GID=${CERTIFICATE_OCR_CLIENT_GID:-0}
+      - CUDA_VISIBLE_DEVICES=
+      - NVIDIA_VISIBLE_DEVICES=void
+      - FLAGS_selected_gpus=
+    volumes:
+      - ./services/certificate_ocr/models:/opt/certificate-ocr/models:ro
+      - certificate_ocr_runtime:/run/openavatarchat-ocr
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    restart: "no"
+    depends_on:
+      certificate-ocr-runtime-init:
+        condition: service_completed_successfully
+
 networks:
   nat_network:
     driver: bridge
-    
+
+volumes:
+  certificate_ocr_runtime:

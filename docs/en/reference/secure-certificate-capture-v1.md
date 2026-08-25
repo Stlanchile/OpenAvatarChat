@@ -262,6 +262,24 @@ A Perception or ChatAgent quiescence acknowledgement is valid only after new adm
 - `POST .../{capture_id}/end`
   - Returns success only after key destruction, queue cleanup, callback fencing, and normal-mode resume acknowledgement.
 
+### Current admission-notice roadmap amendment
+
+The current product path is admission-notice personalization, not a general
+credential-verification or certificate-query platform. Milestone 6A implements
+only private CPU OCR and ends at an encrypted `OcrPageResultV1` containing exact
+recognized spans and normalized source polygons. It does not interpret fields
+or publish OCR through a public API.
+
+The broader downstream `ObservationV1`, field/profile registry,
+`FieldHypothesisV1`, `AssertionV1`, statistical assertion calibration,
+certificate query/answer, private certificate speech, highlighted-evidence UI,
+and generic certificate WebUI roadmap below is deferred and superseded for the
+current implementation path. A later Milestone 6B may add a small
+admission-notice extractor and narrowly sanitized context, but Milestone 6A
+does not add `AdmissionNoticeV1`, `SanitizedAdmissionContextV1`, ChatAgent
+integration, or field semantics. Production seal therefore remains
+`PROCESSOR_NOT_READY` until that later processor exists.
+
 ### Evidence contract
 
 Use immutable versioned records:

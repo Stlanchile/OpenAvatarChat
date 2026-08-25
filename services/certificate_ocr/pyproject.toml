@@ -1,0 +1,35 @@
+[project]
+name = "openavatarchat-certificate-ocr"
+version = "0.1.0"
+description = "Isolated CPU-only PP-OCRv6 medium sidecar for private certificate OCR."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy==1.26.4",
+    "opencv-python-headless==4.11.0.86",
+    "paddleocr==3.7.0",
+    "paddlepaddle==3.2.0",
+    "paddlex==3.7.0",
+    "psutil==7.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==9.0.2",
+    "pytest-asyncio==1.3.0",
+]
+
+[project.scripts]
+certificate-ocr-sidecar = "certificate_ocr.app:main"
+certificate-ocr-qualify = "certificate_ocr.qualification:main"
+
+[build-system]
+requires = ["hatchling==1.28.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["certificate_ocr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+asyncio_mode = "auto"

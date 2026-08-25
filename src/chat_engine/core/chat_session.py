@@ -55,10 +55,12 @@ from chat_engine.security.work_runtime import (
     WorkBoundItemV1,
 )
 from certificate_capture.coordinator import CaptureCoordinatorV1
+from certificate_capture.contracts.ocr import StoredOcrResultV1
 from certificate_capture.epochs import CaptureEpochV1
 from certificate_capture.isolation import (
     NormalApplicationAdmissionViewV1,
 )
+from certificate_capture.ocr.client import OcrDeploymentConfigV1
 from certificate_capture.private_authority import (
     PrivateEvidenceAuthorityV1,
 )
@@ -103,8 +105,27 @@ class ChatSession:
         _capture_failure_terminator_v1: (
             Callable[[], None] | None
         ) = None,
+        _certificate_ocr_deployment_v1: (
+            OcrDeploymentConfigV1 | None
+        ) = None,
     ):
         self.session_context = session_context
+        if (
+            _certificate_ocr_deployment_v1 is not None
+            and (
+                not isinstance(
+                    _certificate_ocr_deployment_v1,
+                    OcrDeploymentConfigV1,
+                )
+                or not self.session_context.certificate_capture_enabled_v1
+            )
+        ):
+            raise RuntimeError("private OCR deployment unavailable")
+        self._certificate_ocr_deployment_v1 = (
+            _certificate_ocr_deployment_v1
+        )
+        self._certificate_ocr_bootstrap_lock_v1 = asyncio.Lock()
+        self._certificate_ocr_bootstrapped_v1 = False
         self._stop_state_lock_v1 = threading.Lock()
         self._stop_finalize_lock_v1 = threading.Lock()
         self._stop_complete_event_v1 = threading.Event()
@@ -311,6 +332,51 @@ class ChatSession:
         if coordinator is None:
             raise RuntimeError("capture coordinator unavailable")
         return coordinator.snapshot_v1()
+
+    async def _bootstrap_certificate_ocr_v1(
+        self,
+        deployment: OcrDeploymentConfigV1,
+    ) -> None:
+        """Install one reviewed private OCR runtime for this owning session."""
+
+        coordinator = self._capture_coordinator_v1
+        if (
+            coordinator is None
+            or not self.session_context.certificate_capture_enabled_v1
+            or not isinstance(deployment, OcrDeploymentConfigV1)
+            or (
+                self._certificate_ocr_deployment_v1 is not None
+                and deployment != self._certificate_ocr_deployment_v1
+            )
+        ):
+            raise RuntimeError("private OCR unavailable")
+        async with self._certificate_ocr_bootstrap_lock_v1:
+            if self._certificate_ocr_bootstrapped_v1:
+                return
+            await coordinator._bootstrap_private_ocr_runtime_v1(deployment)
+            self._certificate_ocr_deployment_v1 = deployment
+            self._certificate_ocr_bootstrapped_v1 = True
+
+    async def _process_certificate_ocr_frames_v1(
+        self,
+        *,
+        capture_epoch: CaptureEpochV1,
+        frame_ids: tuple[uuid.UUID, ...],
+    ) -> tuple[StoredOcrResultV1, ...]:
+        """Trusted owner seam returning opaque encrypted-record receipts."""
+
+        coordinator = self._capture_coordinator_v1
+        if coordinator is None:
+            raise RuntimeError("private OCR unavailable")
+        if not self._certificate_ocr_bootstrapped_v1:
+            deployment = self._certificate_ocr_deployment_v1
+            if deployment is None:
+                raise RuntimeError("private OCR unavailable")
+            await self._bootstrap_certificate_ocr_v1(deployment)
+        return await coordinator._process_private_ocr_frames_v1(
+            capture_epoch=capture_epoch,
+            frame_ids=frame_ids,
+        )
 
     def _require_certificate_capture_ownership_v1(
         self,
