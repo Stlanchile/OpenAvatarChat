@@ -116,6 +116,12 @@ class _AsyncProtectedActionStateV1:
     cancel_requested: bool = False
 
 
+RetiredGenerationDestructiveCleanupV1 = Callable[
+    [RetiredGenerationCleanupFenceV1],
+    bool,
+]
+
+
 @dataclass(frozen=True, slots=True)
 class SessionWorkControllerSnapshotV1:
     current_epoch: SessionEpochV1
@@ -464,7 +470,7 @@ class SessionWorkControllerV1:
             return True
         try:
             admitted = bool(admission_guard_v1())
-        except Exception:
+        except Exception:  # noqa: BLE001 - guard failure closes admission
             admitted = False
         if not admitted:
             self._record_v1(SecurityAuditEventCodeV1.WORK_ADMISSION_DENIED)
@@ -906,6 +912,12 @@ class SessionWorkControllerV1:
         return self.validate_work_v1(
             fence,
             WorkValidationBoundaryV1.BEFORE_MEMORY_WRITE,
+        )
+
+    def validate_before_private_store_read_v1(self, fence: object) -> bool:
+        return self.validate_work_v1(
+            fence,
+            WorkValidationBoundaryV1.BEFORE_PRIVATE_STORE_READ,
         )
 
     def validate_before_private_store_write_v1(self, fence: object) -> bool:
@@ -1966,6 +1978,10 @@ class SessionWorkControllerV1:
     def shutdown(
         self,
         retired_cleanup_v1: Callable[[], None] | None = None,
+        *,
+        destructive_cleanup_v1: (
+            RetiredGenerationDestructiveCleanupV1 | None
+        ) = None,
     ) -> bool:
         """Retire, cancel, await all barriers, and destroy this authority."""
 
@@ -2019,6 +2035,15 @@ class SessionWorkControllerV1:
             )
 
         cleanup_succeeded = barrier_succeeded
+        if destructive_cleanup_v1 is not None:
+            for cleanup_fence in cleanup_fences:
+                try:
+                    if not destructive_cleanup_v1(cleanup_fence):
+                        cleanup_succeeded = False
+                except Exception:  # noqa: BLE001 - fail closed without payload data
+                    with self._condition:
+                        self._fail_internal_authority_locked_v1()
+                    cleanup_succeeded = False
         if retired_cleanup_v1 is not None:
             try:
                 retired_cleanup_v1()
@@ -2051,6 +2076,10 @@ class SessionWorkControllerV1:
     async def shutdown_async(
         self,
         retired_cleanup_v1: Callable[[], None] | None = None,
+        *,
+        destructive_cleanup_v1: (
+            RetiredGenerationDestructiveCleanupV1 | None
+        ) = None,
     ) -> bool:
         """Native async counterpart to shutdown without blocking the loop."""
 
@@ -2114,6 +2143,34 @@ class SessionWorkControllerV1:
                         reopen_admission=False,
                         allow_failed=True,
                     )
+                cleanup_fences = tuple(
+                    record.cleanup_fence
+                    for record in self._retired_generations.values()
+                    if (
+                        record.state
+                        is RetiredGenerationCleanupStateV1.PENDING
+                    )
+                )
+            if destructive_cleanup_v1 is not None:
+                for cleanup_fence in cleanup_fences:
+                    try:
+                        destructive_cleanup_v1(cleanup_fence)
+                    except Exception:  # noqa: BLE001 - erasure is best effort
+                        with self._condition:
+                            self._record_v1(
+                                SecurityAuditEventCodeV1
+                                .WORK_TOKEN_INVARIANT_VIOLATION
+                            )
+            if retired_cleanup_v1 is not None:
+                try:
+                    retired_cleanup_v1()
+                except Exception:  # noqa: BLE001 - teardown remains failed
+                    with self._condition:
+                        self._record_v1(
+                            SecurityAuditEventCodeV1
+                            .WORK_TOKEN_INVARIANT_VIOLATION
+                        )
+            with self._condition:
                 self._finish_shutdown_locked_v1(False)
             raise
         with self._condition:
@@ -2137,6 +2194,15 @@ class SessionWorkControllerV1:
                 return self._finish_shutdown_locked_v1(False)
 
         cleanup_succeeded = barrier_succeeded
+        if destructive_cleanup_v1 is not None:
+            for cleanup_fence in cleanup_fences:
+                try:
+                    if not destructive_cleanup_v1(cleanup_fence):
+                        cleanup_succeeded = False
+                except Exception:  # noqa: BLE001 - fail closed without payload data
+                    with self._condition:
+                        self._fail_internal_authority_locked_v1()
+                    cleanup_succeeded = False
         if retired_cleanup_v1 is not None:
             try:
                 retired_cleanup_v1()

@@ -19,6 +19,13 @@ from starlette.requests import Request
 from certificate_capture.capabilities import CAPTURE_CAPABILITY_HEADER_V1
 from certificate_capture.coordinator import CaptureCoordinatorV1
 from certificate_capture.frame_ingress import read_bounded_private_jpeg_v1
+from certificate_capture.private_authority import (
+    PrivateEvidenceAuthorityV1,
+)
+from certificate_capture.private_store import (
+    PrivateEvidenceCleanupStepV1,
+    PrivateEvidenceStoreV1,
+)
 from certificate_capture.protocol import (
     CaptureProtocolErrorV1,
     CaptureProtocolReasonV1,
@@ -27,6 +34,10 @@ from certificate_capture.routes import install_certificate_capture_routes_v1
 from chat_engine.chat_engine import ChatEngine
 from chat_engine.data_models.chat_engine_config_data import ChatEngineConfigModel
 from chat_engine.data_models.session_info_data import SessionInfoData
+from chat_engine.security.authority import SecurityAuthorityV1
+from chat_engine.security.cleanup_fence import (
+    RetiredGenerationCleanupFenceV1,
+)
 from chat_engine.security.ids import new_uuid7_v1
 from chat_engine.security.session_work_controller import (
     SessionWorkControllerV1,
@@ -118,10 +129,16 @@ class RouteCaptureSessionV1:
             **kwargs,
         )
 
-    async def _commit_certificate_frame_upload_v1(self, permit, validated):
+    async def _commit_certificate_frame_upload_v1(
+        self,
+        permit,
+        validated,
+        encoded_frame,
+    ):
         return await self.coordinator.commit_frame_upload_v1(
             permit,
             validated,
+            encoded_frame,
         )
 
     def _release_certificate_frame_upload_v1(self, permit) -> None:
@@ -187,6 +204,7 @@ class RouteHarnessV1:
     authority: CertificateSessionAuthorityV1
     controller: SessionWorkControllerV1
     coordinator: CaptureCoordinatorV1
+    security_authority_v1: SecurityAuthorityV1
     ownership: SessionOwnershipV1
     session_capability: str
     token: str = "owner-token"
@@ -201,6 +219,7 @@ class RouteHarnessV1:
     async def close(self) -> None:
         await self.coordinator.shutdown_async_v1()
         await self.controller.shutdown_async()
+        self.security_authority_v1.close()
         async with self.authority.serialized_transition():
             self.authority.close()
 
@@ -267,8 +286,20 @@ async def route_harness():
     controller = SessionWorkControllerV1._create_for_test_v1(
         cleanup_timeout_seconds=0.5
     )
+    security_authority_v1, security_registrar_v1 = (
+        SecurityAuthorityV1.create_v1()
+    )
+    private_evidence_authority_v1 = (
+        PrivateEvidenceAuthorityV1._create_for_session_v1(
+            security_authority=security_authority_v1,
+            registrar=security_registrar_v1,
+        )
+    )
     coordinator, _ = CaptureCoordinatorV1._create_for_session_v1(
         work_controller=controller,
+        private_evidence_authority_v1=(
+            private_evidence_authority_v1
+        ),
         feature_enabled_v1=lambda: True,
         security_authority_usable_v1=lambda: True,
         session_live_action_v1=lambda action: (action() or True),
@@ -285,6 +316,7 @@ async def route_harness():
         authority=authority,
         controller=controller,
         coordinator=coordinator,
+        security_authority_v1=security_authority_v1,
         ownership=ownership,
         session_capability=grant.session_capability,
     )
@@ -1056,8 +1088,11 @@ async def test_production_chat_engine_resolver_uses_exact_session_coordinator(
 
 
 @pytest.mark.asyncio
-async def test_session_replacement_destroys_active_capture_before_returning(
+@pytest.mark.parametrize("terminal_kind", ("replacement", "revoke"))
+async def test_session_replacement_or_revoke_destroys_active_capture_before_returning(
     tmp_path,
+    terminal_kind,
+    monkeypatch,
 ):
     now = time.time()
     principal = AuthenticatedPrincipalV1(
@@ -1100,6 +1135,19 @@ async def test_session_replacement_destroys_active_capture_before_returning(
     old_session.start()
     old_coordinator = old_session._capture_coordinator_v1
     assert old_coordinator is not None
+    cleanup_fences: list[RetiredGenerationCleanupFenceV1] = []
+    original_destroy = PrivateEvidenceStoreV1.destroy_capture_v1
+
+    def observe_destroy(self, **kwargs):
+        if self is old_coordinator._private_evidence_store_v1:
+            cleanup_fences.append(kwargs["cleanup_fence"])
+        return original_destroy(self, **kwargs)
+
+    monkeypatch.setattr(
+        PrivateEvidenceStoreV1,
+        "destroy_capture_v1",
+        observe_destroy,
+    )
     old_headers = {
         "Authorization": "Bearer replace-token",
         SESSION_CAPABILITY_HEADER_V1: old_grant.session_capability,
@@ -1141,14 +1189,40 @@ async def test_session_replacement_destroys_active_capture_before_returning(
             )
             assert upload.status_code == 200
 
-            replacement = await client.post(
-                "/api/v1/session-capabilities",
-                headers={"Authorization": "Bearer replace-token"},
-            )
-            assert replacement.status_code == 201
-            assert replacement.json()["session_id"] != old_grant.session_id
+            if terminal_kind == "replacement":
+                terminal = await client.post(
+                    "/api/v1/session-capabilities",
+                    headers={"Authorization": "Bearer replace-token"},
+                )
+                assert terminal.status_code == 201
+                assert terminal.json()["session_id"] != old_grant.session_id
+            else:
+                terminal = await client.delete(
+                    f"/api/v1/sessions/{old_grant.session_id}",
+                    headers=old_headers,
+                )
+                assert terminal.status_code == 204
             assert old_coordinator.snapshot_v1().destroyed is True
             assert old_coordinator._private_capture_is_clear_locked_v1()
+            assert len(cleanup_fences) == 1
+            assert isinstance(
+                cleanup_fences[0],
+                RetiredGenerationCleanupFenceV1,
+            )
+            assert (
+                cleanup_fences[0].retired_generation
+                == begin_body["session_generation"]
+            )
+            assert (
+                old_coordinator._private_evidence_store_v1.cleanup_trace_v1()
+                == (
+                    PrivateEvidenceCleanupStepV1.ADMISSION_CLOSED,
+                    PrivateEvidenceCleanupStepV1.KEY_DESTROYED,
+                    PrivateEvidenceCleanupStepV1.CIPHERTEXT_CLEARED,
+                    PrivateEvidenceCleanupStepV1.INDICES_CLEARED,
+                    PrivateEvidenceCleanupStepV1.METADATA_CLEARED,
+                )
+            )
             assert old_session._stop_complete_event_v1.is_set()
 
             old_status = await client.get(

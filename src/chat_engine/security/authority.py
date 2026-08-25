@@ -587,6 +587,7 @@ class SecurityAuthorityV1:
         parent_envelopes: tuple[SecurityEnvelopeV1, ...],
         *,
         root_authority: object = None,
+        private_core_root: bool = False,
     ) -> SecurityEnvelopeReferenceV1 | None:
         if parent_envelopes:
             classification = most_restrictive_classification_v1(
@@ -595,7 +596,14 @@ class SecurityAuthorityV1:
         else:
             root_allowed = (
                 self._validate_registrar_locked(root_authority)
-                and classification is SecurityClassificationV1.PUBLIC_CHAT
+                and (
+                    classification is SecurityClassificationV1.PUBLIC_CHAT
+                    or (
+                        private_core_root
+                        and classification
+                        is SecurityClassificationV1.CERTIFICATE_PRIVATE
+                    )
+                )
             ) or self._validate_private_test_issuer_locked(root_authority)
             if not root_allowed and isinstance(
                 root_authority,
@@ -717,6 +725,35 @@ class SecurityAuthorityV1:
                     SecurityClassificationV1.CERTIFICATE_PRIVATE,
                     (),
                     root_authority=issuer,
+                )
+        except SecurityAuthorityUnavailableV1:
+            self.audit_registry_failure_v1()
+            return None
+
+    def _issue_certificate_private_root_v1(
+        self,
+        registrar: CoreRegistrarCapabilityV1,
+    ) -> SecurityEnvelopeReferenceV1 | None:
+        """Issue the core-only root used by the private evidence service.
+
+        This construction-time seam is intentionally separate from generic
+        producer and stream registration. It is consumed only before the
+        session registrar is irreversibly closed.
+        """
+
+        try:
+            with self._lock:
+                self._ensure_available_locked()
+                if not self._validate_registrar_locked(registrar):
+                    self._record(
+                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED
+                    )
+                    return None
+                return self._new_envelope_locked(
+                    SecurityClassificationV1.CERTIFICATE_PRIVATE,
+                    (),
+                    root_authority=registrar,
+                    private_core_root=True,
                 )
         except SecurityAuthorityUnavailableV1:
             self.audit_registry_failure_v1()
@@ -908,7 +945,7 @@ class SecurityAuthorityV1:
         self,
         issuer: PrivateTestIssuerCapabilityV1,
     ) -> ConsumerCapabilityV1 | None:
-        """Trusted test seam; there is no production private consumer."""
+        """Trusted test seam for broad synthetic private-flow coverage."""
 
         try:
             with self._lock:
@@ -930,6 +967,33 @@ class SecurityAuthorityV1:
                         }
                     ),
                     issuance_authority=issuer,
+                )
+        except SecurityAuthorityUnavailableV1:
+            self.audit_registry_failure_v1()
+            return None
+
+    def _issue_certificate_private_consumer_capability_v1(
+        self,
+        registrar: CoreRegistrarCapabilityV1,
+    ) -> ConsumerCapabilityV1 | None:
+        """Issue the narrow internal-only private evidence-store grant."""
+
+        try:
+            with self._lock:
+                self._ensure_available_locked()
+                if not self._validate_registrar_locked(registrar):
+                    self._record(
+                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED
+                    )
+                    return None
+                return self._issue_capability_locked(
+                    classifications=frozenset(
+                        {SecurityClassificationV1.CERTIFICATE_PRIVATE}
+                    ),
+                    egress_policies=frozenset(
+                        {EgressPolicyV1.INTERNAL_ONLY}
+                    ),
+                    issuance_authority=registrar,
                 )
         except SecurityAuthorityUnavailableV1:
             self.audit_registry_failure_v1()

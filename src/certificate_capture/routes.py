@@ -216,6 +216,7 @@ def install_certificate_capture_routes_v1(
             result = await session._commit_certificate_frame_upload_v1(
                 permit,
                 validated,
+                body,
             )
         except CaptureProtocolErrorV1 as exception:
             raise _capture_http_error_v1(exception.reason) from None

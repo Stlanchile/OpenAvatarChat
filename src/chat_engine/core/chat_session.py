@@ -59,6 +59,9 @@ from certificate_capture.epochs import CaptureEpochV1
 from certificate_capture.isolation import (
     NormalApplicationAdmissionViewV1,
 )
+from certificate_capture.private_authority import (
+    PrivateEvidenceAuthorityV1,
+)
 from certificate_capture.protocol import (
     BeginCaptureGrantV1,
     CaptureProtocolErrorV1,
@@ -179,6 +182,9 @@ class ChatSession:
                 "work controller requires a secure session"
             )
         self._capture_coordinator_v1: CaptureCoordinatorV1 | None = None
+        self._private_evidence_authority_v1: (
+            PrivateEvidenceAuthorityV1 | None
+        ) = None
         self._normal_application_admission_v1: (
             NormalApplicationAdmissionViewV1 | None
         ) = None
@@ -190,11 +196,24 @@ class ChatSession:
                 raise RuntimeError(
                     "capture coordinator security authority unavailable"
                 )
+            if self._security_registrar_v1 is None:
+                raise RuntimeError(
+                    "capture coordinator registrar unavailable"
+                )
+            self._private_evidence_authority_v1 = (
+                PrivateEvidenceAuthorityV1._create_for_session_v1(
+                    security_authority=self._security_authority,
+                    registrar=self._security_registrar_v1,
+                )
+            )
             (
                 self._capture_coordinator_v1,
                 self._normal_application_admission_v1,
             ) = CaptureCoordinatorV1._create_for_session_v1(
                 work_controller=self._work_controller_v1,
+                private_evidence_authority_v1=(
+                    self._private_evidence_authority_v1
+                ),
                 feature_enabled_v1=(
                     _capture_feature_enabled_v1
                     if _capture_feature_enabled_v1 is not None
@@ -364,6 +383,7 @@ class ChatSession:
         self,
         permit: FrameUploadPermitV1,
         validated_frame: ValidatedJpegFrameV1,
+        encoded_frame: bytearray,
     ) -> FrameUploadResultV1:
         coordinator = self._capture_coordinator_v1
         if coordinator is None:
@@ -373,6 +393,7 @@ class ChatSession:
         return await coordinator.commit_frame_upload_v1(
             permit,
             validated_frame,
+            encoded_frame,
         )
 
     def _release_certificate_frame_upload_v1(
@@ -1136,13 +1157,16 @@ class ChatSession:
         try:
             if self._capture_coordinator_v1 is not None:
                 capture_cleanup_succeeded = (
-                    self._capture_coordinator_v1.shutdown_v1()
+                    self._capture_coordinator_v1.shutdown_v1(
+                        self._prepare_retired_work_cleanup_v1,
+                        _retire_work_controller_v1=True,
+                    )
                 )
                 if not capture_cleanup_succeeded:
                     logger.error(
                         "CAPTURE_COORDINATOR_CLEANUP_FAILED_V1"
                     )
-            if self._work_controller_v1 is not None:
+            elif self._work_controller_v1 is not None:
                 cleanup_succeeded = self._work_controller_v1.shutdown(
                     self._prepare_retired_work_cleanup_v1
                 )
@@ -1171,13 +1195,16 @@ class ChatSession:
             if self._capture_coordinator_v1 is not None:
                 capture_cleanup_succeeded = (
                     await self._capture_coordinator_v1
-                    .shutdown_async_v1()
+                    .shutdown_async_v1(
+                        self._prepare_retired_work_cleanup_v1,
+                        _retire_work_controller_v1=True,
+                    )
                 )
                 if not capture_cleanup_succeeded:
                     logger.error(
                         "CAPTURE_COORDINATOR_CLEANUP_FAILED_V1"
                     )
-            if self._work_controller_v1 is not None:
+            elif self._work_controller_v1 is not None:
                 cleanup_succeeded = (
                     await self._work_controller_v1.shutdown_async(
                         self._prepare_retired_work_cleanup_v1

@@ -11,7 +11,11 @@ from PIL import Image
 
 from certificate_capture.coordinator import CaptureCoordinatorV1
 from certificate_capture.frame_ingress import validate_private_jpeg_v1
+from certificate_capture.private_authority import (
+    PrivateEvidenceAuthorityV1,
+)
 from certificate_capture.protocol import BeginCaptureGrantV1
+from chat_engine.security.authority import SecurityAuthorityV1
 from chat_engine.security.session_work_controller import (
     SessionWorkControllerV1,
 )
@@ -60,9 +64,21 @@ class CaptureProtocolHarnessV1:
             monotonic_clock=self.clock.monotonic,
             cleanup_timeout_seconds=self.cleanup_timeout_seconds,
         )
+        self.security_authority, self.security_registrar = (
+            SecurityAuthorityV1.create_v1()
+        )
+        self.private_evidence_authority = (
+            PrivateEvidenceAuthorityV1._create_for_session_v1(
+                security_authority=self.security_authority,
+                registrar=self.security_registrar,
+            )
+        )
         self.coordinator, self.gate = (
             CaptureCoordinatorV1._create_for_session_v1(
                 work_controller=self.controller,
+                private_evidence_authority_v1=(
+                    self.private_evidence_authority
+                ),
                 feature_enabled_v1=lambda: self.feature_enabled,
                 security_authority_usable_v1=lambda: self.security_live,
                 session_live_action_v1=self.perform_if_session_live,
@@ -125,6 +141,7 @@ class CaptureProtocolHarnessV1:
             return await self.coordinator.commit_frame_upload_v1(
                 permit,
                 validated,
+                encoded_frame,
             )
         finally:
             self.coordinator.release_frame_upload_permit_v1(permit)
@@ -137,6 +154,7 @@ class CaptureProtocolHarnessV1:
     async def close(self) -> None:
         await self.coordinator.shutdown_async_v1()
         await self.controller.shutdown_async()
+        self.security_authority.close()
 
 
 def synthetic_jpeg_v1(

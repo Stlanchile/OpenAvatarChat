@@ -11,6 +11,9 @@ from certificate_capture.coordinator import (
     CaptureFailedClosedV1,
     CaptureTransitionRejectedV1,
 )
+from certificate_capture.private_authority import (
+    PrivateEvidenceAuthorityV1,
+)
 from certificate_capture.state import (
     CaptureStateV1,
     CaptureTransitionPointV1,
@@ -22,6 +25,7 @@ from chat_engine.data_models.chat_engine_config_data import (
     ChatEngineConfigModel,
 )
 from chat_engine.data_models.session_info_data import SessionInfoData
+from chat_engine.security.authority import SecurityAuthorityV1
 from chat_engine.security.session_work_controller import (
     SessionWorkControllerV1,
 )
@@ -64,9 +68,17 @@ def _authority_bound_coordinator():
     controller = SessionWorkControllerV1._create_for_test_v1(
         cleanup_timeout_seconds=0.2
     )
+    security_authority, security_registrar = SecurityAuthorityV1.create_v1()
+    private_evidence_authority = (
+        PrivateEvidenceAuthorityV1._create_for_session_v1(
+            security_authority=security_authority,
+            registrar=security_registrar,
+        )
+    )
     terminations: list[bool] = []
     coordinator, gate = CaptureCoordinatorV1._create_for_session_v1(
         work_controller=controller,
+        private_evidence_authority_v1=private_evidence_authority,
         feature_enabled_v1=lambda: True,
         security_authority_usable_v1=lambda: True,
         session_live_action_v1=(

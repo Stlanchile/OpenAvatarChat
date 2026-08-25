@@ -19,11 +19,22 @@ from certificate_capture.capabilities import (
     CaptureCapabilityAuthorityV1,
     CaptureCapabilityBindingV1,
 )
+from certificate_capture.contracts.evidence import EvidenceFrameV1
 from certificate_capture.epochs import CaptureEpochV1
 from certificate_capture.isolation import (
     NormalApplicationAdmissionViewV1,
     _create_normal_mode_isolation_v1,
     _NormalModeIsolationControllerV1,
+)
+from certificate_capture.private_authority import (
+    PrivateEvidenceAccessKindV1,
+    PrivateEvidenceAccessV1,
+    PrivateEvidenceAuthorityV1,
+)
+from certificate_capture.private_store import (
+    PrivateEvidenceStoreErrorV1,
+    PrivateEvidenceStoreReasonV1,
+    PrivateEvidenceStoreV1,
 )
 from certificate_capture.processor import CaptureProcessorV1
 from certificate_capture.protocol import (
@@ -71,6 +82,7 @@ from chat_engine.security.cleanup_fence import (
     CleanupActionV1,
     CleanupTokenV1,
     GenerationRetirementV1,
+    RetiredGenerationCleanupFenceV1,
     RetiredGenerationCleanupStateV1,
 )
 from chat_engine.security.epochs import SessionEpochV1
@@ -121,6 +133,7 @@ class _CaptureTransitionV1:
     target_generation: int | None
     phase: CaptureTransitionPhaseV1
     cleanup_token: CleanupTokenV1 | None = None
+    cleanup_fence: RetiredGenerationCleanupFenceV1 | None = None
     superseded_transition_id: uuid.UUID | None = None
 
     def __repr__(self) -> str:
@@ -138,13 +151,29 @@ class _BeginReplayResultV1:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class _FrameRecordV1:
-    frame_seq: int
-    encoded_size: int
-    decoded_width: int
-    decoded_height: int
-    sha256_digest: bytes
+    evidence_frame: EvidenceFrameV1
     accepted_at_monotonic: float
     result: FrameUploadResultV1
+
+    @property
+    def frame_seq(self) -> int:
+        return self.evidence_frame.frame_seq
+
+    @property
+    def encoded_size(self) -> int:
+        return self.evidence_frame.encoded_size
+
+    @property
+    def decoded_width(self) -> int:
+        return self.evidence_frame.canonical_width
+
+    @property
+    def decoded_height(self) -> int:
+        return self.evidence_frame.canonical_height
+
+    @property
+    def sha256_digest(self) -> bytes:
+        return self.evidence_frame.sha256
 
     def __repr__(self) -> str:
         return "_FrameRecordV1(<private-metadata>)"
@@ -194,6 +223,7 @@ class CaptureCoordinatorV1:
         "_failure_terminator_v1",
         "_fatal_failure",
         "_feature_enabled_v1",
+        "_frame_metadata_commit_hook_for_test_v1",
         "_frame_records_v1",
         "_inactivity_deadline_epoch_v1",
         "_inactivity_deadline_monotonic_v1",
@@ -209,6 +239,13 @@ class CaptureCoordinatorV1:
         "_monotonic_clock_v1",
         "_operation_idle",
         "_operation_lock",
+        "_private_evidence_authority_v1",
+        "_private_evidence_store_v1",
+        "_private_store_cleanup_access_v1",
+        "_private_store_cleanup_token_v1",
+        "_private_store_delete_access_v1",
+        "_private_store_read_access_v1",
+        "_private_store_write_access_v1",
         "_processor_task_v1",
         "_processor_work_v1",
         "_profile_id_v1",
@@ -236,6 +273,7 @@ class CaptureCoordinatorV1:
         work_controller: SessionWorkControllerV1,
         isolation_controller: _NormalModeIsolationControllerV1,
         isolation_view: NormalApplicationAdmissionViewV1,
+        private_evidence_authority_v1: PrivateEvidenceAuthorityV1,
         feature_enabled_v1: Callable[[], bool],
         security_authority_usable_v1: Callable[[], bool],
         session_live_action_v1: SessionLiveActionV1,
@@ -250,6 +288,14 @@ class CaptureCoordinatorV1:
             raise RuntimeError("capture coordinator construction denied")
         if not isinstance(work_controller, SessionWorkControllerV1):
             raise TypeError("work_controller must be SessionWorkControllerV1")
+        if not isinstance(
+            private_evidence_authority_v1,
+            PrivateEvidenceAuthorityV1,
+        ):
+            raise TypeError(
+                "private_evidence_authority_v1 must be "
+                "PrivateEvidenceAuthorityV1"
+            )
         if test_processor_v1 is not None and not callable(
             getattr(test_processor_v1, "process_capture_v1", None)
         ):
@@ -285,6 +331,9 @@ class CaptureCoordinatorV1:
         self._last_session_generation = work_controller.current_epoch_v1().generation
         self._audit = CoreSecurityAuditV1()
         self._transition_hook_for_test_v1: TransitionHookV1 | None = None
+        self._frame_metadata_commit_hook_for_test_v1: (
+            Callable[[], None] | None
+        ) = None
         self._capability_authority_v1 = CaptureCapabilityAuthorityV1()
         self._active_capture_capability_v1: (
             ActiveCaptureCapabilityV1 | None
@@ -306,12 +355,46 @@ class CaptureCoordinatorV1:
         self._processor_task_v1: asyncio.Task[None] | None = None
         self._processor_work_v1: RegisteredWorkV1 | None = None
         self._control_waiters_v1 = 0
+        self._private_evidence_authority_v1 = (
+            private_evidence_authority_v1
+        )
+        self._private_store_write_access_v1 = (
+            private_evidence_authority_v1._access_for_core_v1(
+                PrivateEvidenceAccessKindV1.WRITE
+            )
+        )
+        self._private_store_read_access_v1 = (
+            private_evidence_authority_v1._access_for_core_v1(
+                PrivateEvidenceAccessKindV1.READ
+            )
+        )
+        self._private_store_delete_access_v1 = (
+            private_evidence_authority_v1._access_for_core_v1(
+                PrivateEvidenceAccessKindV1.DELETE
+            )
+        )
+        self._private_store_cleanup_access_v1 = (
+            private_evidence_authority_v1._access_for_core_v1(
+                PrivateEvidenceAccessKindV1.CLEANUP
+            )
+        )
+        self._private_store_cleanup_token_v1: CleanupTokenV1 | None = None
+        self._private_evidence_store_v1 = (
+            PrivateEvidenceStoreV1._create_for_session_v1(
+                private_authority=private_evidence_authority_v1,
+                work_controller=work_controller,
+                capture_is_live_v1=(
+                    self._private_store_operation_is_live_v1
+                ),
+            )
+        )
 
     @classmethod
     def _create_for_session_v1(
         cls,
         *,
         work_controller: SessionWorkControllerV1,
+        private_evidence_authority_v1: PrivateEvidenceAuthorityV1,
         feature_enabled_v1: Callable[[], bool],
         security_authority_usable_v1: Callable[[], bool],
         session_live_action_v1: SessionLiveActionV1,
@@ -333,6 +416,9 @@ class CaptureCoordinatorV1:
             work_controller=work_controller,
             isolation_controller=isolation_controller,
             isolation_view=isolation_view,
+            private_evidence_authority_v1=(
+                private_evidence_authority_v1
+            ),
             feature_enabled_v1=feature_enabled_v1,
             security_authority_usable_v1=(security_authority_usable_v1),
             session_live_action_v1=session_live_action_v1,
@@ -359,6 +445,13 @@ class CaptureCoordinatorV1:
     ) -> None:
         with self._lock:
             self._transition_hook_for_test_v1 = hook
+
+    def _set_frame_metadata_commit_hook_for_test_v1(
+        self,
+        hook: Callable[[], None] | None,
+    ) -> None:
+        with self._lock:
+            self._frame_metadata_commit_hook_for_test_v1 = hook
 
     def _set_capture_sequence_for_test_v1(self, capture_seq: int) -> None:
         with self._lock:
@@ -697,48 +790,120 @@ class CaptureCoordinatorV1:
             raise CaptureProtocolErrorV1(
                 CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
             ) from None
+        try:
+            partition_work = self._work_controller.register_work_v1(
+                WorkOperationKindV1.CAPTURE_EVIDENCE_PARTITION_OPEN,
+                min(
+                    now_monotonic + FRAME_UPLOAD_READ_TIMEOUT_SECONDS_V1,
+                    binding.expires_at_monotonic,
+                ),
+                _admission_guard_v1=(
+                    lambda: self._capture_work_admission_is_open_v1(
+                        capture_epoch,
+                        {CaptureStateV1.ARMED},
+                    )
+                ),
+            )
+        except Exception:  # noqa: BLE001 - encrypted partition is mandatory
+            self._work_controller.release_work_v1(inactivity_work.lease)
+            self._fail_protocol_runtime_v1()
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+            ) from None
 
         event = asyncio.Event()
         task_started = asyncio.Event()
-        with self._lock:
-            if (
-                self._destroyed
-                or self._shutdown_started
-                or self._state is not CaptureStateV1.ARMED
-                or self._capture_epoch is not capture_epoch
-                or self._active_capture_capability_v1 is not None
+        partition_created = False
+        partition_committed = False
+        cleanup_token: CleanupTokenV1 | None = None
+        try:
+            cleanup_token = (
+                self._work_controller.register_cleanup_participant_v1()
+            )
+            with self._lock:
+                if (
+                    self._destroyed
+                    or self._shutdown_started
+                    or self._state is not CaptureStateV1.ARMED
+                    or self._capture_epoch is not capture_epoch
+                    or self._active_capture_capability_v1 is not None
+                    or self._private_store_cleanup_token_v1 is not None
+                ):
+                    raise RuntimeError(
+                        "capture partition activation precondition failed"
+                    )
+                self._private_evidence_store_v1.create_capture_partition_v1(
+                    access=self._private_store_write_access_v1,
+                    capture_epoch=capture_epoch,
+                    fence=partition_work.fence,
+                    profile_id=profile_id,
+                    capture_created_at_epoch_seconds=now_epoch,
+                    maximum_expires_at_epoch_seconds=(
+                        session_expires_at_epoch_seconds
+                    ),
+                )
+                partition_created = True
+                self._private_store_cleanup_token_v1 = cleanup_token
+                if not (
+                    self._private_evidence_store_v1
+                    ._commit_capture_partition_for_owner_v1(
+                        access=self._private_store_write_access_v1,
+                        capture_epoch=capture_epoch,
+                    )
+                ):
+                    raise RuntimeError(
+                        "capture partition publication failed"
+                    )
+                partition_committed = True
+                self._active_capture_capability_v1 = active_capability
+                self._profile_id_v1 = profile_id
+                self._frame_records_v1.clear()
+                self._unique_frame_digests_v1.clear()
+                self._accepted_frame_bytes_v1 = 0
+                self._active_frame_upload_permits_v1.clear()
+                self._seal_attempt_seq_v1 = 0
+                self._last_seal_result_v1 = None
+                self._inactivity_deadline_monotonic_v1 = (
+                    inactivity_deadline_monotonic
+                )
+                self._inactivity_deadline_epoch_v1 = now_epoch + (
+                    inactivity_deadline_monotonic - now_monotonic
+                )
+                self._inactivity_revision_v1 += 1
+                self._inactivity_event_v1 = event
+                self._inactivity_work_v1 = inactivity_work
+                task = asyncio.create_task(
+                    self._run_inactivity_timer_v1(
+                        capture_epoch,
+                        inactivity_work,
+                        event,
+                        task_started,
+                    )
+                )
+                self._inactivity_task_v1 = task
+            if not self._work_controller.release_work_v1(
+                partition_work.lease
             ):
-                self._work_controller.release_work_v1(inactivity_work.lease)
-                self._fail_protocol_runtime_v1()
-                raise CaptureProtocolErrorV1(
-                    CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+                raise RuntimeError("partition work release failed")
+        except BaseException:  # noqa: BLE001 - rollback includes cancellation
+            self._work_controller.release_work_v1(partition_work.lease)
+            self._work_controller.release_work_v1(inactivity_work.lease)
+            if partition_created and not partition_committed:
+                self._private_evidence_store_v1._rollback_uncommitted_capture_v1(
+                    access=self._private_store_cleanup_access_v1,
+                    capture_epoch=capture_epoch,
                 )
-            self._active_capture_capability_v1 = active_capability
-            self._profile_id_v1 = profile_id
-            self._frame_records_v1.clear()
-            self._unique_frame_digests_v1.clear()
-            self._accepted_frame_bytes_v1 = 0
-            self._active_frame_upload_permits_v1.clear()
-            self._seal_attempt_seq_v1 = 0
-            self._last_seal_result_v1 = None
-            self._inactivity_deadline_monotonic_v1 = (
-                inactivity_deadline_monotonic
-            )
-            self._inactivity_deadline_epoch_v1 = now_epoch + (
-                inactivity_deadline_monotonic - now_monotonic
-            )
-            self._inactivity_revision_v1 += 1
-            self._inactivity_event_v1 = event
-            self._inactivity_work_v1 = inactivity_work
-            task = asyncio.create_task(
-                self._run_inactivity_timer_v1(
-                    capture_epoch,
-                    inactivity_work,
-                    event,
-                    task_started,
+            if not partition_committed and cleanup_token is not None:
+                self._work_controller.withdraw_cleanup_participant_v1(
+                    cleanup_token
                 )
-            )
-            self._inactivity_task_v1 = task
+                with self._lock:
+                    if self._private_store_cleanup_token_v1 is cleanup_token:
+                        self._private_store_cleanup_token_v1 = None
+            self._fail_protocol_runtime_v1()
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_FAILED_CLOSED
+            ) from None
         timer_started = await self._wait_committed_task_started_v1(
             task_started,
             task,
@@ -774,6 +939,20 @@ class CaptureCoordinatorV1:
                 and self._state in permitted_states
                 and self._fatal_failure is None
             )
+
+    def _private_store_operation_is_live_v1(
+        self,
+        capture_epoch: CaptureEpochV1,
+    ) -> bool:
+        return self._capture_work_admission_is_open_v1(
+            capture_epoch,
+            {
+                CaptureStateV1.ARMED,
+                CaptureStateV1.CAPTURING,
+                CaptureStateV1.BUILDING_ASSERTIONS,
+                CaptureStateV1.READY,
+            },
+        )
 
     def _active_capability_authorizes_locked_v1(
         self,
@@ -957,19 +1136,25 @@ class CaptureCoordinatorV1:
         self,
         permit: FrameUploadPermitV1,
         validated_frame: ValidatedJpegFrameV1,
+        encoded_frame: bytearray,
     ) -> FrameUploadResultV1:
-        """Atomically commit metadata; encoded bytes never cross this seam."""
+        """Encrypt immediately and atomically commit store plus metadata."""
 
-        if not isinstance(permit, FrameUploadPermitV1) or not isinstance(
-            validated_frame,
-            ValidatedJpegFrameV1,
+        if (
+            not isinstance(permit, FrameUploadPermitV1)
+            or not isinstance(validated_frame, ValidatedJpegFrameV1)
+            or not isinstance(encoded_frame, bytearray)
+            or len(encoded_frame) != validated_frame.encoded_size
         ):
             raise CaptureProtocolErrorV1(
                 CaptureProtocolReasonV1.CAPTURE_OPERATION_FAILED
             )
-        async with self._serialized_operation_v1():
+        async with self._serialized_frame_commit_v1(
+            permit.registered_work
+        ):
             now_epoch, now_monotonic = self._read_protocol_clocks_v1()
             result: FrameUploadResultV1 | None = None
+            fatal_store_failure: list[bool] = []
 
             def commit() -> None:
                 nonlocal result
@@ -1054,28 +1239,121 @@ class CaptureCoordinatorV1:
                         ),
                         total_accepted_bytes=next_total,
                     )
-                    self._frame_records_v1[permit.frame_seq] = _FrameRecordV1(
-                        frame_seq=permit.frame_seq,
-                        encoded_size=validated_frame.encoded_size,
-                        decoded_width=validated_frame.decoded_width,
-                        decoded_height=validated_frame.decoded_height,
-                        sha256_digest=bytes(validated_frame.sha256_digest),
-                        accepted_at_monotonic=now_monotonic,
-                        result=accepted,
-                    )
-                    self._unique_frame_digests_v1.add(
-                        bytes(validated_frame.sha256_digest)
-                    )
-                    self._accepted_frame_bytes_v1 = next_total
-                    if self._state is CaptureStateV1.ARMED:
-                        self._state = CaptureStateV1.CAPTURING
-                    self._reset_inactivity_locked_v1(
-                        now_epoch,
-                        now_monotonic,
-                    )
-                    result = accepted
 
-            if not self._run_if_session_live_v1(commit):
+                    previous_records = dict(self._frame_records_v1)
+                    previous_digests = set(self._unique_frame_digests_v1)
+                    previous_total = self._accepted_frame_bytes_v1
+                    previous_state = self._state
+                    previous_deadline_epoch = (
+                        self._inactivity_deadline_epoch_v1
+                    )
+                    previous_deadline_monotonic = (
+                        self._inactivity_deadline_monotonic_v1
+                    )
+                    previous_revision = self._inactivity_revision_v1
+
+                    def commit_metadata(
+                        evidence_frame: EvidenceFrameV1,
+                    ) -> None:
+                        nonlocal result
+                        try:
+                            hook = (
+                                self
+                                ._frame_metadata_commit_hook_for_test_v1
+                            )
+                            if hook is not None:
+                                hook()
+                            self._frame_records_v1[
+                                permit.frame_seq
+                            ] = _FrameRecordV1(
+                                evidence_frame=evidence_frame,
+                                accepted_at_monotonic=now_monotonic,
+                                result=accepted,
+                            )
+                            self._unique_frame_digests_v1.add(
+                                bytes(validated_frame.sha256_digest)
+                            )
+                            self._accepted_frame_bytes_v1 = next_total
+                            if self._state is CaptureStateV1.ARMED:
+                                self._state = CaptureStateV1.CAPTURING
+                            self._reset_inactivity_locked_v1(
+                                now_epoch,
+                                now_monotonic,
+                            )
+                            result = accepted
+                        except BaseException:
+                            self._frame_records_v1 = previous_records
+                            self._unique_frame_digests_v1 = (
+                                previous_digests
+                            )
+                            self._accepted_frame_bytes_v1 = previous_total
+                            self._state = previous_state
+                            self._inactivity_deadline_epoch_v1 = (
+                                previous_deadline_epoch
+                            )
+                            self._inactivity_deadline_monotonic_v1 = (
+                                previous_deadline_monotonic
+                            )
+                            self._inactivity_revision_v1 = (
+                                previous_revision
+                            )
+                            result = None
+                            raise
+
+                    try:
+                        self._private_evidence_store_v1.put_frame_v1(
+                            access=self._private_store_write_access_v1,
+                            capture_epoch=capture_epoch,
+                            fence=permit.registered_work.fence,
+                            frame_seq=permit.frame_seq,
+                            received_at_epoch_seconds=now_epoch,
+                            encoded_frame=encoded_frame,
+                            encoded_size=validated_frame.encoded_size,
+                            canonical_width=(
+                                validated_frame.decoded_width
+                            ),
+                            canonical_height=(
+                                validated_frame.decoded_height
+                            ),
+                            sha256_digest=(
+                                validated_frame.sha256_digest
+                            ),
+                            metadata_commit_v1=commit_metadata,
+                        )
+                    except PrivateEvidenceStoreErrorV1 as exception:
+                        if exception.reason in {
+                            PrivateEvidenceStoreReasonV1
+                            .INTEGRITY_FAILURE,
+                            PrivateEvidenceStoreReasonV1
+                            .INVARIANT_FAILURE,
+                        }:
+                            fatal_store_failure.append(True)
+                            reason = (
+                                CaptureProtocolReasonV1
+                                .CAPTURE_FAILED_CLOSED
+                            )
+                        elif exception.reason in {
+                            PrivateEvidenceStoreReasonV1.ACCESS_DENIED,
+                            PrivateEvidenceStoreReasonV1.CAPTURE_CLOSED,
+                        }:
+                            reason = (
+                                CaptureProtocolReasonV1
+                                .CAPTURE_ACCESS_DENIED
+                            )
+                        else:
+                            reason = (
+                                CaptureProtocolReasonV1
+                                .CAPTURE_OPERATION_FAILED
+                            )
+                        raise CaptureProtocolErrorV1(reason) from None
+
+            try:
+                session_live = self._run_if_session_live_v1(commit)
+            except CaptureProtocolErrorV1:
+                if fatal_store_failure:
+                    self._fail_protocol_runtime_v1()
+                raise
+            if not session_live:
                 raise CaptureProtocolErrorV1(
                     CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
                 )
@@ -1096,6 +1374,55 @@ class CaptureCoordinatorV1:
         self._work_controller.release_work_v1(
             permit.registered_work.lease
         )
+
+    def _read_private_frame_for_test_v1(
+        self,
+        *,
+        capture_epoch: CaptureEpochV1,
+        frame_id: uuid.UUID,
+        registered_work: RegisteredWorkV1,
+        access: PrivateEvidenceAccessV1,
+    ) -> bytes:
+        """Authorized internal read seam; no production consumer exists in 5A."""
+
+        if not isinstance(registered_work, RegisteredWorkV1):
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.ACCESS_DENIED
+            )
+        result: list[bytes] = []
+        integrity_failure: list[bool] = []
+
+        def read() -> None:
+            try:
+                result.append(
+                    self._private_evidence_store_v1.get_frame_v1(
+                        access=access,
+                        capture_epoch=capture_epoch,
+                        fence=registered_work.fence,
+                        frame_id=frame_id,
+                    )
+                )
+            except PrivateEvidenceStoreErrorV1 as exception:
+                if exception.reason in {
+                    PrivateEvidenceStoreReasonV1.INTEGRITY_FAILURE,
+                    PrivateEvidenceStoreReasonV1.INVARIANT_FAILURE,
+                    PrivateEvidenceStoreReasonV1
+                    .RECORD_TYPE_MISMATCH,
+                }:
+                    integrity_failure.append(True)
+                raise
+
+        try:
+            session_live = self._run_if_session_live_v1(read)
+        except PrivateEvidenceStoreErrorV1:
+            if integrity_failure:
+                self._fail_protocol_runtime_v1()
+            raise
+        if not session_live or not result:
+            raise PrivateEvidenceStoreErrorV1(
+                PrivateEvidenceStoreReasonV1.ACCESS_DENIED
+            )
+        return result[0]
 
     async def capture_public_status_v1(
         self,
@@ -1940,22 +2267,12 @@ class CaptureCoordinatorV1:
         except RuntimeError:
             return
 
-    def _clear_private_capture_locked_v1(self) -> None:
-        """Invalidate admission and delete all capture-scoped private metadata."""
-
+    def _cancel_private_capture_work_locked_v1(self) -> None:
         timer_task = self._inactivity_task_v1
         processor_task = self._processor_task_v1
         timer_work = self._inactivity_work_v1
         processor_work = self._processor_work_v1
 
-        self._active_capture_capability_v1 = None
-        self._frame_records_v1.clear()
-        self._unique_frame_digests_v1.clear()
-        self._accepted_frame_bytes_v1 = 0
-        self._active_frame_upload_permits_v1.clear()
-        self._profile_id_v1 = None
-        self._seal_attempt_seq_v1 = 0
-        self._last_seal_result_v1 = None
         self._inactivity_deadline_epoch_v1 = None
         self._inactivity_deadline_monotonic_v1 = None
         self._inactivity_revision_v1 += 1
@@ -1974,6 +2291,132 @@ class CaptureCoordinatorV1:
         self._cancel_task_v1(timer_task)
         self._cancel_task_v1(processor_task)
 
+    def _clear_private_capture_metadata_locked_v1(self) -> None:
+        self._frame_records_v1.clear()
+        self._unique_frame_digests_v1.clear()
+        self._accepted_frame_bytes_v1 = 0
+        self._profile_id_v1 = None
+        self._seal_attempt_seq_v1 = 0
+        self._last_seal_result_v1 = None
+
+    def _prepare_private_capture_end_locked_v1(self) -> bool:
+        """Close admission and work before retired-generation destruction."""
+
+        capture_epoch = self._capture_epoch
+        self._active_capture_capability_v1 = None
+        self._active_frame_upload_permits_v1.clear()
+        if capture_epoch is not None:
+            try:
+                closed = (
+                    self._private_evidence_store_v1
+                    ._close_capture_admission_for_owner_v1(
+                        access=self._private_store_cleanup_access_v1,
+                        capture_epoch=capture_epoch,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - cleanup uncertainty is fatal
+                closed = False
+            if not closed:
+                return False
+        self._cancel_private_capture_work_locked_v1()
+        return True
+
+    def _destroy_private_capture_with_cleanup_fence_v1(
+        self,
+        cleanup_fence: RetiredGenerationCleanupFenceV1,
+    ) -> bool:
+        """Perform key-first erasure under one exact M3 cleanup fence."""
+
+        with self._lock:
+            capture_epoch = self._capture_epoch
+            cleanup_token = self._private_store_cleanup_token_v1
+        if capture_epoch is None:
+            return bool(
+                cleanup_token is None
+                and self._private_evidence_store_v1.is_capture_clear_v1()
+            )
+        if (
+            cleanup_fence.session_instance_id
+            != capture_epoch.session_epoch.session_instance_id
+            or cleanup_fence.retired_generation
+            != capture_epoch.session_epoch.generation
+        ):
+            return False
+        if self._private_evidence_store_v1.is_capture_clear_v1():
+            destroyed = True
+        else:
+            try:
+                destroyed = (
+                    self._private_evidence_store_v1.destroy_capture_v1(
+                        access=self._private_store_cleanup_access_v1,
+                        capture_epoch=capture_epoch,
+                        cleanup_fence=cleanup_fence,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - cleanup uncertainty is fatal
+                destroyed = False
+        if not destroyed:
+            return False
+        with self._lock:
+            if self._capture_epoch is not capture_epoch:
+                return False
+            self._clear_private_capture_metadata_locked_v1()
+            cleanup_token = self._private_store_cleanup_token_v1
+        if cleanup_token is not None:
+            try:
+                acknowledged = self._work_controller.release_cleanup_v1(
+                    cleanup_fence,
+                    cleanup_token,
+                    action=CleanupActionV1.ACK_CLEANUP,
+                )
+            except Exception:  # noqa: BLE001 - cleanup uncertainty is fatal
+                acknowledged = False
+            if not acknowledged:
+                return False
+            with self._lock:
+                if self._private_store_cleanup_token_v1 is cleanup_token:
+                    self._private_store_cleanup_token_v1 = None
+        return self._private_evidence_store_v1.is_capture_clear_v1()
+
+    def _erase_failed_private_capture_v1(
+        self,
+        transition: _CaptureTransitionV1 | None,
+    ) -> bool:
+        """Retire the failed capture generation and erase through M3."""
+
+        with self._lock:
+            capture_epoch = self._capture_epoch
+            cleanup_token = self._private_store_cleanup_token_v1
+            cleanup_fence = (
+                transition.cleanup_fence
+                if transition is not None
+                else None
+            )
+        if capture_epoch is None:
+            return self._private_evidence_store_v1.is_capture_clear_v1()
+        if (
+            cleanup_token is None
+            and self._private_evidence_store_v1.is_capture_clear_v1()
+        ):
+            with self._lock:
+                self._clear_private_capture_metadata_locked_v1()
+            return True
+        if cleanup_fence is None:
+            try:
+                retirement = self._work_controller.retire_generation_v1(
+                    GenerationRetirementReasonV1.GENERIC
+                )
+            except Exception:  # noqa: BLE001 - failure remains closed
+                return False
+            cleanup_fence = retirement.cleanup_fence
+            with self._lock:
+                self._last_session_generation = (
+                    retirement.new_epoch.generation
+                )
+        return self._destroy_private_capture_with_cleanup_fence_v1(
+            cleanup_fence
+        )
+
     def _private_capture_is_clear_locked_v1(self) -> bool:
         return bool(
             self._active_capture_capability_v1 is None
@@ -1986,12 +2429,13 @@ class CaptureCoordinatorV1:
             and self._inactivity_work_v1 is None
             and self._processor_task_v1 is None
             and self._processor_work_v1 is None
+            and self._private_store_cleanup_token_v1 is None
+            and self._private_evidence_store_v1.is_capture_clear_v1()
         )
 
     def _fail_protocol_runtime_v1(self) -> None:
         with self._lock:
             capture_was_active = self._capture_epoch is not None
-            self._clear_private_capture_locked_v1()
             transition = self._active_transition
         if capture_was_active and self._enter_failed_closed_v1(
             transition,
@@ -2017,7 +2461,7 @@ class CaptureCoordinatorV1:
     ) -> bool:
         try:
             return bool(self._session_live_action_v1(action))
-        except CaptureProtocolErrorV1:
+        except (CaptureProtocolErrorV1, PrivateEvidenceStoreErrorV1):
             raise
         except Exception:  # noqa: BLE001 - authority callback is fail closed
             return False
@@ -2063,6 +2507,83 @@ class CaptureCoordinatorV1:
             self._operation_idle.set()
             self._operation_lock.release()
 
+    @asynccontextmanager
+    async def _serialized_frame_commit_v1(
+        self,
+        registered_work: RegisteredWorkV1,
+    ):
+        """Acquire the mutation lock without deadlocking retired upload work."""
+
+        if registered_work.cancellation.is_cancelled:
+            raise CaptureProtocolErrorV1(
+                CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+            )
+        acquire_task = asyncio.create_task(self._operation_lock.acquire())
+        cancellation_task = asyncio.create_task(
+            registered_work.cancellation.wait_async()
+        )
+        acquired = False
+        acquire_result_observed = False
+        try:
+            done, _ = await asyncio.wait(
+                {acquire_task, cancellation_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if acquire_task in done:
+                acquired = bool(acquire_task.result())
+                acquire_result_observed = True
+            if (
+                registered_work.cancellation.is_cancelled
+                or cancellation_task in done
+            ):
+                if not acquire_task.done():
+                    acquire_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await acquire_task
+                elif not acquired:
+                    acquired = bool(acquire_task.result())
+                    acquire_result_observed = True
+                if acquired:
+                    self._operation_lock.release()
+                    acquired = False
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                )
+            if not acquired:
+                acquired = bool(await acquire_task)
+                acquire_result_observed = True
+            if registered_work.cancellation.is_cancelled:
+                self._operation_lock.release()
+                acquired = False
+                raise CaptureProtocolErrorV1(
+                    CaptureProtocolReasonV1.CAPTURE_ACCESS_DENIED
+                )
+            self._operation_idle.clear()
+            try:
+                yield
+            finally:
+                self._operation_idle.set()
+                self._operation_lock.release()
+                acquired = False
+        finally:
+            if not cancellation_task.done():
+                cancellation_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cancellation_task
+            if not acquire_task.done():
+                acquire_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await acquire_task
+            elif (
+                not acquire_result_observed
+                and not acquire_task.cancelled()
+                and acquire_task.exception() is None
+                and acquire_task.result()
+            ):
+                self._operation_lock.release()
+            if acquired:
+                self._operation_lock.release()
+
     def _request_failure_termination_v1(self) -> None:
         with self._lock:
             if self._termination_requested:
@@ -2086,7 +2607,7 @@ class CaptureCoordinatorV1:
                 return False
             if transition is not None and self._active_transition is not transition:
                 return False
-            self._clear_private_capture_locked_v1()
+            cleanup_prepared = self._prepare_private_capture_end_locked_v1()
             self._isolation_controller.close_v1()
             self._isolation_controller.disable_transport_keepalive_v1()
             self._fatal_failure = reason
@@ -2095,7 +2616,13 @@ class CaptureCoordinatorV1:
             self._active_transition = None
             self._quiescence_complete = False
             self._record_v1(SecurityAuditEventCodeV1.CAPTURE_FAILED_CLOSED)
-            return True
+        cleanup_succeeded = bool(
+            cleanup_prepared
+            and self._erase_failed_private_capture_v1(transition)
+        )
+        if not cleanup_succeeded:
+            self._request_failure_termination_v1()
+        return True
 
     def _fail_transition_v1(
         self,
@@ -2267,6 +2794,32 @@ class CaptureCoordinatorV1:
         except Exception:  # noqa: BLE001 - failed drain cannot acknowledge
             drain_succeeded = False
 
+        if transition.kind is CaptureTransitionKindV1.END:
+            with self._lock:
+                capture_epoch = self._capture_epoch
+                if (
+                    self._active_transition is not transition
+                    or self._state is not CaptureStateV1.ENDING
+                ):
+                    raise _TransitionFailureV1(
+                        CaptureFailureReasonV1.STALE_TRANSITION
+                    )
+            if capture_epoch is not None:
+                destroyed = (
+                    self._destroy_private_capture_with_cleanup_fence_v1(
+                        retirement.cleanup_fence
+                    )
+                )
+            else:
+                destroyed = (
+                    self._private_store_cleanup_token_v1 is None
+                    and self._private_evidence_store_v1.is_capture_clear_v1()
+                )
+            if not destroyed:
+                raise _TransitionFailureV1(
+                    CaptureFailureReasonV1.SEMANTIC_CLEANUP_FAILED
+                )
+
         token = transition.cleanup_token
         acknowledged = (
             drain_succeeded
@@ -2393,6 +2946,7 @@ class CaptureCoordinatorV1:
                 retirement = await self._work_controller.retire_generation_async_v1(
                     GenerationRetirementReasonV1.CAPTURE_BEGIN
                 )
+                transition.cleanup_fence = retirement.cleanup_fence
                 await self._call_transition_hook_v1(
                     CaptureTransitionPointV1.AFTER_BEGIN_RETIREMENT
                 )
@@ -2488,6 +3042,7 @@ class CaptureCoordinatorV1:
     ) -> _CaptureTransitionV1:
         claimed: list[_CaptureTransitionV1] = []
         rejected: list[CaptureFailureReasonV1] = []
+        failed: list[_CaptureTransitionV1] = []
 
         def claim() -> None:
             with self._lock:
@@ -2577,7 +3132,9 @@ class CaptureCoordinatorV1:
                 self._active_transition = transition
                 self._state = CaptureStateV1.ENDING
                 self._quiescence_complete = False
-                self._clear_private_capture_locked_v1()
+                if not self._prepare_private_capture_end_locked_v1():
+                    failed.append(transition)
+                    return
                 self._record_v1(SecurityAuditEventCodeV1.CAPTURE_ENDING)
                 claimed.append(transition)
 
@@ -2587,6 +3144,11 @@ class CaptureCoordinatorV1:
                 self._request_failure_termination_v1()
                 raise CaptureFailedClosedV1(reason)
             self._reject_v1(CaptureFailureReasonV1.SESSION_SHUTDOWN)
+        if failed:
+            reason = CaptureFailureReasonV1.INTERNAL_FAILURE
+            self._enter_failed_closed_v1(failed[0], reason)
+            self._request_failure_termination_v1()
+            raise CaptureFailedClosedV1(reason)
         if claimed:
             return claimed[0]
         self._reject_v1(
@@ -2730,6 +3292,7 @@ class CaptureCoordinatorV1:
                 retirement = await self._work_controller.retire_generation_async_v1(
                     GenerationRetirementReasonV1.CAPTURE_END
                 )
+                transition.cleanup_fence = retirement.cleanup_fence
                 await self._call_transition_hook_v1(
                     CaptureTransitionPointV1.AFTER_END_RETIREMENT
                 )
@@ -2816,13 +3379,88 @@ class CaptureCoordinatorV1:
         if self._enter_failed_closed_v1(transition, reason):
             self._request_failure_termination_v1()
 
-    def _start_shutdown_v1(self) -> None:
+    def _prepare_shutdown_v1(self) -> bool:
         with self._lock:
             if self._destroyed:
-                return
+                return self._private_evidence_store_v1.is_capture_clear_v1()
             self._shutdown_started = True
             was_active = self._state is not CaptureStateV1.IDLE
-            self._clear_private_capture_locked_v1()
+            transition = self._active_transition
+            self._active_transition = None
+            cleanup_prepared = self._prepare_private_capture_end_locked_v1()
+            if was_active:
+                self._state = CaptureStateV1.FAILED_CLOSED
+                self._failure_reason = (
+                    CaptureFailureReasonV1.SESSION_SHUTDOWN
+                )
+                self._fatal_failure = self._failure_reason
+                self._record_v1(
+                    SecurityAuditEventCodeV1.CAPTURE_FAILED_CLOSED
+                )
+        if transition is not None:
+            self._close_transition_cleanup_token_v1(transition)
+        return cleanup_prepared
+
+    def _cleanup_private_capture_for_shutdown_fence_v1(
+        self,
+        cleanup_fence: RetiredGenerationCleanupFenceV1,
+    ) -> bool:
+        with self._lock:
+            capture_epoch = self._capture_epoch
+        if capture_epoch is None:
+            return True
+        if (
+            cleanup_fence.session_instance_id
+            != capture_epoch.session_epoch.session_instance_id
+            or cleanup_fence.retired_generation
+            != capture_epoch.session_epoch.generation
+        ):
+            return True
+        return self._destroy_private_capture_with_cleanup_fence_v1(
+            cleanup_fence
+        )
+
+    def _finish_shutdown_v1(
+        self,
+        *,
+        cleanup_prepared: bool,
+        controller_cleanup_succeeded: bool,
+    ) -> bool:
+        with self._lock:
+            if self._destroyed:
+                return bool(
+                    controller_cleanup_succeeded
+                    and self._private_evidence_store_v1
+                    .is_capture_clear_v1()
+                )
+            private_cleanup_succeeded = bool(
+                cleanup_prepared
+                and self._private_store_cleanup_token_v1 is None
+                and self._private_evidence_store_v1.is_capture_clear_v1()
+            )
+            try:
+                store_shutdown = (
+                    self._private_evidence_store_v1.shutdown_v1(
+                        cleanup_access=(
+                            self._private_store_cleanup_access_v1
+                        )
+                    )
+                )
+            except Exception:  # noqa: BLE001 - shutdown remains failed closed
+                store_shutdown = False
+            private_cleanup_succeeded = bool(
+                private_cleanup_succeeded and store_shutdown
+            )
+            if not private_cleanup_succeeded:
+                self._state = CaptureStateV1.FAILED_CLOSED
+                self._failure_reason = (
+                    CaptureFailureReasonV1.SESSION_SHUTDOWN
+                )
+                self._fatal_failure = self._failure_reason
+                self._record_v1(
+                    SecurityAuditEventCodeV1.CAPTURE_FAILED_CLOSED
+                )
+                return False
             self._replay_ledger_v1.clear_v1()
             self._capability_authority_v1.close_v1()
             self._active_transition = None
@@ -2830,31 +3468,142 @@ class CaptureCoordinatorV1:
             self._capture_id = None
             self._quiescence_complete = False
             self._isolation_controller.destroy_v1()
-            if was_active:
-                self._state = CaptureStateV1.FAILED_CLOSED
-                self._failure_reason = CaptureFailureReasonV1.SESSION_SHUTDOWN
-                self._fatal_failure = self._failure_reason
-                self._record_v1(SecurityAuditEventCodeV1.CAPTURE_FAILED_CLOSED)
             self._destroyed = True
+            return bool(controller_cleanup_succeeded)
 
-    def shutdown_v1(self) -> bool:
-        """Destroy capture authority before synchronous session teardown."""
+    def _start_shutdown_v1(self) -> bool:
+        """Compatibility teardown for M4A harnesses with no M5A partition."""
 
-        self._start_shutdown_v1()
-        return self._operation_idle.wait(
-            timeout=self._work_controller.cleanup_timeout_seconds_v1()
+        cleanup_prepared = self._prepare_shutdown_v1()
+        if (
+            self._private_store_cleanup_token_v1 is not None
+            or not self._private_evidence_store_v1.is_capture_clear_v1()
+        ):
+            return False
+        return self._finish_shutdown_v1(
+            cleanup_prepared=cleanup_prepared,
+            controller_cleanup_succeeded=True,
         )
 
-    async def shutdown_async_v1(self) -> bool:
+    def shutdown_v1(
+        self,
+        retired_cleanup_v1: Callable[[], None] | None = None,
+        *,
+        _retire_work_controller_v1: bool = False,
+    ) -> bool:
+        """Destroy capture authority before synchronous session teardown."""
+
+        cleanup_prepared = self._prepare_shutdown_v1()
+        private_partition_active = bool(
+            self._private_store_cleanup_token_v1 is not None
+            or not self._private_evidence_store_v1.is_capture_clear_v1()
+        )
+        if not _retire_work_controller_v1 and not private_partition_active:
+            finalized = self._finish_shutdown_v1(
+                cleanup_prepared=cleanup_prepared,
+                controller_cleanup_succeeded=True,
+            )
+            return bool(
+                finalized
+                and self._operation_idle.wait(
+                    timeout=(
+                        self._work_controller
+                        .cleanup_timeout_seconds_v1()
+                    ),
+                )
+            )
+        finalized_before_controller = bool(
+            not private_partition_active
+            and self._finish_shutdown_v1(
+                cleanup_prepared=cleanup_prepared,
+                controller_cleanup_succeeded=True,
+            )
+        )
+        controller_cleanup_succeeded = self._work_controller.shutdown(
+            retired_cleanup_v1,
+            destructive_cleanup_v1=(
+                self._cleanup_private_capture_for_shutdown_fence_v1
+            ),
+        )
+        operation_idle = self._operation_idle.wait(
+            timeout=self._work_controller.cleanup_timeout_seconds_v1(),
+        )
+        finalized = self._finish_shutdown_v1(
+            cleanup_prepared=cleanup_prepared,
+            controller_cleanup_succeeded=(
+                controller_cleanup_succeeded and operation_idle
+            ),
+        )
+        return bool(
+            finalized
+            and (
+                finalized_before_controller
+                or controller_cleanup_succeeded
+            )
+            and operation_idle
+        )
+
+    async def shutdown_async_v1(
+        self,
+        retired_cleanup_v1: Callable[[], None] | None = None,
+        *,
+        _retire_work_controller_v1: bool = False,
+    ) -> bool:
         """Destroy capture authority without retaining a lock across awaits."""
 
-        self._start_shutdown_v1()
-        deadline = time.monotonic() + self._work_controller.cleanup_timeout_seconds_v1()
+        cleanup_prepared = self._prepare_shutdown_v1()
+        private_partition_active = bool(
+            self._private_store_cleanup_token_v1 is not None
+            or not self._private_evidence_store_v1.is_capture_clear_v1()
+        )
+        if not _retire_work_controller_v1 and not private_partition_active:
+            finalized = self._finish_shutdown_v1(
+                cleanup_prepared=cleanup_prepared,
+                controller_cleanup_succeeded=True,
+            )
+            deadline = (
+                time.monotonic()
+                + self._work_controller.cleanup_timeout_seconds_v1()
+            )
+            while not self._operation_idle.is_set():
+                if time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(0.01)
+            return finalized
+        finalized_before_controller = bool(
+            not private_partition_active
+            and self._finish_shutdown_v1(
+                cleanup_prepared=cleanup_prepared,
+                controller_cleanup_succeeded=True,
+            )
+        )
+        controller_cleanup_succeeded = (
+            await self._work_controller.shutdown_async(
+                retired_cleanup_v1,
+                destructive_cleanup_v1=(
+                    self._cleanup_private_capture_for_shutdown_fence_v1
+                ),
+            )
+        )
+        deadline = (
+            time.monotonic()
+            + self._work_controller.cleanup_timeout_seconds_v1()
+        )
         while not self._operation_idle.is_set():
             if time.monotonic() >= deadline:
                 return False
             await asyncio.sleep(0.01)
-        return True
+        finalized = self._finish_shutdown_v1(
+            cleanup_prepared=cleanup_prepared,
+            controller_cleanup_succeeded=controller_cleanup_succeeded,
+        )
+        return bool(
+            finalized
+            and (
+                finalized_before_controller
+                or controller_cleanup_succeeded
+            )
+        )
 
     def snapshot_v1(self) -> CaptureStatusV1:
         try:

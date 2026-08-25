@@ -141,11 +141,7 @@ async def test_retained_frame_record_is_bounded_metadata_only(
     record = harness.coordinator._frame_records_v1[1]
 
     assert {field.name for field in fields(record)} == {
-        "frame_seq",
-        "encoded_size",
-        "decoded_width",
-        "decoded_height",
-        "sha256_digest",
+        "evidence_frame",
         "accepted_at_monotonic",
         "result",
     }
@@ -156,6 +152,8 @@ async def test_retained_frame_record_is_bounded_metadata_only(
         for field in fields(record)
     )
     assert len(record.sha256_digest) == 32
+    assert record.evidence_frame.frame_seq == 1
+    assert record.evidence_frame.capture_epoch is grant.capture_epoch
     assert not any(
         isinstance(getattr(record, field.name), bytearray)
         for field in fields(record)

@@ -71,6 +71,9 @@ def test_direct_coordinator_construction_is_denied(capture_harness_factory):
             work_controller=harness.controller,
             isolation_controller=object(),
             isolation_view=harness.gate,
+            private_evidence_authority_v1=(
+                harness.private_evidence_authority
+            ),
             feature_enabled_v1=lambda: True,
             security_authority_usable_v1=lambda: True,
             session_live_action_v1=lambda action: True,

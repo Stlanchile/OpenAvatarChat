@@ -315,10 +315,12 @@ async def test_two_same_sequence_uploads_serialize_to_one_record(
             harness.coordinator.commit_frame_upload_v1(
                 first_permit,
                 validated,
+                encoded,
             ),
             harness.coordinator.commit_frame_upload_v1(
                 second_permit,
                 validated,
+                encoded,
             ),
         )
     finally:
@@ -354,9 +356,8 @@ async def test_upload_commit_loses_to_atomic_seal_and_cannot_mutate_build(
         owner_issuer=harness.owner_issuer,
         owner_subject=harness.owner_subject,
     )
-    validated = validate_private_jpeg_v1(
-        synthetic_jpeg_v1(color=(41, 42, 43))
-    )
+    encoded = synthetic_jpeg_v1(color=(41, 42, 43))
+    validated = validate_private_jpeg_v1(encoded)
 
     seal = await harness.coordinator.seal_capture_protocol_v1(
         request_id=uuid.uuid4(),
@@ -372,6 +373,7 @@ async def test_upload_commit_loses_to_atomic_seal_and_cannot_mutate_build(
             await harness.coordinator.commit_frame_upload_v1(
                 permit,
                 validated,
+                encoded,
             )
     finally:
         harness.coordinator.release_frame_upload_permit_v1(permit)

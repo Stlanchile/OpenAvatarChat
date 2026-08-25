@@ -571,6 +571,7 @@ Required results:
 ### Security and runtime gates
 
 - Zero certificate payloads in generic ChatAgent, Perception, history, writeback, generic TTS/audio, manager exports, ordinary logs, or browser persistence.
+- The production ASGI server and any front proxy must prove bounded request-body buffering before application delivery. The bounded application-level frame reader alone does not satisfy this deployment gate.
 - Race tests must complete old Perception, ChatAgent, OCR, query, and TTS operations after Begin/End and prove every stale callback is fenced.
 - Tests must cover session replacement, generation rollover, capture/query sequence mismatch, idempotent retries, late cleanup acknowledgements, and malicious metadata/type/stream rewriting.
 - Identity tests must reject every single-field `CalibrationDependencyV1` mismatch and accept changes only to explicitly non-calibration provenance fields.

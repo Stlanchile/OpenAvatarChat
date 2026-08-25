@@ -15,9 +15,9 @@ from chat_engine.security.epochs import SessionEpochV1
 class WorkOperationKindV1(str, Enum):
     """Closed Milestone 3 operation kinds.
 
-    Milestone 4B adds only private frame-request work, capture-control timers,
-    and the constructor-injected mock lifecycle processor. OCR/query/speech
-    work remains absent.
+    Milestone 5A additionally admits only encrypted evidence partition,
+    auxiliary-record, and authorized internal-read work. OCR/query/speech work
+    remains absent.
     """
 
     GENERIC_ASYNC = "GENERIC_ASYNC"
@@ -35,6 +35,9 @@ class WorkOperationKindV1(str, Enum):
     CAPTURE_FRAME_UPLOAD = "CAPTURE_FRAME_UPLOAD"
     CAPTURE_INACTIVITY_TIMER = "CAPTURE_INACTIVITY_TIMER"
     CAPTURE_MOCK_PROCESSOR = "CAPTURE_MOCK_PROCESSOR"
+    CAPTURE_EVIDENCE_PARTITION_OPEN = "CAPTURE_EVIDENCE_PARTITION_OPEN"
+    CAPTURE_EVIDENCE_AUXILIARY = "CAPTURE_EVIDENCE_AUXILIARY"
+    CAPTURE_EVIDENCE_READ = "CAPTURE_EVIDENCE_READ"
 
 
 class WorkValidationBoundaryV1(str, Enum):
@@ -46,6 +49,7 @@ class WorkValidationBoundaryV1(str, Enum):
     AFTER_RETURN_OR_CALLBACK = "AFTER_RETURN_OR_CALLBACK"
     BEFORE_STATE_MUTATION = "BEFORE_STATE_MUTATION"
     BEFORE_MEMORY_WRITE = "BEFORE_MEMORY_WRITE"
+    BEFORE_PRIVATE_STORE_READ = "BEFORE_PRIVATE_STORE_READ"
     BEFORE_PRIVATE_STORE_WRITE = "BEFORE_PRIVATE_STORE_WRITE"
     BEFORE_FOLLOW_ON_WORK = "BEFORE_FOLLOW_ON_WORK"
     BEFORE_EGRESS = "BEFORE_EGRESS"
