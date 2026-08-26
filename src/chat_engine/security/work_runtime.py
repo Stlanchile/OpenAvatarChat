@@ -38,10 +38,10 @@ from chat_engine.security.work_fence import (
 )
 
 if TYPE_CHECKING:
-    from chat_engine.security.authority import SecurityAuthorityV1
     from certificate_capture.isolation import (
         NormalApplicationAdmissionViewV1,
     )
+    from chat_engine.security.authority import SecurityAuthorityV1
 
 
 _DEFAULT_WORK_LIFETIME_SECONDS_V1: dict[WorkOperationKindV1, float] = {
@@ -335,6 +335,50 @@ class SessionWorkRuntimeV1:
         return authority.consumer_is_authorized_v1(
             envelope_ref,
             consumer_capability,
+        )
+
+    def consume_m2_admission_notice_safe_context_v1(
+        self,
+        envelope_ref: SecurityEnvelopeReferenceV1 | None,
+        consumer_capability: ConsumerCapabilityV1 | None,
+    ) -> bool:
+        """Authorize only an M7 policy-attested public-safe context."""
+
+        authority = self.__security_authority
+        if (
+            authority is None
+            or envelope_ref is None
+            or consumer_capability is None
+        ):
+            return False
+        return (
+            authority
+            .consume_admission_notice_safe_context_for_consumer_v1(
+                envelope_ref,
+                consumer_capability,
+            )
+        )
+
+    def consume_m2_claimed_admission_notice_generation_v1(
+        self,
+        envelope_ref: SecurityEnvelopeReferenceV1 | None,
+        consumer_capability: ConsumerCapabilityV1 | None,
+    ) -> bool:
+        """Consume a previously claimed M7 root at the model-call seam."""
+
+        authority = self.__security_authority
+        if (
+            authority is None
+            or envelope_ref is None
+            or consumer_capability is None
+        ):
+            return False
+        return (
+            authority
+            .consume_claimed_admission_notice_context_for_generation_v1(
+                envelope_ref,
+                consumer_capability,
+            )
         )
 
     def perform_item_egress_if_live_v1(

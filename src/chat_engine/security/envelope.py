@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1 = (
+    "admission-notice-safe-release.v1"
+)
+
 
 class SecurityClassificationV1(str, Enum):
     """V1 security classifications, ordered by restrictiveness in policy.py."""
@@ -34,6 +38,14 @@ class TrustedLineageV1:
 
     parent_envelope_ids: tuple[str, ...] = ()
     ancestor_envelope_ids: tuple[str, ...] = ()
+    policy_release_attestations: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.policy_release_attestations not in (
+            (),
+            (ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1,),
+        ):
+            raise ValueError("unsupported policy release attestation")
 
 
 @dataclass(frozen=True, slots=True, repr=False)

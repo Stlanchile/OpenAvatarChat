@@ -61,6 +61,19 @@ class CoreRegistrarCapabilityV1:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class AdmissionNoticeReleaseAuthorityV1:
+    """Session-scoped authority for the single M7 release policy."""
+
+    authority_id: str
+    release_authority_id: str
+    policy_version: str
+    authenticator: bytes
+
+    def __repr__(self) -> str:
+        return "AdmissionNoticeReleaseAuthorityV1(<opaque>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class ProducerAuthorityReferenceV1:
     """Core-issued identity for one handler or trusted ingress producer."""
 

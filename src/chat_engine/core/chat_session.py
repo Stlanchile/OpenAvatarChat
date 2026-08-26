@@ -41,6 +41,7 @@ from chat_engine.security.authority import SecurityAuthorityV1
 from chat_engine.security.dispatch import (
     CoreRegistrarCapabilityV1,
     ConsumerCapabilityV1,
+    AdmissionNoticeReleaseAuthorityV1,
     ProducerAuthorityReferenceV1,
     ValidatedDispatchV1,
 )
@@ -49,7 +50,11 @@ from chat_engine.security.history import SessionHistoryConsumerViewV1
 from chat_engine.security.session_work_controller import (
     SessionWorkControllerV1,
 )
-from chat_engine.security.work_fence import WorkValidationBoundaryV1
+from chat_engine.security.work_fence import (
+    RegisteredWorkV1,
+    WorkOperationKindV1,
+    WorkValidationBoundaryV1,
+)
 from chat_engine.security.work_runtime import (
     SessionWorkRuntimeV1,
     WorkBoundItemV1,
@@ -74,6 +79,9 @@ from certificate_capture.protocol import (
     FrameUploadResultV1,
     SealResultV1,
     ValidatedJpegFrameV1,
+)
+from certificate_capture.release.service import (
+    AdmissionNoticePersonalizationContinuationV1,
 )
 from certificate_capture.status import CaptureStatusV1
 from service.service_security.certificate_session_authority import (
@@ -206,6 +214,9 @@ class ChatSession:
         self._private_evidence_authority_v1: (
             PrivateEvidenceAuthorityV1 | None
         ) = None
+        self._admission_notice_release_authority_v1: (
+            AdmissionNoticeReleaseAuthorityV1 | None
+        ) = None
         self._normal_application_admission_v1: (
             NormalApplicationAdmissionViewV1 | None
         ) = None
@@ -227,6 +238,16 @@ class ChatSession:
                     registrar=self._security_registrar_v1,
                 )
             )
+            self._admission_notice_release_authority_v1 = (
+                self._security_authority
+                ._issue_admission_notice_release_authority_v1(
+                    self._security_registrar_v1
+                )
+            )
+            if self._admission_notice_release_authority_v1 is None:
+                raise RuntimeError(
+                    "admission notice release authority unavailable"
+                )
             (
                 self._capture_coordinator_v1,
                 self._normal_application_admission_v1,
@@ -234,6 +255,14 @@ class ChatSession:
                 work_controller=self._work_controller_v1,
                 private_evidence_authority_v1=(
                     self._private_evidence_authority_v1
+                ),
+                security_authority_v1=self._security_authority,
+                admission_notice_release_authority_v1=(
+                    self._admission_notice_release_authority_v1
+                ),
+                post_capture_personalization_v1=(
+                    self
+                    ._run_admission_notice_personalization_v1
                 ),
                 feature_enabled_v1=(
                     _capture_feature_enabled_v1
@@ -326,6 +355,92 @@ class ChatSession:
             capture_epoch,
             capture_seq=capture_seq,
         )
+
+    async def _run_admission_notice_personalization_v1(
+        self,
+        continuation: AdmissionNoticePersonalizationContinuationV1,
+        registered_work: RegisteredWorkV1,
+    ) -> None:
+        """Consume one M7 context through the configured normal ChatAgent."""
+
+        if (
+            type(continuation)
+            is not AdmissionNoticePersonalizationContinuationV1
+            or type(registered_work) is not RegisteredWorkV1
+            or registered_work.fence.operation_kind
+            is not WorkOperationKindV1.CHAT_AGENT_LLM
+        ):
+            return
+        selected: list[HandlerRecord] = []
+
+        def select_chat_agent() -> None:
+            from handlers.agent.chat_agent_handler import (
+                ChatAgentContext,
+                ChatAgentHandler,
+            )
+
+            for record in self.handlers.values():
+                if (
+                    type(record.env.handler) is ChatAgentHandler
+                    and type(record.env.context) is ChatAgentContext
+                ):
+                    selected.append(record)
+
+        if (
+            not self._perform_if_capture_session_live_v1(
+                select_chat_agent
+            )
+            or len(selected) != 1
+        ):
+            return
+        released = (
+            AdmissionNoticePersonalizationContinuationV1
+            ._consume_for_core_v1(
+                continuation,
+                expected_successor_epoch=(
+                    registered_work.fence.session_epoch
+                ),
+            )
+        )
+        if released is None:
+            return
+        sanitized_context, envelope_ref = released
+        record = selected[0]
+        output_info = (
+            record.env.handler_output_info
+            or record.env.output_info
+            or {}
+        )
+        handler = record.env.handler
+        context = record.env.context
+        from handlers.agent.chat_agent_handler import ChatAgentHandler
+
+        try:
+            await asyncio.to_thread(
+                ChatAgentHandler._handle_admission_notice_personalization_v1,
+                handler,
+                context,
+                sanitized_context,
+                output_info,
+                work_v1=registered_work,
+                envelope_ref=envelope_ref,
+            )
+        finally:
+            security_authority = self._security_authority
+            release_authority = (
+                self._admission_notice_release_authority_v1
+            )
+            if (
+                security_authority is not None
+                and release_authority is not None
+            ):
+                (
+                    security_authority
+                    ._revoke_admission_notice_safe_public_root_v1(
+                        release_authority,
+                        envelope_ref,
+                    )
+                )
 
     def _certificate_capture_status_v1(self) -> CaptureStatusV1:
         coordinator = self._capture_coordinator_v1

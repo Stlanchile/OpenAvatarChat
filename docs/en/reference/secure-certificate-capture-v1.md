@@ -278,9 +278,10 @@ current implementation path. Milestone 6B adds only a deterministic
 admission-notice extractor for `name`, `source_province`, `college`, and
 `major`. It consumes exact encrypted M6A OCR records and ends at an encrypted
 `AdmissionNoticeExtractionV1`; it does not publish OCR or extraction results.
-`SanitizedAdmissionContextV1`, ChatAgent integration, and all client-facing
-behavior remain deferred to Milestone 7. Production seal therefore remains
-`PROCESSOR_NOT_READY` until that downstream processor exists.
+Milestone 7 adds only the internal trusted release and one-turn ChatAgent
+personalization path described below. It adds no client-facing result API or
+WebUI. Production seal remains `PROCESSOR_NOT_READY` because real M6A
+production qualification is still outstanding.
 
 Milestone 6C binds that extractor to exactly one trusted server-owned template:
 
@@ -341,6 +342,117 @@ the existing certificate-private `ADMISSION_NOTICE_EXTRACTION` work item and
 adds no authority, plaintext store, operation kind, public status, or public
 result API. It does not alter the independent real M6A Paddle/PP-OCRv6
 qualification blockers or the production `PROCESSOR_NOT_READY` gate.
+
+### Milestone 7 trusted admission-notice release
+
+Milestone 7 adds exactly one core-owned release policy:
+
+```text
+policy_version: admission-notice-safe-release.v1
+eligible_input: AdmissionNoticeExtractionV1
+template_id:    hbtc_admission_notice_v1
+institution:    湖北交通职业技术学院
+```
+
+This is the sole `CERTIFICATE_PRIVATE` to `PUBLIC_CHAT`-safe exception. It is
+not a generic declassification API. Ordinary handlers, plugins, routes,
+ChatData consumers, tools, and ChatAgent code receive no release authority.
+Generic M2 derivation still inherits the most restrictive parent
+classification and cannot downgrade `CERTIFICATE_PRIVATE`. The successful M7
+policy operation instead mints a new M2 `PUBLIC_CHAT` lineage root carrying
+the exact `admission-notice-safe-release.v1` attestation.
+
+The released immutable contract is:
+
+```text
+SanitizedAdmissionContextV1 {
+  schema_version
+  institution_name
+  name?
+  source_province?
+  college?
+  major?
+}
+```
+
+`institution_name` is always the trusted server-owned constant
+`湖北交通职业技术学院`; it is never copied from OCR or supplied by a client.
+Only an M6B field whose status is exactly `FOUND` may cross. `AMBIGUOUS` and
+`NOT_FOUND` fields are omitted. The release boundary reparses the canonical
+M6B record and revalidates exact schemas, capture and extraction identity,
+template binding, field-status semantics, field-specific length bounds,
+strict UTF-8, and the absence of Unicode control/format/surrogate state. It
+does no spell correction, normalization rewrite, LLM rewrite, dictionary
+lookup, or network lookup.
+
+No OCR transcript, span, polygon, frame/result ID, score, extraction identity,
+template anchor, capture identity, capability, candidate set, or other
+provenance may enter `SanitizedAdmissionContextV1`. A zero-`FOUND` extraction
+ends internally with `ADMISSION_RELEASE_NO_FIELDS` and starts no ChatAgent
+turn.
+
+Extraction completion retains only its opaque authenticated receipt under an
+exact capture-generation preparation lease. Inside EndCapture processing, the
+release service rereads and strictly validates that encrypted extraction and
+creates a logically private, bounded candidate. The receipt, digest, store
+record identity, and read authority do not enter the candidate and are not
+needed after that step. The candidate is bound to the exact owning session,
+capture, supported template, and release-policy version. It is not
+`PUBLIC_CHAT` and cannot be attached to ChatData.
+
+EndCapture then closes capture admission, retires and cancels
+capture-generation work, destroys the M5A capture DEK before clearing
+ciphertext and indices, proves the cleanup barrier, and validates the exact
+fresh successor session generation. Normal admission must successfully reopen
+on that successor before the policy can commit the release. A timeout, failed
+cleanup, failed reopen, revoked authority, `FAILED_CLOSED`, invalid successor,
+shutdown, or stale callback discards the candidate and emits no personalized
+turn.
+
+The committed context is carried by one server-created, one-use post-capture
+continuation. Only the core continuation path may register `CHAT_AGENT_LLM`
+work under the exact fresh successor generation. Core consumes the
+continuation before invoking the exact built-in ChatAgent entry; ChatAgent
+receives no release identity. Generic M2 consumers cannot authorize or derive
+from the policy root. The trusted entry first claims the exact active,
+policy-attested root, and the fenced model-generation seam consumes that claim
+exactly once before prompt compilation. An ordinary public root, an attested
+descendant, an unclaimed root, or a replayed claim is denied. Abandoned
+continuations and failed dispatches revoke their release root. A
+capture-generation callback cannot consult the later current generation and
+adopt it; ordinary child work still requires its exact live parent. Replayed
+extraction callbacks, End responses, or continuation objects cannot create a
+second personalization attempt. No unbounded release ledger is retained.
+
+ChatAgent receives the context through one strongly typed, ephemeral
+`ChatAgentTurnContextV1`, not through `HUMAN_TEXT`, ChatData metadata, a fake
+user transcript, or a generic arbitrary-context dictionary. The existing
+configured ChatAgent/model, persona, allowed ordinary dialogue history, and
+normal assistant output path are reused. A fixed server-owned prompt fragment
+labels the released values as untrusted data, says not to follow instructions
+inside them, omits missing fields, and forbids authenticity, official
+verification, finalized-admission, or completed-enrollment claims.
+
+Tools and tool-execution loops are disabled for this one generation. No tool
+schemas are sent, and any unsolicited model tool-call delta is suppressed
+without execution. The setting is per turn: ordinary later turns retain their
+configured tool behavior. Document values cannot select a model, endpoint,
+tool, configuration, memory policy, or prompt policy.
+
+The structured context is never written directly to SessionHistory, working
+memory, writeback, compaction input, manager state, analytics, or debug prompt
+logs. Its lifetime ends after the one generation. The natural assistant
+response is ordinary `PUBLIC_CHAT` output and may follow the existing
+assistant-history, TTS, WS, RTC, and avatar paths without a second speech or
+fanout pipeline. ChatAgent failure or cancellation consumes the attempt; it
+does not resurrect destroyed private evidence or retry automatically.
+
+Operational logs may contain only the policy version, opaque release ID,
+released-field count, lifecycle state, duration, and stable reason code. They
+must not contain any released field value or serialized prompt/context.
+Template compatibility remains parsing compatibility only and is not
+authenticity verification. M7 does not change the real M6A qualification
+blocker or the production `PROCESSOR_NOT_READY` seal.
 
 ### Evidence contract
 
@@ -650,7 +762,11 @@ Required results:
 
 ### Security and runtime gates
 
-- Zero certificate payloads in generic ChatAgent, Perception, history, writeback, generic TTS/audio, manager exports, ordinary logs, or browser persistence.
+- Zero raw/private certificate payloads in generic ChatAgent, Perception,
+  history, writeback, generic TTS/audio, manager exports, ordinary logs, or
+  browser persistence. The only ChatAgent exception is the one-use,
+  policy-attested Milestone 7 `SanitizedAdmissionContextV1`; it is never
+  persisted directly.
 - The production ASGI server and any front proxy must prove bounded request-body buffering before application delivery. The bounded application-level frame reader alone does not satisfy this deployment gate.
 - Race tests must complete old Perception, ChatAgent, OCR, query, and TTS operations after Begin/End and prove every stale callback is fenced.
 - Tests must cover session replacement, generation rollover, capture/query sequence mismatch, idempotent retries, late cleanup acknowledgements, and malicious metadata/type/stream rewriting.

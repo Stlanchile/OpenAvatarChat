@@ -25,6 +25,7 @@ from chat_engine.security.audit_events import (
     SecurityAuditEventV1,
 )
 from chat_engine.security.dispatch import (
+    AdmissionNoticeReleaseAuthorityV1,
     AuthorizedDispatchV1,
     AuthorizedSignalEmissionV1,
     ConsumerCapabilityV1,
@@ -38,6 +39,7 @@ from chat_engine.security.dispatch import (
     ValidatedSignalEmissionV1,
 )
 from chat_engine.security.envelope import (
+    ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1,
     EgressPolicyV1,
     SecurityClassificationV1,
     SecurityEnvelopeV1,
@@ -99,6 +101,174 @@ class _RegisteredConsumerCapabilityStateV1:
             allowed_egress_policies=self.allowed_egress_policies,
             authenticator=self.authenticator,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmissionNoticeReleaseAuthorityStateV1:
+    reference: AdmissionNoticeReleaseAuthorityV1
+    active_safe_context_envelope_id: str | None = None
+    claimed_safe_context_envelope_id: str | None = None
+
+
+def _admission_notice_release_authority_accessors_v1():
+    """Keep the single M7 release grant in the M2 authority registry."""
+
+    stores: weakref.WeakKeyDictionary[
+        SecurityAuthorityV1,
+        _AdmissionNoticeReleaseAuthorityStateV1,
+    ] = weakref.WeakKeyDictionary()
+
+    def initialize(authority: SecurityAuthorityV1) -> None:
+        stores.pop(authority, None)
+
+    def register(
+        authority: SecurityAuthorityV1,
+        reference: AdmissionNoticeReleaseAuthorityV1,
+        registrar: object,
+    ) -> bool:
+        if (
+            authority in stores
+            or not authority._validate_registrar_locked(registrar)
+        ):
+            return False
+        stores[authority] = _AdmissionNoticeReleaseAuthorityStateV1(
+            reference=reference,
+        )
+        return True
+
+    def get(
+        authority: SecurityAuthorityV1,
+        release_authority_id: str,
+    ) -> AdmissionNoticeReleaseAuthorityV1 | None:
+        state = stores.get(authority)
+        if (
+            state is None
+            or state.reference.release_authority_id
+            != release_authority_id
+        ):
+            return None
+        return state.reference
+
+    def activate_safe_context_envelope(
+        authority: SecurityAuthorityV1,
+        release_authority_id: str,
+        envelope_id: str,
+    ) -> bool:
+        state = stores.get(authority)
+        if (
+            state is None
+            or state.reference.release_authority_id
+            != release_authority_id
+            or state.active_safe_context_envelope_id is not None
+            or state.claimed_safe_context_envelope_id is not None
+        ):
+            return False
+        stores[authority] = replace(
+            state,
+            active_safe_context_envelope_id=envelope_id,
+        )
+        return True
+
+    def consume_safe_context_envelope(
+        authority: SecurityAuthorityV1,
+        envelope_id: str,
+    ) -> bool:
+        state = stores.get(authority)
+        if (
+            state is None
+            or state.active_safe_context_envelope_id != envelope_id
+            or state.claimed_safe_context_envelope_id is not None
+        ):
+            return False
+        stores[authority] = replace(
+            state,
+            active_safe_context_envelope_id=None,
+            claimed_safe_context_envelope_id=envelope_id,
+        )
+        return True
+
+    def consume_claimed_safe_context_envelope(
+        authority: SecurityAuthorityV1,
+        envelope_id: str,
+    ) -> bool:
+        state = stores.get(authority)
+        if (
+            state is None
+            or state.claimed_safe_context_envelope_id != envelope_id
+        ):
+            return False
+        stores[authority] = replace(
+            state,
+            claimed_safe_context_envelope_id=None,
+        )
+        return True
+
+    def revoke_safe_context_envelope(
+        authority: SecurityAuthorityV1,
+        envelope_id: str,
+    ) -> bool:
+        state = stores.get(authority)
+        if state is None or envelope_id not in {
+            state.active_safe_context_envelope_id,
+            state.claimed_safe_context_envelope_id,
+        }:
+            return False
+        stores[authority] = replace(
+            state,
+            active_safe_context_envelope_id=(
+                None
+                if state.active_safe_context_envelope_id == envelope_id
+                else state.active_safe_context_envelope_id
+            ),
+            claimed_safe_context_envelope_id=(
+                None
+                if state.claimed_safe_context_envelope_id == envelope_id
+                else state.claimed_safe_context_envelope_id
+            ),
+        )
+        return True
+
+    def safe_context_envelope_is_reserved(
+        authority: SecurityAuthorityV1,
+        envelope_id: str,
+    ) -> bool:
+        state = stores.get(authority)
+        return bool(
+            state is not None
+            and envelope_id
+            in {
+                state.active_safe_context_envelope_id,
+                state.claimed_safe_context_envelope_id,
+            }
+        )
+
+    def clear(authority: SecurityAuthorityV1) -> None:
+        stores.pop(authority, None)
+
+    return (
+        initialize,
+        register,
+        get,
+        activate_safe_context_envelope,
+        consume_safe_context_envelope,
+        consume_claimed_safe_context_envelope,
+        revoke_safe_context_envelope,
+        safe_context_envelope_is_reserved,
+        clear,
+    )
+
+
+(
+    _initialize_admission_notice_release_authority_v1,
+    _register_admission_notice_release_authority_v1,
+    _get_admission_notice_release_authority_v1,
+    _activate_admission_notice_safe_context_envelope_v1,
+    _consume_admission_notice_safe_context_envelope_v1,
+    _consume_claimed_admission_notice_safe_context_envelope_v1,
+    _revoke_admission_notice_safe_context_envelope_v1,
+    _admission_notice_safe_context_envelope_is_reserved_v1,
+    _clear_admission_notice_release_authority_v1,
+) = _admission_notice_release_authority_accessors_v1()
 
 
 def _consumer_capability_state_accessors_v1():
@@ -458,6 +628,7 @@ class SecurityAuthorityV1:
         )
         _initialize_consumer_capability_state_v1(self)
         _initialize_producer_state_v1(self)
+        _initialize_admission_notice_release_authority_v1(self)
 
     @classmethod
     def create_v1(
@@ -562,6 +733,7 @@ class SecurityAuthorityV1:
             self._envelope_refs.clear()
             _clear_consumer_capability_state_v1(self)
             _clear_producer_state_v1(self)
+            _clear_admission_notice_release_authority_v1(self)
             self._stream_refs.clear()
 
     # ------------------------------------------------------------------
@@ -579,6 +751,9 @@ class SecurityAuthorityV1:
         for ancestor_id in envelope.lineage.ancestor_envelope_ids:
             digest.update(b"\2")
             digest.update(ancestor_id.encode("utf-8"))
+        for attestation in envelope.lineage.policy_release_attestations:
+            digest.update(b"\3")
+            digest.update(attestation.encode("ascii"))
         return digest.digest()
 
     def _new_envelope_locked(
@@ -588,12 +763,33 @@ class SecurityAuthorityV1:
         *,
         root_authority: object = None,
         private_core_root: bool = False,
+        release_policy_attestation: str | None = None,
     ) -> SecurityEnvelopeReferenceV1 | None:
         if parent_envelopes:
+            if release_policy_attestation is not None:
+                self._record(SecurityAuditEventCodeV1.INVALID_LINEAGE)
+                return None
+            if any(
+                _admission_notice_safe_context_envelope_is_reserved_v1(
+                    self,
+                    parent.envelope_id,
+                )
+                for parent in parent_envelopes
+            ):
+                self._record(SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED)
+                return None
             classification = most_restrictive_classification_v1(
                 parent.classification for parent in parent_envelopes
             )
         else:
+            release_root_allowed = bool(
+                classification is SecurityClassificationV1.PUBLIC_CHAT
+                and release_policy_attestation
+                == ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1
+                and self._validate_admission_notice_release_authority_locked_v1(
+                    root_authority
+                )
+            )
             root_allowed = (
                 self._validate_registrar_locked(root_authority)
                 and (
@@ -604,7 +800,9 @@ class SecurityAuthorityV1:
                         is SecurityClassificationV1.CERTIFICATE_PRIVATE
                     )
                 )
-            ) or self._validate_private_test_issuer_locked(root_authority)
+            ) or self._validate_private_test_issuer_locked(
+                root_authority
+            ) or release_root_allowed
             if not root_allowed and isinstance(
                 root_authority,
                 ProducerAuthorityReferenceV1,
@@ -625,6 +823,8 @@ class SecurityAuthorityV1:
         ancestor_ids: list[str] = []
         seen_parents: set[str] = set()
         seen_ancestors: set[str] = set()
+        release_attestations: list[str] = []
+        seen_release_attestations: set[str] = set()
 
         for parent in parent_envelopes:
             if parent.envelope_id not in seen_parents:
@@ -637,6 +837,14 @@ class SecurityAuthorityV1:
                 if ancestor_id not in seen_ancestors:
                     seen_ancestors.add(ancestor_id)
                     ancestor_ids.append(ancestor_id)
+            for attestation in (
+                parent.lineage.policy_release_attestations
+            ):
+                if attestation not in seen_release_attestations:
+                    seen_release_attestations.add(attestation)
+                    release_attestations.append(attestation)
+        if release_policy_attestation is not None:
+            release_attestations.append(release_policy_attestation)
 
         envelope = SecurityEnvelopeV1(
             envelope_id=envelope_id,
@@ -647,6 +855,9 @@ class SecurityAuthorityV1:
             lineage=TrustedLineageV1(
                 parent_envelope_ids=tuple(parent_ids),
                 ancestor_envelope_ids=tuple(ancestor_ids),
+                policy_release_attestations=tuple(
+                    release_attestations
+                ),
             ),
         )
         envelope_ref = SecurityEnvelopeReferenceV1(
@@ -664,6 +875,170 @@ class SecurityAuthorityV1:
         self._envelopes[envelope_id] = envelope
         self._envelope_refs[envelope_id] = envelope_ref
         return envelope_ref
+
+    def _issue_admission_notice_release_authority_v1(
+        self,
+        registrar: CoreRegistrarCapabilityV1,
+    ) -> AdmissionNoticeReleaseAuthorityV1 | None:
+        """Provision the one narrow M7 release grant before registrar close."""
+
+        try:
+            with self._lock:
+                self._ensure_available_locked()
+                if not self._validate_registrar_locked(registrar):
+                    self._record(
+                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED
+                    )
+                    return None
+                release_authority_id = _opaque_id_v1("arav1_")
+                reference = AdmissionNoticeReleaseAuthorityV1(
+                    authority_id=self._authority_id,
+                    release_authority_id=release_authority_id,
+                    policy_version=(
+                        ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1
+                    ),
+                    authenticator=self._mac(
+                        b"admission-notice-release-authority-v1",
+                        self._authority_id,
+                        release_authority_id,
+                        ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1,
+                    ),
+                )
+                if not _register_admission_notice_release_authority_v1(
+                    self,
+                    reference,
+                    registrar,
+                ):
+                    self._record(SecurityAuditEventCodeV1.REGISTRY_FAILURE)
+                    return None
+                return reference
+        except SecurityAuthorityUnavailableV1:
+            self.audit_registry_failure_v1()
+            return None
+
+    def _validate_admission_notice_release_authority_locked_v1(
+        self,
+        release_authority: object,
+    ) -> bool:
+        if (
+            not isinstance(
+                release_authority,
+                AdmissionNoticeReleaseAuthorityV1,
+            )
+            or release_authority.authority_id != self._authority_id
+            or release_authority.policy_version
+            != ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1
+        ):
+            return False
+        registered = _get_admission_notice_release_authority_v1(
+            self,
+            release_authority.release_authority_id,
+        )
+        if (
+            registered is None
+            or registered.authority_id != release_authority.authority_id
+            or registered.policy_version != release_authority.policy_version
+            or not hmac.compare_digest(
+                registered.authenticator,
+                release_authority.authenticator,
+            )
+        ):
+            return False
+        return hmac.compare_digest(
+            release_authority.authenticator,
+            self._mac(
+                b"admission-notice-release-authority-v1",
+                release_authority.authority_id,
+                release_authority.release_authority_id,
+                release_authority.policy_version,
+            ),
+        )
+
+    def _issue_admission_notice_safe_public_root_v1(
+        self,
+        release_authority: AdmissionNoticeReleaseAuthorityV1,
+    ) -> SecurityEnvelopeReferenceV1 | None:
+        """Mint only the policy-attested PUBLIC root for M7 safe context."""
+
+        try:
+            with self._lock:
+                self._ensure_available_locked()
+                if not (
+                    self._validate_admission_notice_release_authority_locked_v1(
+                        release_authority
+                    )
+                ):
+                    self._record(
+                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED
+                    )
+                    return None
+                envelope_ref = self._new_envelope_locked(
+                    SecurityClassificationV1.PUBLIC_CHAT,
+                    (),
+                    root_authority=release_authority,
+                    release_policy_attestation=(
+                        ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1
+                    ),
+                )
+                if envelope_ref is None:
+                    return None
+                if not (
+                    _activate_admission_notice_safe_context_envelope_v1(
+                        self,
+                        release_authority.release_authority_id,
+                        envelope_ref.envelope_id,
+                    )
+                ):
+                    self._envelopes.pop(envelope_ref.envelope_id, None)
+                    self._envelope_refs.pop(
+                        envelope_ref.envelope_id,
+                        None,
+                    )
+                    self._record(SecurityAuditEventCodeV1.REGISTRY_FAILURE)
+                    return None
+                return envelope_ref
+        except SecurityAuthorityUnavailableV1:
+            self.audit_registry_failure_v1()
+            return None
+
+    def _revoke_admission_notice_safe_public_root_v1(
+        self,
+        release_authority: AdmissionNoticeReleaseAuthorityV1,
+        envelope_ref: SecurityEnvelopeReferenceV1,
+    ) -> bool:
+        """Retire one M7 root without exposing a generic release operation."""
+
+        try:
+            with self._lock:
+                self._ensure_available_locked()
+                envelope = self._validate_envelope_ref_locked(envelope_ref)
+                if (
+                    not self._validate_admission_notice_release_authority_locked_v1(
+                        release_authority
+                    )
+                    or envelope is None
+                    or envelope.classification
+                    is not SecurityClassificationV1.PUBLIC_CHAT
+                    or envelope.lineage.parent_envelope_ids
+                    or envelope.lineage.policy_release_attestations
+                    != (
+                        ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1,
+                    )
+                ):
+                    self._record(
+                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED
+                    )
+                    return False
+                _revoke_admission_notice_safe_context_envelope_v1(
+                    self,
+                    envelope.envelope_id,
+                )
+                self._envelopes.pop(envelope.envelope_id, None)
+                self._envelope_refs.pop(envelope.envelope_id, None)
+                return True
+        except SecurityAuthorityUnavailableV1:
+            self.audit_registry_failure_v1()
+            return False
 
     def _issue_public_root_v1(
         self,
@@ -1078,6 +1453,20 @@ class SecurityAuthorityV1:
                             envelope_id=envelope.envelope_id,
                         )
                     return False
+                if (
+                    not envelope.lineage.parent_envelope_ids
+                    and envelope.lineage.policy_release_attestations
+                    == (
+                        ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1,
+                    )
+                ):
+                    if audit_denial:
+                        self._record(
+                            SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED,
+                            envelope_id=envelope.envelope_id,
+                            consumer_capability_id=registered.capability_id,
+                        )
+                    return False
                 if envelope.classification not in registered.allowed_classifications:
                     if audit_denial:
                         self._record(
@@ -1093,6 +1482,100 @@ class SecurityAuthorityV1:
                             envelope_id=envelope.envelope_id,
                             consumer_capability_id=registered.capability_id,
                         )
+                    return False
+                return True
+        except SecurityAuthorityUnavailableV1:
+            self.audit_registry_failure_v1()
+            return False
+
+    def consume_admission_notice_safe_context_for_consumer_v1(
+        self,
+        envelope_ref: SecurityEnvelopeReferenceV1,
+        capability: ConsumerCapabilityV1,
+    ) -> bool:
+        """Claim the exact active M7 root for the trusted ChatAgent path."""
+
+        try:
+            with self._lock:
+                self._ensure_available_locked()
+                envelope = self._validate_envelope_ref_locked(envelope_ref)
+                registered = self._validate_capability_locked(capability)
+                if (
+                    envelope is None
+                    or registered is None
+                    or envelope.classification
+                    is not SecurityClassificationV1.PUBLIC_CHAT
+                    or envelope.lineage.policy_release_attestations
+                    != (
+                        ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1,
+                    )
+                    or envelope.lineage.parent_envelope_ids
+                    or envelope.classification
+                    not in registered.allowed_classifications
+                    or envelope.egress_policy
+                    not in registered.allowed_egress_policies
+                    or not (
+                        _consume_admission_notice_safe_context_envelope_v1(
+                            self,
+                            envelope.envelope_id,
+                        )
+                    )
+                ):
+                    self._record(
+                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED,
+                        envelope_id=(
+                            envelope.envelope_id
+                            if envelope is not None
+                            else None
+                        ),
+                    )
+                    return False
+                return True
+        except SecurityAuthorityUnavailableV1:
+            self.audit_registry_failure_v1()
+            return False
+
+    def consume_claimed_admission_notice_context_for_generation_v1(
+        self,
+        envelope_ref: SecurityEnvelopeReferenceV1,
+        capability: ConsumerCapabilityV1,
+    ) -> bool:
+        """Open one claimed M7 root for exactly one model generation."""
+
+        try:
+            with self._lock:
+                self._ensure_available_locked()
+                envelope = self._validate_envelope_ref_locked(envelope_ref)
+                registered = self._validate_capability_locked(capability)
+                if (
+                    envelope is None
+                    or registered is None
+                    or envelope.classification
+                    is not SecurityClassificationV1.PUBLIC_CHAT
+                    or envelope.lineage.parent_envelope_ids
+                    or envelope.lineage.policy_release_attestations
+                    != (
+                        ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1,
+                    )
+                    or envelope.classification
+                    not in registered.allowed_classifications
+                    or envelope.egress_policy
+                    not in registered.allowed_egress_policies
+                    or not (
+                        _consume_claimed_admission_notice_safe_context_envelope_v1(
+                            self,
+                            envelope.envelope_id,
+                        )
+                    )
+                ):
+                    self._record(
+                        SecurityAuditEventCodeV1.CONSUMER_NOT_AUTHORIZED,
+                        envelope_id=(
+                            envelope.envelope_id
+                            if envelope is not None
+                            else None
+                        ),
+                    )
                     return False
                 return True
         except SecurityAuthorityUnavailableV1:

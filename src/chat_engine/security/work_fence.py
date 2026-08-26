@@ -16,8 +16,9 @@ class WorkOperationKindV1(str, Enum):
     """Closed Milestone 3 operation kinds.
 
     Milestones 6A/6B additionally admit private CPU OCR and deterministic
-    admission-notice extraction. Query and certificate-speech work remain
-    absent.
+    admission-notice extraction. Milestone 7 adds only private release
+    preparation; committed personalization uses the existing CHAT_AGENT_LLM
+    kind. Query and certificate-speech work remain absent.
     """
 
     GENERIC_ASYNC = "GENERIC_ASYNC"
@@ -40,6 +41,9 @@ class WorkOperationKindV1(str, Enum):
     CAPTURE_EVIDENCE_READ = "CAPTURE_EVIDENCE_READ"
     OCR_INFERENCE = "OCR_INFERENCE"
     ADMISSION_NOTICE_EXTRACTION = "ADMISSION_NOTICE_EXTRACTION"
+    ADMISSION_NOTICE_RELEASE_PREPARE = (
+        "ADMISSION_NOTICE_RELEASE_PREPARE"
+    )
 
 
 class WorkValidationBoundaryV1(str, Enum):

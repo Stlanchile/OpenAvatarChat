@@ -14,6 +14,8 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
+from loguru import logger
+
 from certificate_capture.capabilities import (
     ActiveCaptureCapabilityV1,
     CaptureCapabilityAuthorityV1,
@@ -87,6 +89,12 @@ from certificate_capture.protocol import (
     SealResultV1,
     ValidatedJpegFrameV1,
 )
+from certificate_capture.release.service import (
+    AdmissionNoticePersonalizationContinuationV1,
+    AdmissionNoticeReleaseReasonV1,
+    AdmissionNoticeReleaseServiceErrorV1,
+    AdmissionNoticeSafeReleaseServiceV1,
+)
 from certificate_capture.replay import (
     ControlOperationV1,
     ControlReplayLedgerV1,
@@ -106,6 +114,7 @@ from chat_engine.security.audit_events import (
     SecurityAuditEventCodeV1,
     SecurityAuditEventV1,
 )
+from chat_engine.security.authority import SecurityAuthorityV1
 from chat_engine.security.cleanup_fence import (
     CleanupActionV1,
     CleanupTokenV1,
@@ -113,6 +122,7 @@ from chat_engine.security.cleanup_fence import (
     RetiredGenerationCleanupFenceV1,
     RetiredGenerationCleanupStateV1,
 )
+from chat_engine.security.dispatch import AdmissionNoticeReleaseAuthorityV1
 from chat_engine.security.epochs import SessionEpochV1
 from chat_engine.security.ids import UINT64_MAX_V1, new_uuid7_v1
 from chat_engine.security.session_work_controller import (
@@ -221,6 +231,15 @@ class _DetachedPrivateCaptureWorkV1:
         return "_DetachedPrivateCaptureWorkV1(<private>)"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _AdmissionPersonalizationDispatchV1:
+    continuation: AdmissionNoticePersonalizationContinuationV1
+    registered_work: RegisteredWorkV1
+
+    def __repr__(self) -> str:
+        return "_AdmissionPersonalizationDispatchV1(<ephemeral>)"
+
+
 class _TransitionFailureV1(RuntimeError):
     __slots__ = ("reason",)
 
@@ -237,6 +256,13 @@ SessionLiveActionV1 = Callable[[Callable[[], None]], bool]
 QuiescenceDrainV1 = Callable[[SessionEpochV1], None]
 SemanticCleanupV1 = Callable[[SessionEpochV1], None]
 FailureTerminatorV1 = Callable[[], None]
+PostCapturePersonalizationV1 = Callable[
+    [
+        AdmissionNoticePersonalizationContinuationV1,
+        RegisteredWorkV1,
+    ],
+    Coroutine[Any, Any, None],
+]
 TransitionHookV1 = Callable[
     [CaptureTransitionPointV1],
     object,
@@ -254,6 +280,8 @@ class CaptureCoordinatorV1:
         "_active_frame_upload_permits_v1",
         "_active_transition",
         "_admission_extraction_service_v1",
+        "_admission_notice_release_service_v1",
+        "_admission_personalization_task_v1",
         "_audit",
         "_capability_authority_v1",
         "_capture_epoch",
@@ -283,6 +311,7 @@ class CaptureCoordinatorV1:
         "_ocr_service_v1",
         "_operation_idle",
         "_operation_lock",
+        "_post_capture_personalization_v1",
         "_private_evidence_authority_v1",
         "_private_evidence_store_v1",
         "_private_store_cleanup_access_v1",
@@ -324,6 +353,13 @@ class CaptureCoordinatorV1:
         quiescence_drain_v1: QuiescenceDrainV1,
         semantic_cleanup_v1: SemanticCleanupV1,
         failure_terminator_v1: FailureTerminatorV1 | None,
+        security_authority_v1: SecurityAuthorityV1 | None = None,
+        admission_notice_release_authority_v1: (
+            AdmissionNoticeReleaseAuthorityV1 | None
+        ) = None,
+        post_capture_personalization_v1: (
+            PostCapturePersonalizationV1 | None
+        ) = None,
         test_processor_v1: CaptureProcessorV1 | None = None,
         wall_clock_v1: Callable[[], float] = time.time,
         monotonic_clock_v1: Callable[[], float] = time.monotonic,
@@ -340,6 +376,22 @@ class CaptureCoordinatorV1:
                 "private_evidence_authority_v1 must be "
                 "PrivateEvidenceAuthorityV1"
             )
+        release_dependencies = (
+            security_authority_v1,
+            admission_notice_release_authority_v1,
+            post_capture_personalization_v1,
+        )
+        if any(item is not None for item in release_dependencies) and (
+            not isinstance(security_authority_v1, SecurityAuthorityV1)
+            or not isinstance(
+                admission_notice_release_authority_v1,
+                AdmissionNoticeReleaseAuthorityV1,
+            )
+            or not callable(post_capture_personalization_v1)
+        ):
+            raise TypeError(
+                "Milestone 7 release dependencies must be complete"
+            )
         if test_processor_v1 is not None and not callable(
             getattr(test_processor_v1, "process_capture_v1", None)
         ):
@@ -354,6 +406,12 @@ class CaptureCoordinatorV1:
         self._semantic_cleanup_v1 = semantic_cleanup_v1
         self._failure_terminator_v1 = failure_terminator_v1
         self._test_processor_v1 = test_processor_v1
+        self._post_capture_personalization_v1 = (
+            post_capture_personalization_v1
+        )
+        self._admission_personalization_task_v1: (
+            asyncio.Task[None] | None
+        ) = None
         self._wall_clock_v1 = wall_clock_v1
         self._monotonic_clock_v1 = monotonic_clock_v1
         self._lock = threading.RLock()
@@ -449,6 +507,34 @@ class CaptureCoordinatorV1:
                 wall_clock_v1=self._wall_clock_v1,
             )
         )
+        self._admission_notice_release_service_v1: (
+            AdmissionNoticeSafeReleaseServiceV1 | None
+        ) = None
+        if (
+            security_authority_v1 is not None
+            and admission_notice_release_authority_v1 is not None
+        ):
+            self._admission_notice_release_service_v1 = (
+                AdmissionNoticeSafeReleaseServiceV1
+                ._create_for_coordinator_v1(
+                    security_authority=security_authority_v1,
+                    release_authority=(
+                        admission_notice_release_authority_v1
+                    ),
+                    private_authority=(
+                        private_evidence_authority_v1
+                    ),
+                    store=self._private_evidence_store_v1,
+                    read_access=self._private_store_read_access_v1,
+                    work_controller=work_controller,
+                    capture_is_live_v1=(
+                        self
+                        ._private_admission_extraction_operation_is_live_v1
+                    ),
+                    fatal_failure_v1=self._fail_protocol_runtime_v1,
+                    monotonic_clock_v1=self._monotonic_clock_v1,
+                )
+            )
 
     @classmethod
     def _create_for_session_v1(
@@ -462,6 +548,13 @@ class CaptureCoordinatorV1:
         quiescence_drain_v1: QuiescenceDrainV1,
         semantic_cleanup_v1: SemanticCleanupV1,
         failure_terminator_v1: FailureTerminatorV1 | None = None,
+        security_authority_v1: SecurityAuthorityV1 | None = None,
+        admission_notice_release_authority_v1: (
+            AdmissionNoticeReleaseAuthorityV1 | None
+        ) = None,
+        post_capture_personalization_v1: (
+            PostCapturePersonalizationV1 | None
+        ) = None,
         _test_processor_v1: CaptureProcessorV1 | None = None,
         _wall_clock_for_test_v1: Callable[[], float] | None = None,
         _monotonic_clock_for_test_v1: Callable[[], float] | None = None,
@@ -479,6 +572,13 @@ class CaptureCoordinatorV1:
             isolation_view=isolation_view,
             private_evidence_authority_v1=(
                 private_evidence_authority_v1
+            ),
+            security_authority_v1=security_authority_v1,
+            admission_notice_release_authority_v1=(
+                admission_notice_release_authority_v1
+            ),
+            post_capture_personalization_v1=(
+                post_capture_personalization_v1
             ),
             feature_enabled_v1=feature_enabled_v1,
             security_authority_usable_v1=(security_authority_usable_v1),
@@ -1752,11 +1852,29 @@ class CaptureCoordinatorV1:
                     .EXTRACTION_AUTHORITY_INVALID
                 )
             service = self._admission_extraction_service_v1
-        return await service.extract_v1(
+        receipt = await service.extract_v1(
             capture_epoch=capture_epoch,
             ocr_receipts=ocr_receipts,
             parent_work=parent_work,
         )
+        release_service = self._admission_notice_release_service_v1
+        if release_service is not None:
+            try:
+                release_service.stage_extraction_v1(
+                    capture_epoch=capture_epoch,
+                    receipt=receipt,
+                    parent_work=parent_work,
+                )
+            except AdmissionNoticeReleaseServiceErrorV1 as exception:
+                release_service.record_failure_v1(
+                    exception.reason
+                )
+            except Exception:  # noqa: BLE001 - stable M7 failure outcome
+                release_service.record_failure_v1(
+                    AdmissionNoticeReleaseReasonV1
+                    .ADMISSION_RELEASE_INTERNAL_ERROR
+                )
+        return receipt
 
     def _read_private_admission_extraction_for_test_v1(
         self,
@@ -3024,6 +3142,12 @@ class CaptureCoordinatorV1:
             self._record_v1(SecurityAuditEventCodeV1.CAPTURE_FAILED_CLOSED)
         if detached_work is not None:
             self._cancel_detached_private_capture_work_v1(detached_work)
+        release_service = self._admission_notice_release_service_v1
+        if release_service is not None:
+            release_service.discard_v1(
+                AdmissionNoticeReleaseReasonV1
+                .ADMISSION_RELEASE_CLEANUP_FAILED
+            )
         cleanup_succeeded = bool(
             cleanup_prepared
             and self._erase_failed_private_capture_v1(transition)
@@ -3271,6 +3395,14 @@ class CaptureCoordinatorV1:
     ) -> CaptureEpochV1 | None:
         if transition.capture_id is None:
             raise _TransitionFailureV1(CaptureFailureReasonV1.INTERNAL_FAILURE)
+        release_service = self._admission_notice_release_service_v1
+        if release_service is not None:
+            try:
+                release_service.reset_for_capture_v1()
+            except AdmissionNoticeReleaseServiceErrorV1:
+                raise _TransitionFailureV1(
+                    CaptureFailureReasonV1.INTERNAL_FAILURE
+                ) from None
         published: list[CaptureEpochV1] = []
         candidate = CaptureEpochV1(
             session_epoch=retirement.new_epoch,
@@ -3443,6 +3575,45 @@ class CaptureCoordinatorV1:
         finally:
             self._close_transition_cleanup_token_v1(transition)
 
+    def _end_request_rejection_locked_v1(
+        self,
+        capture_epoch: CaptureEpochV1 | None,
+        capture_seq: int | None,
+    ) -> CaptureFailureReasonV1 | None:
+        if self._destroyed or self._shutdown_started:
+            return CaptureFailureReasonV1.SESSION_SHUTDOWN
+        state = self._state
+        if state is CaptureStateV1.IDLE:
+            return CaptureFailureReasonV1.INVALID_STATE
+        if state is CaptureStateV1.ENDING:
+            return CaptureFailureReasonV1.CAPTURE_BUSY
+        if state not in {
+            CaptureStateV1.ENTERING,
+            CaptureStateV1.QUIESCING,
+            CaptureStateV1.ARMED,
+            CaptureStateV1.CAPTURING,
+            CaptureStateV1.BUILDING_ASSERTIONS,
+            CaptureStateV1.READY,
+            CaptureStateV1.FAILED_CLOSED,
+        }:
+            return CaptureFailureReasonV1.INVALID_STATE
+
+        canonical_epoch = self._capture_epoch
+        if canonical_epoch is not None:
+            if capture_epoch is not canonical_epoch:
+                return CaptureFailureReasonV1.CAPTURE_EPOCH_MISMATCH
+            if (
+                capture_seq is not None
+                and capture_seq != canonical_epoch.capture_seq
+            ):
+                return CaptureFailureReasonV1.CAPTURE_SEQUENCE_MISMATCH
+        else:
+            if capture_epoch is not None:
+                return CaptureFailureReasonV1.CAPTURE_EPOCH_MISMATCH
+            if capture_seq != self._capture_seq:
+                return CaptureFailureReasonV1.CAPTURE_SEQUENCE_MISMATCH
+        return None
+
     def _claim_end_v1(
         self,
         capture_epoch: CaptureEpochV1 | None,
@@ -3455,50 +3626,14 @@ class CaptureCoordinatorV1:
 
         def claim() -> None:
             with self._lock:
-                if self._destroyed or self._shutdown_started:
-                    rejected.append(CaptureFailureReasonV1.SESSION_SHUTDOWN)
+                rejection = self._end_request_rejection_locked_v1(
+                    capture_epoch,
+                    capture_seq,
+                )
+                if rejection is not None:
+                    rejected.append(rejection)
                     return
-                state = self._state
-                if state is CaptureStateV1.IDLE:
-                    rejected.append(CaptureFailureReasonV1.INVALID_STATE)
-                    return
-                if state is CaptureStateV1.ENDING:
-                    rejected.append(CaptureFailureReasonV1.CAPTURE_BUSY)
-                    return
-                if state not in {
-                    CaptureStateV1.ENTERING,
-                    CaptureStateV1.QUIESCING,
-                    CaptureStateV1.ARMED,
-                    CaptureStateV1.CAPTURING,
-                    CaptureStateV1.BUILDING_ASSERTIONS,
-                    CaptureStateV1.READY,
-                    CaptureStateV1.FAILED_CLOSED,
-                }:
-                    rejected.append(CaptureFailureReasonV1.INVALID_STATE)
-                    return
-
                 canonical_epoch = self._capture_epoch
-                if canonical_epoch is not None:
-                    if capture_epoch is not canonical_epoch:
-                        rejected.append(CaptureFailureReasonV1.CAPTURE_EPOCH_MISMATCH)
-                        return
-                    if (
-                        capture_seq is not None
-                        and capture_seq != canonical_epoch.capture_seq
-                    ):
-                        rejected.append(
-                            CaptureFailureReasonV1.CAPTURE_SEQUENCE_MISMATCH
-                        )
-                        return
-                else:
-                    if capture_epoch is not None:
-                        rejected.append(CaptureFailureReasonV1.CAPTURE_EPOCH_MISMATCH)
-                        return
-                    if capture_seq != self._capture_seq:
-                        rejected.append(
-                            CaptureFailureReasonV1.CAPTURE_SEQUENCE_MISMATCH
-                        )
-                        return
 
                 superseded = self._active_transition
                 if (
@@ -3541,6 +3676,18 @@ class CaptureCoordinatorV1:
                 self._active_transition = transition
                 self._state = CaptureStateV1.ENDING
                 self._quiescence_complete = False
+                release_service = (
+                    self._admission_notice_release_service_v1
+                )
+                if release_service is not None:
+                    try:
+                        release_service.bind_end_v1(
+                            capture_epoch=canonical_epoch,
+                            transition_id=transition.transition_id,
+                        )
+                    except AdmissionNoticeReleaseServiceErrorV1:
+                        failed.append(transition)
+                        return
                 prepared, detached = (
                     self._prepare_private_capture_end_locked_v1()
                 )
@@ -3617,6 +3764,67 @@ class CaptureCoordinatorV1:
             self._last_session_generation = new_epoch.generation
             transition.phase = CaptureTransitionPhaseV1.VERIFYING
 
+    def _launch_admission_personalization_v1(
+        self,
+        dispatch: _AdmissionPersonalizationDispatchV1,
+    ) -> bool:
+        callback = self._post_capture_personalization_v1
+        with self._lock:
+            existing = self._admission_personalization_task_v1
+            if (
+                callback is None
+                or (
+                    existing is not None
+                    and not existing.done()
+                )
+            ):
+                return False
+
+            async def run_once() -> None:
+                try:
+                    await callback(
+                        dispatch.continuation,
+                        dispatch.registered_work,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - ordinary agent failure
+                    logger.error(
+                        "ADMISSION_NOTICE_PERSONALIZATION_FAILED"
+                    )
+                finally:
+                    release_service = (
+                        self._admission_notice_release_service_v1
+                    )
+                    if release_service is not None:
+                        release_service.discard_continuation_v1(
+                            dispatch.continuation
+                        )
+                    else:
+                        dispatch.continuation._discard_for_core_v1()
+                    self._work_controller.release_work_v1(
+                        dispatch.registered_work.lease
+                    )
+
+            try:
+                task = asyncio.create_task(run_once())
+            except RuntimeError:
+                return False
+            self._admission_personalization_task_v1 = task
+
+            def clear_completed(
+                completed: asyncio.Task[None],
+            ) -> None:
+                with self._lock:
+                    if (
+                        self._admission_personalization_task_v1
+                        is completed
+                    ):
+                        self._admission_personalization_task_v1 = None
+
+            task.add_done_callback(clear_completed)
+            return True
+
     def _publish_resumed_v1(
         self,
         transition: _CaptureTransitionV1,
@@ -3648,9 +3856,109 @@ class CaptureCoordinatorV1:
                         or cleanup.state is not RetiredGenerationCleanupStateV1.COMPLETE
                         or cleanup.outstanding_work_tokens != 0
                         or cleanup.outstanding_cleanup_tokens != 0
-                        or not self._isolation_controller.reopen_v1()
                     ):
                         return
+                    release_service = (
+                        self._admission_notice_release_service_v1
+                    )
+                    if not self._isolation_controller.reopen_v1():
+                        return
+                    continuation = None
+                    if release_service is not None:
+                        continuation = (
+                            release_service.commit_after_cleanup_v1(
+                                transition_id=transition.transition_id,
+                                successor_epoch=retirement.new_epoch,
+                                cleanup_proven=True,
+                                private_capture_clear=(
+                                    self
+                                    ._private_capture_is_clear_locked_v1()
+                                ),
+                            )
+                        )
+                    personalization_work = None
+                    if continuation is not None:
+                        try:
+                            personalization_work = (
+                                self._work_controller.register_work_v1(
+                                    WorkOperationKindV1.CHAT_AGENT_LLM,
+                                    self._monotonic_clock_v1() + 300.0,
+                                    _admission_guard_v1=(
+                                        lambda: (
+                                            not self._destroyed
+                                            and not self._shutdown_started
+                                            and self._active_transition
+                                            is transition
+                                            and self._state
+                                            is CaptureStateV1.ENDING
+                                            and self._capture_epoch is None
+                                            and (
+                                                self._isolation_view
+                                                .is_open_v1()
+                                            )
+                                            and (
+                                                self
+                                                ._private_capture_is_clear_locked_v1()
+                                            )
+                                        )
+                                    ),
+                                )
+                            )
+                        except WorkAdmissionDeniedV1:
+                            self._isolation_controller.close_v1()
+                            release_service.discard_continuation_v1(
+                                continuation
+                            )
+                            return
+                        except Exception:
+                            self._isolation_controller.close_v1()
+                            release_service.discard_continuation_v1(
+                                continuation
+                            )
+                            raise
+                        if (
+                            personalization_work.fence.session_epoch
+                            is not retirement.new_epoch
+                        ):
+                            self._work_controller.release_work_v1(
+                                personalization_work.lease
+                            )
+                            self._isolation_controller.close_v1()
+                            release_service.discard_continuation_v1(
+                                continuation
+                            )
+                            return
+                    if (
+                        continuation is not None
+                        and personalization_work is not None
+                    ):
+                        try:
+                            launched = (
+                                self._launch_admission_personalization_v1(
+                                    _AdmissionPersonalizationDispatchV1(
+                                        continuation=continuation,
+                                        registered_work=personalization_work,
+                                    )
+                                )
+                            )
+                        except Exception:
+                            self._work_controller.release_work_v1(
+                                personalization_work.lease
+                            )
+                            self._isolation_controller.close_v1()
+                            release_service.discard_continuation_v1(
+                                continuation
+                            )
+                            raise
+                        if not launched:
+                            self._work_controller.release_work_v1(
+                                personalization_work.lease
+                            )
+                            self._isolation_controller.close_v1()
+                            release_service.discard_continuation_v1(
+                                continuation
+                            )
+                            return
                     self._state = CaptureStateV1.IDLE
                     self._active_transition = None
                     self._capture_id = None
@@ -3668,7 +3976,34 @@ class CaptureCoordinatorV1:
                     )
                 )
 
-        if not self._run_if_session_live_v1(publish_if_session_live):
+        try:
+            session_live = self._run_if_session_live_v1(
+                publish_if_session_live
+            )
+        except AdmissionNoticeReleaseServiceErrorV1 as exception:
+            self._isolation_controller.close_v1()
+            if exception.reason is (
+                AdmissionNoticeReleaseReasonV1
+                .ADMISSION_RELEASE_CLEANUP_FAILED
+            ):
+                reason = CaptureFailureReasonV1.SEMANTIC_CLEANUP_FAILED
+            elif exception.reason is (
+                AdmissionNoticeReleaseReasonV1
+                .ADMISSION_RELEASE_AUTHORITY_INVALID
+            ):
+                reason = (
+                    CaptureFailureReasonV1
+                    .SECURITY_AUTHORITY_UNAVAILABLE
+                )
+            elif exception.reason is (
+                AdmissionNoticeReleaseReasonV1
+                .ADMISSION_RELEASE_STALE
+            ):
+                reason = CaptureFailureReasonV1.GENERATION_MISMATCH
+            else:
+                reason = CaptureFailureReasonV1.INTERNAL_FAILURE
+            raise _TransitionFailureV1(reason) from None
+        if not session_live:
             return False
         return bool(resumed)
 
@@ -3680,10 +4015,69 @@ class CaptureCoordinatorV1:
     ) -> CaptureStatusV1:
         """Retire capture mode and reopen only after a fresh cleanup barrier."""
 
-        transition = self._claim_end_v1(
-            capture_epoch,
-            capture_seq,
-        )
+        release_service = self._admission_notice_release_service_v1
+        with self._lock:
+            request_rejection = self._end_request_rejection_locked_v1(
+                capture_epoch,
+                capture_seq,
+            )
+            release_capture_epoch = (
+                self._capture_epoch
+                if (
+                    request_rejection is None
+                    and self._capture_epoch is capture_epoch
+                )
+                else None
+            )
+        if request_rejection is not None:
+            if (
+                release_service is not None
+                and request_rejection
+                is not CaptureFailureReasonV1.CAPTURE_BUSY
+            ):
+                release_service.discard_v1(
+                    AdmissionNoticeReleaseReasonV1.ADMISSION_RELEASE_STALE
+                )
+            self._reject_v1(request_rejection)
+        if (
+            release_service is not None
+            and release_capture_epoch is not None
+        ):
+            try:
+                release_service.prepare_for_end_v1(
+                    capture_epoch=release_capture_epoch,
+                )
+            except AdmissionNoticeReleaseServiceErrorV1 as exception:
+                release_service.record_failure_v1(
+                    exception.reason
+                )
+            except Exception:  # noqa: BLE001 - stable M7 failure outcome
+                release_service.record_failure_v1(
+                    AdmissionNoticeReleaseReasonV1
+                    .ADMISSION_RELEASE_INTERNAL_ERROR
+                )
+        try:
+            transition = self._claim_end_v1(
+                capture_epoch,
+                capture_seq,
+            )
+        except CaptureTransitionRejectedV1 as exception:
+            if (
+                release_service is not None
+                and exception.reason_code
+                != CaptureFailureReasonV1.CAPTURE_BUSY.value
+            ):
+                release_service.discard_v1(
+                    AdmissionNoticeReleaseReasonV1.ADMISSION_RELEASE_STALE
+                )
+            raise
+        except CaptureFailedClosedV1:
+            if release_service is not None:
+                release_service.discard_v1(
+                    AdmissionNoticeReleaseReasonV1
+                    .ADMISSION_RELEASE_CLEANUP_FAILED
+                )
+            raise
         try:
             await self._call_transition_hook_v1(CaptureTransitionPointV1.AFTER_ENDING)
             async with self._serialized_operation_v1():
@@ -3787,6 +4181,14 @@ class CaptureCoordinatorV1:
                 ) from None
             raise CaptureFailedClosedV1(reason) from None
         finally:
+            release_service = (
+                self._admission_notice_release_service_v1
+            )
+            if release_service is not None:
+                release_service.discard_v1(
+                    AdmissionNoticeReleaseReasonV1
+                    .ADMISSION_RELEASE_CLEANUP_FAILED
+                )
             self._close_transition_cleanup_token_v1(transition)
 
     def _fail_closed_for_test_v1(
@@ -3824,6 +4226,13 @@ class CaptureCoordinatorV1:
         if ocr_service is not None:
             ocr_service.close_admission_v1()
         self._admission_extraction_service_v1.close_admission_v1()
+        release_service = self._admission_notice_release_service_v1
+        if release_service is not None:
+            release_service.discard_v1(
+                AdmissionNoticeReleaseReasonV1
+                .ADMISSION_RELEASE_AUTHORITY_INVALID
+            )
+            release_service.close_v1()
         if detached_work is not None:
             self._cancel_detached_private_capture_work_v1(detached_work)
         if transition is not None:

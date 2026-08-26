@@ -11,6 +11,11 @@ from certificate_capture.contracts.admission_notice import (
     ExtractedAdmissionFieldV1,
     StoredAdmissionNoticeExtractionV1,
 )
+from certificate_capture.contracts.admission_notice_release import (
+    ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1,
+    SANITIZED_ADMISSION_CONTEXT_SCHEMA_VERSION_V1,
+    SanitizedAdmissionContextV1,
+)
 from certificate_capture.contracts.admission_notice_template import (
     ADMISSION_NOTICE_TEMPLATE_DESCRIPTOR_SCHEMA_VERSION_V1,
     ADMISSION_NOTICE_TEMPLATE_MATCH_SCHEMA_VERSION_V1,
@@ -58,6 +63,7 @@ from certificate_capture.contracts.ocr import (
 __all__ = [
     "ADMISSION_NOTICE_EXTRACTION_IDENTITY_SCHEMA_VERSION_V1",
     "ADMISSION_NOTICE_EXTRACTION_SCHEMA_VERSION_V1",
+    "ADMISSION_NOTICE_SAFE_RELEASE_POLICY_VERSION_V1",
     "ADMISSION_NOTICE_TEMPLATE_DESCRIPTOR_SCHEMA_VERSION_V1",
     "ADMISSION_NOTICE_TEMPLATE_MATCH_SCHEMA_VERSION_V1",
     "CALIBRATION_DEPENDENCY_SCHEMA_VERSION_V1",
@@ -71,6 +77,7 @@ __all__ = [
     "INFERENCE_IDENTITY_SCHEMA_VERSION_V1",
     "OCR_PAGE_RESULT_SCHEMA_VERSION_V1",
     "OCR_SPAN_SCHEMA_VERSION_V1",
+    "SANITIZED_ADMISSION_CONTEXT_SCHEMA_VERSION_V1",
     "AcceleratorPolicyV1",
     "AdmissionFieldStatusV1",
     "AdmissionNoticeExtractionIdentityV1",
@@ -96,6 +103,7 @@ __all__ = [
     "OcrSpanV1",
     "PipelineIdentityV1",
     "ProcessingIdentityV1",
+    "SanitizedAdmissionContextV1",
     "ServiceIdentityV1",
     "SoftwareIdentityV1",
     "StoredAdmissionNoticeExtractionV1",

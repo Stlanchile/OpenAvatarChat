@@ -20,6 +20,9 @@ from typing import Dict, List, Optional, Set, cast
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from certificate_capture.contracts.admission_notice_release import (
+    SanitizedAdmissionContextV1,
+)
 from chat_engine.common.handler_base import HandlerBase, HandlerBaseInfo, HandlerDataInfo, HandlerDetail
 from chat_engine.contexts.handler_context import HandlerContext
 from chat_engine.contexts.session_context import SessionContext
@@ -30,6 +33,7 @@ from chat_engine.data_models.chat_signal import ChatSignal, SignalFilterRule
 from chat_engine.data_models.chat_signal_type import ChatSignalType
 from chat_engine.data_models.chat_stream_config import ChatStreamConfig
 from chat_engine.data_models.runtime_data.data_bundle import DataBundle, DataBundleDefinition, DataBundleEntry
+from chat_engine.security.dispatch import SecurityEnvelopeReferenceV1
 from chat_engine.security.session_work_controller import WorkAdmissionDeniedV1
 from chat_engine.security.work_fence import (
     RegisteredWorkV1,
@@ -52,10 +56,25 @@ from handlers.agent.prompt.prompt_compiler import (
     LAYER_ENVIRONMENT_STATE,
 )
 
+from handlers.agent.turn_context import ChatAgentTurnContextV1
 
 # ── 主动消息触发配置 ──
 
 _PROACTIVE_LIFECYCLE_SECONDS_V1 = 24 * 60 * 60
+_ADMISSION_NOTICE_PROTECTED_METHODS_V1 = frozenset(
+    {
+        "_agent_loop",
+        "_apply_llm_extra_body",
+        "_build_admission_notice_prompt_input_v1",
+        "_check_compact",
+        "_generate_response",
+        "_generate_response_fenced_v1",
+        "_handle_admission_notice_personalization_v1",
+        "_reset_generation_state_v1",
+        "_stream_response",
+        "_watch_llm_cancellation_v1",
+    }
+)
 
 
 class EventTriggerConfig(BaseModel):
@@ -1230,6 +1249,116 @@ class ChatAgentHandler(HandlerBase, ABC):
                 context._generate_lock.release()
             runtime.release_work_v1(work)
 
+    def _handle_admission_notice_personalization_v1(
+        self,
+        context: HandlerContext,
+        sanitized_context: SanitizedAdmissionContextV1,
+        output_definitions: dict[ChatDataType, HandlerDataInfo],
+        *,
+        work_v1: RegisteredWorkV1,
+        envelope_ref: SecurityEnvelopeReferenceV1,
+    ) -> None:
+        """Core-only one-turn entry; no ChatData or user-memory write."""
+
+        if (
+            type(self) is not ChatAgentHandler
+            or type(context) is not ChatAgentContext
+            or any(
+                method_name in vars(self)
+                for method_name in _ADMISSION_NOTICE_PROTECTED_METHODS_V1
+            )
+        ):
+            return
+        context = cast(ChatAgentContext, context)
+        runtime = context.work_runtime_v1
+        if (
+            runtime is None
+            or type(context.compiler) is not PromptCompiler
+            or "compile" in vars(context.compiler)
+            or type(sanitized_context)
+            is not SanitizedAdmissionContextV1
+            or not isinstance(work_v1, RegisteredWorkV1)
+            or work_v1.fence.operation_kind
+            is not WorkOperationKindV1.CHAT_AGENT_LLM
+            or not isinstance(
+                envelope_ref,
+                SecurityEnvelopeReferenceV1,
+            )
+            or not runtime.validate_work_v1(
+                work_v1,
+                WorkValidationBoundaryV1.ADMISSION,
+            )
+            or not (
+                runtime
+                .consume_m2_admission_notice_safe_context_v1(
+                    envelope_ref,
+                    context.work_consumer_capability_v1,
+                )
+            )
+        ):
+            return
+
+        acquired = False
+        with context.activate_work_v1(work_v1, envelope_ref):
+            try:
+                acquired = context._generate_lock.acquire(timeout=10.0)
+                if not acquired:
+                    logger.warning(
+                        "ADMISSION_NOTICE_GENERATION_LOCK_TIMEOUT"
+                    )
+                    return
+                generation = work_v1.fence.session_epoch.generation
+                if context._secure_generation_v1 != generation and (
+                    not runtime.perform_if_live_v1(
+                        work_v1,
+                        WorkValidationBoundaryV1
+                        .BEFORE_STATE_MUTATION,
+                        lambda: self._reset_generation_state_v1(
+                            context,
+                            generation,
+                        ),
+                    )
+                ):
+                    return
+
+                def begin_generation() -> None:
+                    context.responded_events.clear()
+                    context.pending_events.clear()
+                    context.is_generating = True
+                    context.last_interaction_time = time.time()
+                    context._idle_triggered = False
+                    context.output_definitions = output_definitions
+
+                if not runtime.perform_if_live_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.BEFORE_STATE_MUTATION,
+                    begin_generation,
+                ):
+                    return
+                prompt_input = (
+                    ChatAgentHandler._build_admission_notice_prompt_input_v1(
+                        self,
+                        context,
+                        sanitized_context,
+                    )
+                )
+                ChatAgentHandler._generate_response(
+                    self,
+                    context,
+                    prompt_input,
+                    output_definitions,
+                    work_v1=work_v1,
+                    _admission_notice_envelope_ref_v1=envelope_ref,
+                )
+            finally:
+                if acquired:
+                    context._generate_lock.release()
+                runtime.perform_if_live_v1(
+                    work_v1,
+                    WorkValidationBoundaryV1.BEFORE_COMPLETION,
+                    lambda: setattr(context, "is_generating", False),
+                )
+
     # ── 构建 PromptInput ──
 
     def _build_prompt_input(
@@ -1281,6 +1410,31 @@ class ChatAgentHandler(HandlerBase, ABC):
             ),
         )
 
+    def _build_admission_notice_prompt_input_v1(
+        self,
+        context: ChatAgentContext,
+        sanitized_context: SanitizedAdmissionContextV1,
+    ) -> PromptInput:
+        """Build one fixed, non-persistent admission-notice attachment."""
+
+        persona_snapshot = ""
+        if context.persona_mgr:
+            persona_snapshot = context.persona_mgr.get_snapshot()
+        return PromptInput(
+            trigger_type="admission_notice_personalization",
+            persona_snapshot=persona_snapshot,
+            dialogue_history=(
+                context.memory.get_dialogue_for_llm(
+                    context.config.max_dialogue_turns
+                )
+                if context.memory
+                else []
+            ),
+            turn_context_v1=ChatAgentTurnContextV1(
+                sanitized_admission_notice=sanitized_context,
+            ),
+        )
+
     # ── LLM 调用 + 流式输出 + Agent Loop ──
 
     def _generate_response(
@@ -1290,16 +1444,32 @@ class ChatAgentHandler(HandlerBase, ABC):
         output_definitions: Dict[ChatDataType, HandlerDataInfo],
         *,
         work_v1: RegisteredWorkV1 | None = None,
+        _admission_notice_envelope_ref_v1: (
+            SecurityEnvelopeReferenceV1 | None
+        ) = None,
     ):
+        admission_notice_turn = (
+            type(prompt_input.turn_context_v1)
+            is ChatAgentTurnContextV1
+        )
         if context.work_runtime_v1 is not None:
             if work_v1 is None:
                 return
-            self._generate_response_fenced_v1(
+            ChatAgentHandler._generate_response_fenced_v1(
+                self,
                 context,
                 prompt_input,
                 output_definitions,
                 work_v1,
+                _admission_notice_envelope_ref_v1=(
+                    _admission_notice_envelope_ref_v1
+                ),
             )
+            return
+        if (
+            admission_notice_turn
+            or _admission_notice_envelope_ref_v1 is not None
+        ):
             return
         output_definition = output_definitions.get(ChatDataType.AVATAR_TEXT).definition
         streamer = context.data_submitter.get_streamer(ChatDataType.AVATAR_TEXT)
@@ -1320,7 +1490,15 @@ class ChatAgentHandler(HandlerBase, ABC):
             )
             stream_key = stream.stream_key_str
 
-        compiled = context.compiler.compile(prompt_input)
+        if admission_notice_turn:
+            if type(context.compiler) is not PromptCompiler:
+                return
+            compiled = PromptCompiler.compile(
+                context.compiler,
+                prompt_input,
+            )
+        else:
+            compiled = context.compiler.compile(prompt_input)
         messages = compiled.full_messages
 
         logger.info(
@@ -1337,6 +1515,7 @@ class ChatAgentHandler(HandlerBase, ABC):
         try:
             full_response = self._agent_loop(
                 context, messages, output_definition, streamer, stream_key,
+                turn_context_v1=prompt_input.turn_context_v1,
             )
 
             if full_response is None:
@@ -1372,9 +1551,34 @@ class ChatAgentHandler(HandlerBase, ABC):
         prompt_input: PromptInput,
         output_definitions: Dict[ChatDataType, HandlerDataInfo],
         work_v1: RegisteredWorkV1,
+        *,
+        _admission_notice_envelope_ref_v1: (
+            SecurityEnvelopeReferenceV1 | None
+        ) = None,
     ) -> None:
         runtime = context.work_runtime_v1
         if runtime is None:
+            return
+        admission_notice_turn = (
+            type(prompt_input.turn_context_v1)
+            is ChatAgentTurnContextV1
+        )
+        if admission_notice_turn:
+            if (
+                not isinstance(
+                    _admission_notice_envelope_ref_v1,
+                    SecurityEnvelopeReferenceV1,
+                )
+                or not (
+                    runtime
+                    .consume_m2_claimed_admission_notice_generation_v1(
+                        _admission_notice_envelope_ref_v1,
+                        context.work_consumer_capability_v1,
+                    )
+                )
+            ):
+                return
+        elif _admission_notice_envelope_ref_v1 is not None:
             return
         output_info = output_definitions.get(
             ChatDataType.AVATAR_TEXT
@@ -1438,7 +1642,18 @@ class ChatAgentHandler(HandlerBase, ABC):
         ):
             return
         stream_key = stream_keys[0] if stream_keys else None
-        compiled = context.compiler.compile(prompt_input)
+        if admission_notice_turn:
+            if (
+                type(context.compiler) is not PromptCompiler
+                or "compile" in vars(context.compiler)
+            ):
+                return
+            compiled = PromptCompiler.compile(
+                context.compiler,
+                prompt_input,
+            )
+        else:
+            compiled = context.compiler.compile(prompt_input)
         messages = compiled.full_messages
         logger.info(
             "[ChatAgent] PromptCompiler prepared secure generation "
@@ -1446,14 +1661,27 @@ class ChatAgentHandler(HandlerBase, ABC):
         )
 
         try:
-            full_response = self._agent_loop(
-                context,
-                messages,
-                output_definition,
-                streamer,
-                stream_key,
-                work_v1=work_v1,
-            )
+            if admission_notice_turn:
+                full_response = ChatAgentHandler._agent_loop(
+                    self,
+                    context,
+                    messages,
+                    output_definition,
+                    streamer,
+                    stream_key,
+                    work_v1=work_v1,
+                    turn_context_v1=prompt_input.turn_context_v1,
+                )
+            else:
+                full_response = self._agent_loop(
+                    context,
+                    messages,
+                    output_definition,
+                    streamer,
+                    stream_key,
+                    work_v1=work_v1,
+                    turn_context_v1=prompt_input.turn_context_v1,
+                )
             if full_response is None:
                 return
 
@@ -1570,18 +1798,27 @@ class ChatAgentHandler(HandlerBase, ABC):
         stream_key: Optional[str],
         *,
         work_v1: RegisteredWorkV1 | None = None,
+        turn_context_v1: ChatAgentTurnContextV1 | None = None,
     ) -> Optional[str]:
         """Multi-step agent loop: LLM call → tool_use → feedback → repeat.
 
         Returns the final text response, or None if cancelled.
         """
         registry = context.tool_registry
+        admission_notice_turn = (
+            type(turn_context_v1) is ChatAgentTurnContextV1
+        )
         use_tools = (
-            registry is not None
+            not admission_notice_turn
+            and registry is not None
             and registry.has_tools()
             and context.config.tool_use.enabled
         )
-        max_rounds = context.config.tool_use.max_tool_rounds
+        max_rounds = (
+            1
+            if admission_notice_turn
+            else context.config.tool_use.max_tool_rounds
+        )
 
         for round_idx in range(max_rounds):
             tools_param = registry.get_schemas() if use_tools else None
@@ -1654,6 +1891,11 @@ class ChatAgentHandler(HandlerBase, ABC):
 
             if not tool_calls:
                 return full_text
+            if admission_notice_turn:
+                logger.warning(
+                    "ADMISSION_NOTICE_TOOL_CALL_SUPPRESSED"
+                )
+                return full_text or ""
 
             # LLM requested tool calls — execute and continue the loop
             logger.info(

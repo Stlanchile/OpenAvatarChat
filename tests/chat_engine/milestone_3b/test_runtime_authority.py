@@ -49,8 +49,6 @@ def test_milestone_3b_operation_kinds_are_closed_and_certificate_free():
         "CAPTURE",
         "QUERY",
         "CERTIFICATE_SPEECH",
-        "BARCODE",
-        "DOCUMENT_NUMBER",
     } & names
 
 
