@@ -262,16 +262,13 @@ def _heading_candidates_v1(
                 run,
                 run.line_index + 1,
             ):
-                related_candidate = _heading_candidate_v1(
-                    related.mapped_text_v1()
-                )
+                related_candidate = _heading_candidate_v1(related.mapped_text_v1())
                 combined = _heading_candidate_v1(
                     MappedTextV1.from_runs_v1((run, related))
                 )
                 if (
                     candidate is not None
-                    and candidate.text
-                    == HBTC_ADMISSION_NOTICE_INSTITUTION_NAME_V1
+                    and candidate.text == HBTC_ADMISSION_NOTICE_INSTITUTION_NAME_V1
                 ) or (
                     related_candidate is not None
                     and related_candidate.text
@@ -279,9 +276,7 @@ def _heading_candidates_v1(
                 ):
                     if (
                         combined is not None
-                        and _has_nested_trusted_institution_modifier_v1(
-                            combined.text
-                        )
+                        and _has_nested_trusted_institution_modifier_v1(combined.text)
                     ):
                         candidates[(combined.text, combined.span_ids)] = combined
                     continue
@@ -360,8 +355,7 @@ def _looks_like_different_institution_v1(
         for end in conflicting_ends
     )
     has_nested_trusted_name = bool(
-        trusted_ends
-        and any(end > min(trusted_ends) for end in conflicting_ends)
+        trusted_ends and any(end > min(trusted_ends) for end in conflicting_ends)
     )
     return bool(
         heading.width >= CONFLICTING_TITLE_MIN_WIDTH_V1
@@ -383,8 +377,7 @@ def _name_fragment_is_valid_v1(text: str) -> bool:
         and "··" not in text
         and not any(fragment in text for fragment in _NON_NAME_SALUTATION_FRAGMENTS_V1)
         and all(
-            is_han_character_v1(character) or character == "·"
-            for character in text
+            is_han_character_v1(character) or character == "·" for character in text
         )
     )
 
@@ -490,10 +483,9 @@ def _major_anchor_context_v1(
     start: int,
     end: int,
 ) -> bool:
-    if (
-        not _only_body_structural_v1(mapped.text[end:])
-        or not _source_boundary_before_v1(mapped, start)
-    ):
+    if not _only_body_structural_v1(
+        mapped.text[end:]
+    ) or not _source_boundary_before_v1(mapped, start):
         return False
     candidate_start = start
     while candidate_start > 0 and (
@@ -611,22 +603,17 @@ def _body_signature_v1(
         next_states = dict(states)
         for state in states.values():
             for occurrence in occurrences:
-                if (
-                    state.last is not None
-                    and (
-                        occurrence.start_key <= state.last.end_key
-                        or not _body_anchor_transition_is_compatible_v1(
-                            state.last,
-                            occurrence,
-                        )
+                if state.last is not None and (
+                    occurrence.start_key <= state.last.end_key
+                    or not _body_anchor_transition_is_compatible_v1(
+                        state.last,
+                        occurrence,
                     )
                 ):
                     continue
                 anchor_ids = state.anchor_ids + (rule.anchor_id,)
                 start_line_index = int(occurrence.start_key[0])
-                anchor_line_indices = (
-                    state.anchor_line_indices | {start_line_index}
-                )
+                anchor_line_indices = state.anchor_line_indices | {start_line_index}
                 state_key = (
                     anchor_ids,
                     (
@@ -697,10 +684,9 @@ def _matched_anchor_order_v1(
     )
 
 
-def _match_page_v1(
-    page: OcrPageResultV1,
+def _match_reading_v1(
+    reading: ReadingOrderV1,
 ) -> AdmissionNoticeTemplateMatchV1:
-    reading = reconstruct_reading_order_v1(page.spans)
     headings = _heading_candidates_v1(reading)
     supported = tuple(
         heading
@@ -764,7 +750,7 @@ class HbtcAdmissionNoticeTemplateMatcherV1:
         self,
         pages: tuple[OcrPageResultV1, ...],
     ) -> AdmissionNoticeTemplateMatchV1:
-        match, _ = self.match_and_select_pages_v1(pages)
+        match, _, _ = self._match_and_select_page_readings_v1(pages)
         return match
 
     def match_and_select_pages_v1(
@@ -776,8 +762,37 @@ class HbtcAdmissionNoticeTemplateMatcherV1:
     ]:
         """Return the capture match and only individually matched source pages."""
 
+        match, _, matched_page_readings = self._match_and_select_page_readings_v1(pages)
+        return match, tuple(page for page, _ in matched_page_readings)
+
+    def _match_and_select_page_readings_v1(
+        self,
+        pages: tuple[OcrPageResultV1, ...],
+    ) -> tuple[
+        AdmissionNoticeTemplateMatchV1,
+        tuple[OcrPageResultV1, ...],
+        tuple[tuple[OcrPageResultV1, ReadingOrderV1], ...],
+    ]:
+        """Match once and retain stack-local readings for semantic extraction."""
+
         ordered = ordered_admission_notice_pages_v1(pages)
-        page_matches = tuple(_match_page_v1(page) for page in ordered)
+        page_evaluations: list[
+            tuple[
+                OcrPageResultV1,
+                ReadingOrderV1,
+                AdmissionNoticeTemplateMatchV1,
+            ]
+        ] = []
+        for page in ordered:
+            reading = reconstruct_reading_order_v1(page.spans)
+            page_evaluations.append(
+                (
+                    page,
+                    reading,
+                    _match_reading_v1(reading),
+                )
+            )
+        page_matches = tuple(match for _, _, match in page_evaluations)
         if any(
             match.status is AdmissionNoticeTemplateMatchStatusV1.NOT_MATCHED
             for match in page_matches
@@ -787,11 +802,12 @@ class HbtcAdmissionNoticeTemplateMatcherV1:
                     status=AdmissionNoticeTemplateMatchStatusV1.NOT_MATCHED,
                     matched_anchor_ids=(),
                 ),
+                ordered,
                 (),
             )
         matched_pairs = tuple(
-            (page, match)
-            for page, match in zip(ordered, page_matches, strict=True)
+            (page, reading, match)
+            for page, reading, match in page_evaluations
             if match.status is AdmissionNoticeTemplateMatchStatusV1.MATCHED
         )
         if matched_pairs:
@@ -801,12 +817,13 @@ class HbtcAdmissionNoticeTemplateMatcherV1:
                     matched_anchor_ids=_matched_anchor_order_v1(
                         {
                             anchor_id
-                            for _, match in matched_pairs
+                            for _, _, match in matched_pairs
                             for anchor_id in match.matched_anchor_ids
                         }
                     ),
                 ),
-                tuple(page for page, _ in matched_pairs),
+                ordered,
+                tuple((page, reading) for page, reading, _ in matched_pairs),
             )
         strongest = max(
             page_matches,
@@ -823,6 +840,7 @@ class HbtcAdmissionNoticeTemplateMatcherV1:
                 status=AdmissionNoticeTemplateMatchStatusV1.INSUFFICIENT,
                 matched_anchor_ids=strongest.matched_anchor_ids,
             ),
+            ordered,
             (),
         )
 

@@ -218,6 +218,8 @@ async def test_extractor_identity_change_creates_a_distinct_record(
         rule_set_version="admission-notice-rules.v1-revision-2",
         normalization_version="admission-notice-normalization.v1",
     )
+    changed_extractor = AdmissionNoticeExtractorV1()
+    changed_extractor._identity = changed_identity
     coordinator._admission_extraction_service_v1 = (
         PrivateAdmissionNoticeExtractionServiceV1._create_for_coordinator_v1(
             private_authority=(coordinator._private_evidence_authority_v1),
@@ -230,7 +232,7 @@ async def test_extractor_identity_change_creates_a_distinct_record(
             ),
             fatal_store_failure_v1=coordinator._fail_protocol_runtime_v1,
             wall_clock_v1=harness.protocol.clock.wall,
-            _extractor_for_test_v1=AdmissionNoticeExtractorV1(changed_identity),
+            _extractor_for_test_v1=changed_extractor,
         )
     )
 
@@ -491,6 +493,33 @@ class _CountingExtractorV1(AdmissionNoticeExtractorV1):
     def extract_pages_v1(self, pages):
         self.calls += 1
         return super().extract_pages_v1(pages)
+
+
+class _FailingExtractorV1(AdmissionNoticeExtractorV1):
+    def extract_pages_v1(self, pages):
+        del pages
+        raise RuntimeError("PRIVATE_EXTRACTION_CANARY")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_extractor_failure_is_stable_and_payload_free(
+    milestone_6b_harness_factory,
+):
+    harness, grant, receipts = await _prepared_harness(milestone_6b_harness_factory)
+    coordinator = harness.protocol.coordinator
+    coordinator._admission_extraction_service_v1._extractor = _FailingExtractorV1()
+
+    with pytest.raises(AdmissionNoticeExtractionServiceErrorV1) as failure:
+        await harness.extract(grant, receipts)
+
+    assert (
+        failure.value.reason
+        is AdmissionNoticeExtractionFailureReasonV1.EXTRACTION_INTERNAL_ERROR
+    )
+    assert "PRIVATE_EXTRACTION_CANARY" not in str(failure.value)
+    snapshot = coordinator._private_evidence_store_v1.snapshot_v1()
+    assert snapshot.admission_extraction_index_count == 0
+    assert snapshot.auxiliary_record_count == 1
 
 
 @pytest.mark.asyncio

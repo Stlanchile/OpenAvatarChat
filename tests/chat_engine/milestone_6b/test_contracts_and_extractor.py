@@ -4,6 +4,8 @@ import dataclasses
 
 import pytest
 
+import certificate_capture.extraction.admission_notice as admission_notice_module
+import certificate_capture.extraction.hbtc_admission_notice as hbtc_matcher_module
 from certificate_capture.contracts.admission_notice import (
     ADMISSION_NOTICE_EXTRACTION_SCHEMA_VERSION_V1,
     EXTRACTED_ADMISSION_FIELD_SCHEMA_VERSION_V1,
@@ -23,6 +25,8 @@ from certificate_capture.extraction.identity import (
     ADMISSION_NOTICE_EXTRACTOR_ID_V1,
     ADMISSION_NOTICE_NORMALIZATION_VERSION_V1,
     ADMISSION_NOTICE_RULE_SET_VERSION_V1,
+    ADMISSION_NOTICE_RULE_SET_VERSION_V2,
+    DEFAULT_ADMISSION_NOTICE_EXTRACTION_IDENTITY_V1,
 )
 from certificate_capture.extraction.reading_order import (
     reconstruct_reading_order_v1,
@@ -58,8 +62,7 @@ def test_exact_minimal_contract_and_identity_are_versioned_and_immutable():
     assert result.name.schema_version == EXTRACTED_ADMISSION_FIELD_SCHEMA_VERSION_V1
     assert result.extraction_identity.extractor_id == ADMISSION_NOTICE_EXTRACTOR_ID_V1
     assert (
-        result.extraction_identity.template_id
-        == HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1
+        result.extraction_identity.template_id == HBTC_ADMISSION_NOTICE_TEMPLATE_ID_V1
     )
     assert (
         result.extraction_identity.template_match_rule_version
@@ -67,7 +70,7 @@ def test_exact_minimal_contract_and_identity_are_versioned_and_immutable():
     )
     assert (
         result.extraction_identity.rule_set_version
-        == ADMISSION_NOTICE_RULE_SET_VERSION_V1
+        == ADMISSION_NOTICE_RULE_SET_VERSION_V2
     )
     assert (
         result.extraction_identity.normalization_version
@@ -97,6 +100,16 @@ def test_exact_minimal_contract_and_identity_are_versioned_and_immutable():
     }
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.name.value = "篡改"
+
+
+def test_fixed_extractor_rejects_a_mislabeled_rule_identity():
+    historical_identity = dataclasses.replace(
+        DEFAULT_ADMISSION_NOTICE_EXTRACTION_IDENTITY_V1,
+        rule_set_version=ADMISSION_NOTICE_RULE_SET_VERSION_V1,
+    )
+
+    with pytest.raises(ValueError, match="extraction identity is unsupported"):
+        AdmissionNoticeExtractorV1(historical_identity)
 
 
 def test_all_four_fields_found_with_exact_source_provenance_and_round_trip():
@@ -382,6 +395,40 @@ def test_shuffled_input_to_reading_order_is_identical():
         tuple(run.mapped_text_v1().text for run in line.runs) for line in second.lines
     )
     assert second_text == first_text
+
+
+def test_field_extraction_reuses_the_matcher_reading_order(monkeypatch):
+    page = synthetic_page_v1(standard_admission_spans_v1())
+    reconstructed = []
+    consumed = []
+    original_reconstruct = hbtc_matcher_module.reconstruct_reading_order_v1
+    original_page_decisions = admission_notice_module._page_decisions_v1
+
+    def counted_reconstruct(spans):
+        reading = original_reconstruct(spans)
+        reconstructed.append(reading)
+        return reading
+
+    def captured_page_decisions(source_page, reading):
+        consumed.append(reading)
+        return original_page_decisions(source_page, reading)
+
+    monkeypatch.setattr(
+        hbtc_matcher_module,
+        "reconstruct_reading_order_v1",
+        counted_reconstruct,
+    )
+    monkeypatch.setattr(
+        admission_notice_module,
+        "_page_decisions_v1",
+        captured_page_decisions,
+    )
+
+    AdmissionNoticeExtractorV1().extract_pages_v1((page,))
+
+    assert len(reconstructed) == 1
+    assert len(consumed) == 1
+    assert consumed[0] is reconstructed[0]
 
 
 @pytest.mark.parametrize(

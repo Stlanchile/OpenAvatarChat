@@ -152,8 +152,12 @@ ExtractedAdmissionFieldV1 {
 - `extractor_id`：`admission-notice-extractor.v1`；
 - `template_id`：`hbtc_admission_notice_v1`；
 - `template_match_rule_version`：`hbtc-admission-notice-template-match.v1`；
-- `rule_set_version`：`admission-notice-rules.v1`；
+- `rule_set_version`：`admission-notice-rules.v2`；
 - `normalization_version`：`admission-notice-normalization.v1`。
+
+当前采用 V2，是因为省份候选所依赖的必需锚点 `批准` 现在也纳入
+`raw_engine_score` 权威范围。V1 常量只用于标识历史记录；当前固定提取器
+会拒绝与其实际规则不完全一致的调用方自定义身份，避免用旧版本号标注新行为。
 
 `AdmissionNoticeExtractionStorageKeyV1` 由排序后的 OCR 结果 ID 元组和 `extraction_identity_sha256` 组成。
 `PrivateEvidenceStoreV1.find_admission_notice_extraction_v1()` 会先查找完全相同的键；命中后直接返回 `reused=True` 的既有加密收据，不会再次运行字段解析。
@@ -211,6 +215,10 @@ V1 只包含一个不可变、由服务端持有的模板：
 `reconstruct_reading_order_v1()` 再按纵向中心、边界坐标和 `span_id` 稳定排序，把文字分组为 `VisualLineV1`，并在每行内从左到右组成 `TextRunV1`。
 需要跨行识别时，`forward_run_paths_v1()` 只探索最多三行且数量有上限的几何相关路径，避免对整页文本进行无界组合。
 
+模板匹配只为每一页构造一次 `ReadingOrderV1`。页面匹配成功后，
+字段提取会复用同一个、仅在当前调用栈内存活的 reading 对象，
+既避免第二次几何重建，也不会跨调用或跨采集缓存 OCR 数据。
+
 随后，字段规则在有界纵向区域和局部锚点语法中运行：
 
 1. `_name_candidates_v1()` 只读取 `同学` 前连续的汉字或间隔点，并要求该文本片段前后除允许的结构标点外没有其他内容。
@@ -259,7 +267,7 @@ V1 只包含一个不可变、由服务端持有的模板：
 | `EXTRACTION_RESULT_TOO_LARGE` | 有界的加密辅助存储容量无法接纳结果 |
 | `EXTRACTION_AUTHORITY_INVALID` | `PrivateEvidenceAuthorityV1` 已失效，或协调器不再拥有该采集 |
 | `EXTRACTION_STALE` | 采集状态、会话代次或工作准入已经变化，或者任一 `WorkFenceV1` 校验失败 |
-| `EXTRACTION_INTERNAL_ERROR` | 完整性、不变量、私有 codec、加密或意外存储处理失败，服务按失败关闭处理 |
+| `EXTRACTION_INTERNAL_ERROR` | 完整性、不变量、私有 codec、加密或意外私有处理失败，服务按失败关闭处理 |
 
 `PrivateEvidenceStoreV1` 报告完整性、不变量或记录类型错误时，`_map_store_error_v1()` 还会调用协调器提供的 `_fail_protocol_runtime_v1()`，使当前安全采集进入失败关闭状态。
 异常文本只包含稳定原因码，不会携带 OCR 文本、字段值或来源坐标。

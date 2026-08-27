@@ -17,7 +17,6 @@ from certificate_capture.contracts.admission_notice import (
     ExtractedAdmissionFieldV1,
 )
 from certificate_capture.contracts.admission_notice_template import (
-    HBTC_ADMISSION_NOTICE_TEMPLATE_MATCH_RULE_VERSION_V1,
     AdmissionNoticeTemplateMatchStatusV1,
     AdmissionNoticeTemplateMatchV1,
 )
@@ -33,7 +32,6 @@ from certificate_capture.extraction.hbtc_admission_notice import (
     NAME_ANCHOR_V1,
     AdmissionNoticeTemplateCompatibilityErrorV1,
     HbtcAdmissionNoticeTemplateMatcherV1,
-    ordered_admission_notice_pages_v1,
 )
 from certificate_capture.extraction.identity import (
     DEFAULT_ADMISSION_NOTICE_EXTRACTION_IDENTITY_V1,
@@ -48,7 +46,6 @@ from certificate_capture.extraction.reading_order import (
     ReadingOrderV1,
     TextRunV1,
     forward_run_paths_v1,
-    reconstruct_reading_order_v1,
     source_polygon_for_spans_v1,
     span_geometry_v1,
 )
@@ -522,7 +519,7 @@ def _province_candidates_v1(
                             start=candidate_start,
                             end=suffix_start,
                             anchor_start=start_anchor,
-                            anchor_end=committee_end,
+                            anchor_end=approval_start + len(APPROVAL_ANCHOR_V1),
                             validator=_province_is_valid_v1,
                         )
                         if candidate is not None:
@@ -621,16 +618,6 @@ def _college_candidates_v1(
     return candidates
 
 
-def _run_is_academic_unit_v1(run: TextRunV1) -> bool:
-    value = normalize_candidate_whitespace_v1(
-        run.mapped_text_v1().source_value_v1(
-            0,
-            len(run.mapped_text_v1().characters),
-        )
-    )
-    return _college_is_valid_v1(value)
-
-
 def _major_start_after_college_v1(
     text: str,
     end: int,
@@ -676,29 +663,23 @@ def _major_candidates_v1(
                     run,
                     run.line_index - 1,
                 )
-                eligible_previous = tuple(
-                    (
-                        previous,
-                        normalize_candidate_whitespace_v1(
-                            previous.mapped_text_v1().source_value_v1(
-                                0,
-                                len(previous.mapped_text_v1().characters),
-                            )
-                        ),
-                    )
-                    for previous in previous_runs
-                    if not _run_is_academic_unit_v1(previous)
-                    and COLLEGE_ANCHOR_V1 not in previous.mapped_text_v1().text
-                    and MAJOR_END_ANCHOR_V1 not in previous.mapped_text_v1().text
-                    and _major_fragment_is_valid_v1(
-                        normalize_candidate_whitespace_v1(
-                            previous.mapped_text_v1().source_value_v1(
-                                0,
-                                len(previous.mapped_text_v1().characters),
-                            )
+                eligible_previous: list[tuple[TextRunV1, MappedTextV1]] = []
+                for previous in previous_runs:
+                    previous_mapped = previous.mapped_text_v1()
+                    previous_value = normalize_candidate_whitespace_v1(
+                        previous_mapped.source_value_v1(
+                            0,
+                            len(previous_mapped.characters),
                         )
                     )
-                )
+                    if (
+                        _college_is_valid_v1(previous_value)
+                        or COLLEGE_ANCHOR_V1 in previous_mapped.text
+                        or MAJOR_END_ANCHOR_V1 in previous_mapped.text
+                        or not _major_fragment_is_valid_v1(previous_value)
+                    ):
+                        continue
+                    eligible_previous.append((previous, previous_mapped))
                 combined_candidates: list[tuple[MappedTextV1, int, int, int, int]] = []
                 current_is_valid = _major_is_valid_v1(current_candidate)
                 if current_is_valid:
@@ -712,9 +693,9 @@ def _major_candidates_v1(
                         )
                     )
                 elif eligible_previous:
-                    for previous, _ in eligible_previous:
+                    for previous, previous_mapped in eligible_previous:
                         combined = MappedTextV1.from_runs_v1((previous, run))
-                        offset = len(previous.mapped_text_v1().characters)
+                        offset = len(previous_mapped.characters)
                         combined_candidates.append(
                             (
                                 combined,
@@ -751,8 +732,10 @@ def _major_candidates_v1(
     return candidates
 
 
-def _page_decisions_v1(page: OcrPageResultV1) -> _PageDecisionsV1:
-    reading = reconstruct_reading_order_v1(page.spans)
+def _page_decisions_v1(
+    page: OcrPageResultV1,
+    reading: ReadingOrderV1,
+) -> _PageDecisionsV1:
     return _PageDecisionsV1(
         name=_decision_from_candidates_v1(_name_candidates_v1(page, reading)),
         source_province=_decision_from_candidates_v1(
@@ -819,11 +802,8 @@ class AdmissionNoticeExtractorV1:
     ) -> None:
         if not isinstance(identity, AdmissionNoticeExtractionIdentityV1):
             raise TypeError("identity must be AdmissionNoticeExtractionIdentityV1")
-        if (
-            identity.template_match_rule_version
-            != HBTC_ADMISSION_NOTICE_TEMPLATE_MATCH_RULE_VERSION_V1
-        ):
-            raise ValueError("template matching identity is unsupported")
+        if identity != DEFAULT_ADMISSION_NOTICE_EXTRACTION_IDENTITY_V1:
+            raise ValueError("extraction identity is unsupported")
         self._identity = identity
         self._template_matcher = HbtcAdmissionNoticeTemplateMatcherV1()
 
@@ -841,14 +821,19 @@ class AdmissionNoticeExtractorV1:
         self,
         pages: tuple[OcrPageResultV1, ...],
     ) -> AdmissionNoticeExtractionV1:
-        ordered = ordered_admission_notice_pages_v1(pages)
-        template_match, matched_pages = (
-            self._template_matcher.match_and_select_pages_v1(ordered)
+        (
+            template_match,
+            ordered,
+            matched_page_readings,
+        ) = self._template_matcher._match_and_select_page_readings_v1(
+            pages,
         )
         if template_match.status is not AdmissionNoticeTemplateMatchStatusV1.MATCHED:
             raise AdmissionNoticeTemplateCompatibilityErrorV1(template_match.status)
         capture_epoch = ordered[0].capture_epoch
-        decisions = tuple(_page_decisions_v1(page) for page in matched_pages)
+        decisions = tuple(
+            _page_decisions_v1(page, reading) for page, reading in matched_page_readings
+        )
         return AdmissionNoticeExtractionV1(
             capture_epoch=capture_epoch,
             source_ocr_result_ids=tuple(

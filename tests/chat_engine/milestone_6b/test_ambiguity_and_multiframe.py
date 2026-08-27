@@ -204,6 +204,18 @@ def test_nonqualifying_raw_engine_score_does_not_conflict_with_clear_value():
     assert result.name.value == "李明"
 
 
+def test_low_score_required_approval_anchor_cannot_authorize_province():
+    spans = list(standard_admission_spans_v1())
+    spans[6] = dataclasses.replace(spans[6], raw_engine_score=0.10)
+
+    result = _extract(spans)
+
+    assert result.source_province.status is AdmissionFieldStatusV1.NOT_FOUND
+    assert result.source_province.value is None
+    assert result.source_province.source_span_ids == ()
+    assert result.source_province.source_polygon is None
+
+
 def test_input_frame_order_cannot_resolve_conflict():
     capture_epoch = synthetic_capture_epoch_v1()
     first = _page(

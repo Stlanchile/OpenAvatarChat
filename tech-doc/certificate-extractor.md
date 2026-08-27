@@ -165,8 +165,13 @@ The fixed extraction identity includes:
 - `extractor_id`: `admission-notice-extractor.v1`;
 - `template_id`: `hbtc_admission_notice_v1`;
 - `template_match_rule_version`: `hbtc-admission-notice-template-match.v1`;
-- `rule_set_version`: `admission-notice-rules.v1`;
+- `rule_set_version`: `admission-notice-rules.v2`;
 - `normalization_version`: `admission-notice-normalization.v1`.
+
+Rule set V2 makes the required `批准` anchor part of the province candidate's
+raw-engine-score authority range. The V1 constant remains available only to
+identify historical records; the fixed current extractor rejects a
+caller-supplied identity that does not exactly match its implemented behavior.
 
 The private-store idempotency key is the sorted OCR result-ID tuple plus the
 SHA-256 of that full extraction identity. An exact prior encrypted result is
@@ -229,6 +234,11 @@ The parser does not trust OCR span array order. It derives a normalized
 rectangle from each non-degenerate polygon, deterministically groups spans into
 visual lines, sorts runs left-to-right, and explores only bounded
 geometry-related forward paths of at most three lines.
+
+Template matching constructs each page's `ReadingOrderV1` once. A matched
+page's exact stack-local reading object is then reused for semantic extraction,
+avoiding a second geometry reconstruction without caching OCR data across calls
+or captures.
 
 Field rules then operate in bounded vertical regions and local anchor grammar:
 
@@ -294,7 +304,7 @@ These are internal service reasons, not current browser/HTTP result codes:
 | `EXTRACTION_RESULT_TOO_LARGE` | The bounded encrypted auxiliary-store capacity cannot admit the result |
 | `EXTRACTION_AUTHORITY_INVALID` | The private authority or coordinator ownership is unavailable |
 | `EXTRACTION_STALE` | Capture/generation/work admission changed or a fence failed |
-| `EXTRACTION_INTERNAL_ERROR` | Integrity, invariant, codec, encryption, or unexpected store processing failed closed |
+| `EXTRACTION_INTERNAL_ERROR` | Integrity, invariant, codec, encryption, or unexpected private processing failed closed |
 
 Store integrity/invariant/type failures also notify the coordinator's fatal
 protocol path. Exceptions intentionally contain a stable reason rather than

@@ -471,6 +471,10 @@ class PrivateAdmissionNoticeExtractionServiceV1:
                 raise AdmissionNoticeExtractionServiceErrorV1(
                     AdmissionNoticeExtractionFailureReasonV1.EXTRACTION_INPUT_INVALID
                 ) from None
+            except Exception:  # noqa: BLE001 - stable fail-closed reason mapping
+                raise AdmissionNoticeExtractionServiceErrorV1(
+                    AdmissionNoticeExtractionFailureReasonV1.EXTRACTION_INTERNAL_ERROR
+                ) from None
             self._require_live_v1(
                 capture_epoch,
                 extraction_work,
