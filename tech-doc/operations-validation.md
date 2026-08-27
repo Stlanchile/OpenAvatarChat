@@ -13,11 +13,15 @@ OpenAvatarChat is a stateful real-time process even though it has no database:
 - one signal-distribution thread is created per session;
 - WebRTC adds event-loop tasks and media queues;
 - selected avatar handlers add their own worker threads/processes/GPU state;
+- enabled certificate sessions add generation authority, capture coordination,
+  capture-key encrypted evidence, and an optional isolated CPU OCR process;
 - restart terminates all conversations and discards in-memory histories.
 
-`src/demo.py` currently forces exit status `0` from `finally`, including after
-startup failure. Supervisors, CI, and shell automation must require positive
-readiness and log/handler evidence rather than interpreting zero as success.
+`src/demo.py` now preserves a nonzero status for explicit certificate
+configuration/startup gate failures, but still ends through `os._exit()` and
+can mask other startup failures. Supervisors, CI, and shell automation must
+require positive readiness and log/handler evidence rather than interpreting
+zero as success.
 
 Operate one application process per allocated GPU/service instance. Scale by
 explicitly partitioning users across isolated instances with admission control,
@@ -25,13 +29,14 @@ not by adding Uvicorn workers to one process command.
 
 ## 2. Health endpoints and their exact meaning
 
-| Endpoint | Success means | It does not prove |
-|---|---|---|
-| `/version` | HTTP app is responding and exposes hard-coded application version | Git/image/model/config identity |
-| `/liveness` | FastAPI process/event loop can answer a simple request | Handler threads, GPU, TURN, models, API connectivity |
-| `/readiness` | `ChatEngine.initialize()` completed and set `inited` | Browser RTC path, credentials, model integrity, TURN, capacity |
+| Endpoint | Success means | Enabled-mode authorization | It does not prove |
+|---|---|---|---|
+| `/version` | HTTP app is responding and exposes hard-coded application version | Bearer token with `oac:manager` | Git/image/model/config identity |
+| `/liveness` | FastAPI process/event loop can answer a simple request | Bearer token with `oac:manager` | Handler threads, GPU, TURN, models, OCR, API connectivity |
+| `/readiness` | `ChatEngine.initialize()` completed and set `inited` | Bearer token with `oac:manager` | Browser RTC/capture path, credentials, model integrity, TURN, production OCR composition/qualification, capacity |
 
-Suggested probes behind the private listener:
+These anonymous probes apply only to legacy/default mode behind the private
+listener:
 
 ```bash
 curl --fail --silent --show-error \
@@ -47,6 +52,22 @@ curl --fail --silent --show-error \
 Use HTTPS and normal certificate verification when Uvicorn terminates TLS.
 Do not use `-k` in a production probe.
 
+In enabled certificate mode, use a narrowly held `oac:manager` probe token and
+the configured HTTPS hostname:
+
+```bash
+read -r OAC_MANAGER_ACCESS_TOKEN < /run/secrets/oac-manager-token
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${OAC_MANAGER_ACCESS_TOKEN}" \
+  https://chat.example.com/liveness
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${OAC_MANAGER_ACCESS_TOKEN}" \
+  https://chat.example.com/readiness
+unset OAC_MANAGER_ACCESS_TOKEN
+```
+
+Do not put the token in the URL, command history, probe output, or metrics.
+
 A deployment-specific readiness gate should additionally check:
 
 - selected exact model files and approved hashes;
@@ -57,7 +78,14 @@ A deployment-specific readiness gate should additionally check:
 - DNS/TCP/TLS reachability of selected cloud handlers;
 - TURN allocation/relay path when TURN is required;
 - disk space and writable output/cache paths;
-- current sessions below the admission threshold.
+- current sessions below the admission threshold;
+- enabled-mode OIDC/JWKS reachability and exact route inventory;
+- in a future integrated release, OCR deployment-manifest, identity,
+  lock/model/qualification hashes, UDS owner/mode/peer checks, and a sidecar
+  health probe;
+- explicit `PROCESSOR_NOT_READY` expectation for every production Seal in this
+  checkout, because the Seal path is not composed with OCR/extraction,
+  independently of whether qualified OCR inputs are present.
 
 The current application does not implement these deeper checks.
 
@@ -86,11 +114,17 @@ No valid rtc provider configuration found
 model ... not found
 api_key=[EMPTY]
 CUDA out of memory
+Certificate capture startup preflight failed (...)
+CERTIFICATE_OCR_UNAVAILABLE_V1
 ```
 
 The application can continue after some handler-time processing exceptions,
-and TLS explicitly continues after missing files. A running PID is not a
-sufficient startup result.
+and legacy-mode TLS explicitly continues after missing files. In enabled mode,
+the certificate preflight failure is fatal; the log-only diagnostic
+`CERTIFICATE_OCR_UNAVAILABLE_V1` means a deployment candidate was invalid or
+conflicting. Ordinary chat remains operational. Production capture processing
+is unavailable regardless because current Seal does not invoke OCR/extraction.
+A running PID is not a sufficient startup result.
 
 ## 4. Logging and privacy operations
 
@@ -113,7 +147,13 @@ Production controls:
 6. exclude `temp/data_tool`, logs, `.env`, and certificates from general support
    bundles unless explicitly authorized;
 7. never publish raw logs in an issue without redaction;
-8. verify deletion from replicas, object storage, and backups where applicable.
+8. verify deletion from replicas, object storage, and backups where applicable;
+9. exclude every certificate JPEG, OCR span/transcript, extracted value,
+   capability, token, prompt/context, receipt, record ID, and capture identity
+   from logs, analytics, crash reports, and support bundles;
+10. permit certificate-release telemetry only for policy version, opaque
+    release ID, released-field count, lifecycle state, duration, and stable
+    reason code.
 
 The Manager's in-memory deque is bounded, but its written media files do not
 have an automatic cleanup lifecycle in the reviewed code. Add an external
@@ -201,7 +241,15 @@ minimum, collect externally:
 - TURN allocations, bandwidth, auth failures, relay-port utilization;
 - cloud API request rate, latency, error class, and spend;
 - certificate expiry;
-- image/config/model digest drift.
+- image/config/model digest drift;
+- enabled-mode OIDC admission failures by stable reason, without token/subject;
+- capture lifecycle counts, `PROCESSOR_NOT_READY`, cleanup failures, and
+  late-callback drops by stable operation/reason;
+- for a future integrated deployment, OCR sidecar health,
+  RSS/CPU/thread/process counts, request latency, restart, manifest/identity
+  drift, and evidence of any forbidden network/GPU activity;
+- in a future integrated deployment, M7 release outcomes and released-field
+  counts without field values.
 
 Recommended alerts:
 
@@ -214,7 +262,12 @@ Recommended alerts:
 - TURN auth failures or allocation surge;
 - cloud API 401/403/429/5xx surge;
 - direct requests reaching the private application port;
-- Manager endpoint access from an unauthorized network.
+- Manager endpoint access from an unauthorized network;
+- capture cleanup/key-destruction failure or `FAILED_CLOSED`;
+- OCR identity/qualification/socket-policy drift, unexpected sidecar egress, or
+  any CUDA/GPU initialization;
+- in a future integrated deployment, repeated release-policy rejection, replay,
+  or stale-work drop surge.
 
 ## 7. Deployment inventory
 
@@ -233,6 +286,10 @@ model artifact names + immutable revision + SHA-256
 avatar resource digest
 frontend submodule commit/build digest
 TURN version/config digest
+certificate feature mode + OIDC config digest
+OCR sidecar image + dependency lock digest
+OCR model/identity/qualification/deployment-manifest digests
+OCR UDS path/mode/expected UID/GID
 deployment timestamp and operator/change record
 ```
 
@@ -344,6 +401,7 @@ Rotate independently:
 - ingress/session credentials;
 - TURN credentials/shared secret;
 - TLS private keys/certificates;
+- OIDC signing-key/JWKS and audience/issuer configuration versions;
 - registry credentials;
 - any beta bridge token.
 
@@ -366,6 +424,25 @@ If a model source or artifact is suspected:
 The global `weights_only=False` patch makes this a code-execution boundary, not
 only a model-quality issue.
 
+### 10.4 Certificate privacy or OCR incident
+
+If certificate payload exposure, stale work, store-integrity failure, or OCR
+identity drift is suspected:
+
+1. stop new certificate admission without attempting a fallback processor;
+2. EndCapture or terminate the owning secure session and require the DEK
+   destruction/cleanup barrier; quarantine the process if cleanup cannot be
+   proven;
+3. preserve only payload-free reason codes, release IDs, versions, digests,
+   lifecycle timing, and process/container evidence;
+4. do not copy JPEG, OCR, extraction, prompt, capability, token, socket payload,
+   or private-store records into incident tickets;
+5. replace the OCR image/models/lock/manifest only with the last approved
+   immutable bundle and repeat peer/no-network/no-GPU checks;
+6. revoke affected OIDC/session authority and restart the single owning process;
+7. treat any M7 response emitted before proven End cleanup, or any second
+   personalization attempt, as a security incident.
+
 ## 11. Troubleshooting matrix
 
 ### 11.1 Installation and startup
@@ -378,7 +455,7 @@ only a model-quality issue.
 | Runtime accepts install dry-run but startup fails on YAML | Different parser behavior | Real-loader validation | Fix duplicate/invalid key; do not rely on installer alone |
 | Qwen preset `DuplicateKeyError` | Two `connection_ttl` entries | Config lines 17/19 | Remove one value and revalidate |
 | Process starts with fewer handlers | Common config validation error was logged/skipped | Search startup for `Registered handler` | Compare against approved handler list; fail deployment |
-| Startup logs an error but exits 0 | `os._exit(0)` masks the real result | Reproduce with a known-invalid config; inspect readiness/logs | Treat as failure; use restart-always workaround until code preserves status |
+| Startup logs an error but exits 0 | Unhandled startup paths leave the default `exit_code=0` before forced exit | Reproduce with a known-invalid config; inspect readiness/logs | Treat as failure; use restart-always workaround until every path preserves status |
 | `api_key`/401/403 | Missing/wrong secret or provider model entitlement | Environment presence, provider response | Inject correct key; never print it |
 | Startup hangs/downloads | SenseVoice/avatar/third party auto-download | Network/process/file activity | Pre-stage verified artifact; block runtime egress after rehearsal |
 
@@ -430,11 +507,33 @@ only a model-quality issue.
 
 | Symptom | Cause/action |
 |---|---|
-| Manager token seems accepted regardless of value | Backend does not validate it; isolate/disable Manager |
-| Unknown client can see all sessions | Expected current unauthenticated hub behavior; treat as incident if exposed |
+| Manager token seems accepted regardless of value | Expected only in legacy/default compatibility mode; isolate/disable Manager there. In enabled mode, verify `oac:manager` and ticket admission; acceptance is an incident |
+| Unknown client can see all sessions | Legacy/default mode remains an unauthenticated hub; in enabled mode this is an incident |
 | Config snapshot leaks secrets | Inline handler keys were serialized; rotate keys and remove inline values |
 | Temporary media keeps growing | No automatic file cleanup; stop exposure, establish safe retention cleanup |
 | Logs contain full transcripts | Current INFO logging; restrict access and change/redact logging |
+
+### 11.6 Secure certificate capture and OCR
+
+The current public capture path stops at `PROCESSOR_NOT_READY`; it cannot emit
+template or release outcomes. The template/release rows below describe
+owner-only component diagnostics and the required behavior of a future
+production composition, not current HTTP responses.
+The [certificate extractor module reference](certificate-extractor.md)
+documents the internal M6B/M6C reason and abstention contracts.
+
+| Symptom/reason | Likely cause | Action |
+|---|---|---|
+| Enabled startup fails with `TLS_*` or `MULTI_WORKER_UNSUPPORTED` | Missing/mismatched/encrypted TLS material or worker count is not exactly one | Correct reviewed TLS paths and `workers`/`WEB_CONCURRENCY`; do not bypass the gate |
+| `AUTHENTICATION_FAILED` or `REQUIRED_SCOPE_MISSING` | Invalid `at+jwt`, issuer/audience/time/key mismatch, or wrong purpose scope | Fix the identity-provider/client flow; keep `certificate:capture` and `oac:manager` separate |
+| `UNSUPPORTED_PROFILE` | Client did not request exact `hbtc_admission_notice_v1` | Fix the client; do not add a dynamic profile or trust a client-supplied school |
+| `PROCESSOR_NOT_READY` | Current production Seal is not composed with M6A OCR/M6B extraction and only admits a constructor-injected test processor; this is unconditional after the frame gate | EndCapture and clean browser state; implement/review production composition and complete real isolated CPU qualification before enablement |
+| Log warning `CERTIFICATE_OCR_UNAVAILABLE_V1` | Startup deployment candidate is malformed/conflicting or otherwise rejected; it is not an HTTP capture reason | Compare only approved hashes/identity/UDS policy; do not enable fallback/downloads/network; remember that a valid candidate still cannot make current Seal process |
+| `NEEDS_RECAPTURE` | Fewer than three independent accepted JPEGs in the current implementation | Add a new sequence up to the limit; if full, End then begin a new capture |
+| Template is `NOT_MATCHED` or `INSUFFICIENT` | Wrong-school heading or insufficient compatible title/body anchors | Do not extract, release, guess, or claim authenticity; recapture only when UX permits |
+| `ADMISSION_RELEASE_NO_FIELDS` | No extracted field is exactly `FOUND` | End without a personalized turn; do not release ambiguous/missing candidates |
+| Capture stays `FAILED_CLOSED` | Cleanup, authority, identity, timeout, or stale-work proof failed | Terminate/quarantine the secure session; investigate with payload-free evidence |
+| Browser camera/photo state persists after cancel/Error/End | M8 cleanup or camera handoff failed | Treat as a privacy defect; revoke Object URLs, stop capture track, restore normal track, clear in-memory capabilities |
 
 ## 12. Validation performed for this report
 
@@ -495,8 +594,8 @@ preset.
 ```
 
 The process logged that the config did not exist and returned exit code `0`.
-This directly confirms that the unconditional `os._exit(0)` masks startup
-failure. No file was created and no service was started.
+This confirms that this unhandled startup path leaves the default exit code
+before `os._exit(exit_code)`. No file was created and no service was started.
 
 #### Focused MuseTalk pytest
 
@@ -509,7 +608,7 @@ Exit 1: the test function requests an undefined `ffmpeg_path` fixture. Running
 the same helper as its intended script succeeds, so this is a vendored pytest
 collection defect, not evidence that FFmpeg is unavailable.
 
-#### Prebuilt frontend type checks
+#### 2026-08-18 prebuilt frontend type checks
 
 The frontend submodule's node and web type checks exit 2:
 
@@ -549,6 +648,33 @@ ports without producing a meaningful ready deployment.
 No end-to-end success, production readiness, or performance result should be
 inferred from the static/syntax checks.
 
+### 12.5 Secure-capture incremental evidence
+
+The 2026-08-27 refresh additionally reviewed current HEAD `6db2b96`, the pinned
+WebUI `b82f290`, the enabled/disabled route split, M2/M3 authority and fencing,
+M4/M5 capture/private storage, M6A–M6C OCR/extraction/template code, M7 release,
+M8 WebUI documentation/tests, and the OCR Compose boundary.
+Dedicated first-party suites now exist for each of these layers.
+The review also confirmed that production Seal calls none of the M6A/M6B/M7
+owner-only seams and unconditionally requires a constructor-injected test
+processor; this missing composition is a separate release blocker from OCR
+qualification.
+
+| Check rerun for this refresh | Result | Scope |
+|---|---|---|
+| M6B extractor suite | 75 passed in 3.32 s; one third-party deprecation warning | Four-field contracts/rules, ambiguity, page-order invariance, encrypted store, authority/lifecycle, isolation, races, performance smoke |
+| M6C template suite | 74 passed in 1.19 s | Fixed HBTC identity, title/body compatibility, adversarial layouts, matched-page-only extraction, performance smoke |
+| M7 backend suite | 40 passed in 1.01 s | Release contract, sanitizer, authority/lifecycle, races, ChatAgent context/tools, performance smoke |
+| Certificate startup-gate service suite | 35 passed in 3.34 s; one third-party deprecation warning | Enabled/disabled configuration, TLS/worker/startup behavior |
+| Documented secure service config through Pydantic | Passed | Confirms the YAML shape and exact `certificate:capture` field contract |
+| `docker compose --profile certificate-ocr config --no-interpolate --quiet` | Passed | Compose rendering only; no image build or service start |
+| Bilingual documentation gate | Passed: 5 pairs, 59 identical fenced blocks per language, 35 matching tables, 116 local links | Structural/content parity and local target existence |
+| Frontend `pnpm run test:m8` | Not run | Pinned submodule has no `node_modules`; Node 26/Corepack fails to launch pnpm with `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`; no install was attempted |
+
+No real Paddle/PP-OCRv6 model, qualified sidecar image, production manifest,
+real certificate, browser camera, network service, or GPU was used. Synthetic
+test success must not be promoted into a production OCR or end-to-end claim.
+
 ## 13. Recommended validation pipeline
 
 ### Gate A — source and configuration
@@ -558,6 +684,7 @@ inferred from the static/syntax checks.
 - real-loader validation of every supported preset;
 - reject duplicate YAML keys;
 - enabled module/path validation;
+- enabled/disabled route inventory and purpose-scope separation;
 - first-party lint/type/unit tests;
 - dependency lock/constraints verification.
 
@@ -568,6 +695,8 @@ inferred from the static/syntax checks.
 - vulnerability/license policy;
 - non-root runtime;
 - exact model manifest with hashes and licenses;
+- separately locked/hashed CPU OCR image, models, identity, qualification
+  record, deployment manifest, and UDS ownership policy;
 - frontend clean install/build/type check.
 
 ### Gate C — component integration
@@ -577,12 +706,18 @@ inferred from the static/syntax checks.
 - cloud handler auth/error/timeouts;
 - standard and duplex stream/cancel tests;
 - session isolation and cleanup;
+- milestone security/fencing/capture/OCR/extraction/release suites run
+  independently, including stale-callback and cleanup races;
+- production Seal integration tests that invoke exact-fenced OCR, extraction,
+  release, failure, and cleanup without a constructor-injected test processor;
 - SIGTERM with active sessions;
 - Manager authorization and retention.
 
 ### Gate D — media/network
 
 - browser HTTPS permissions;
+- M8 camera handoff, bounded JPEG preparation, cancel/error/End cleanup, and
+  real-document capture;
 - RTC signalling and audio/video/text;
 - FPS and long-run A/V sync;
 - network loss/reconnect;
@@ -594,6 +729,9 @@ inferred from the static/syntax checks.
 
 - target concurrency soak;
 - GPU/RAM/CPU/disk/network safety margins;
+- after production composition exists, real CPU OCR statistical qualification,
+  RSS/thread/process/latency budgets, no-GPU/no-network proof, and realtime
+  GPU-workload contention;
 - p50/p95/p99 latency;
 - external API rate/spend;
 - canary, alerts, backup/restore, and rollback rehearsal.
@@ -604,7 +742,7 @@ acceptance decision.
 ## 14. Remediation order
 
 1. Block direct public access; enforce authenticated ingress and disable/protect
-   Manager.
+   Manager in legacy mode or validate strict enabled-mode authorization.
 2. Remove checked-in TURN credentials; fix TURN key/config/application wiring.
 3. Remove or isolate unsafe PyTorch loading and verify immutable model artifacts.
 4. Fix bounded event-loop-safe RTC output queues.
@@ -620,3 +758,7 @@ acceptance decision.
 13. Align versioning and documentation.
 14. Address beta Agent packaging/callback only if that feature becomes a
     deployment priority.
+15. Keep production certificate processing disabled until the missing
+    Seal-to-OCR/extraction/release composition is implemented and independently
+    reviewed, then the separate CPU OCR qualification and real-camera M8
+    acceptance gates pass.

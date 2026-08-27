@@ -15,16 +15,20 @@ public stack. In particular:
 - do not expect `docker compose up` alone to provide working TURN;
 - do not claim HTTPS unless a valid certificate/key pair was actually loaded;
 - do not use Qwen-Omni until its duplicate YAML key is removed;
-- do not put API keys in a Manager-enabled YAML file.
+- do not put API keys in a Manager-enabled YAML file;
+- do not treat the M8 admission-notice button or the `certificate-ocr` Compose
+  profile as evidence that production OCR is wired or qualified.
 
 For public operation, use an authenticated TLS ingress in front of the
-application and a separately hardened TURN service. The application currently
-has no built-in authentication or rate limiting, so the ingress is a required
-compensating control, not an optional optimization.
+application and a separately hardened TURN service. Legacy/default mode has no
+built-in authentication. Enabled certificate mode adds purpose-bound OIDC and
+session/transport/Manager admission, but no general rate limiting; ingress
+controls remain required, not optional.
 
-The process also currently forces exit code `0` even after startup failure.
-Require positive readiness/log evidence; do not use a zero exit status as the
-only deployment success condition.
+The process can still return exit code `0` for startup failures outside the
+explicit certificate-configuration gates. Require positive readiness/log
+evidence; do not use a zero exit status as the only deployment success
+condition.
 
 ## 2. Choose a deployment method
 
@@ -33,6 +37,7 @@ only deployment success condition.
 | Native `uv` | First install, development, single dedicated GPU host | Easiest diagnostics; preset-scoped dependency install | Host libraries and Python must be controlled; dependency resolution is not tracked/locked |
 | Standalone Docker | Isolated single-host runtime after image-content correction | Bundled CUDA/Python/system dependencies | Broad `.dockerignore` removes handler YAML; large all-handler build; root runtime; floating dependency resolution |
 | Docker Compose | Lab app + coturn orchestration | One command after preparation | Shipped TURN config/key mount is unsafe/broken; app does not advertise TURN automatically |
+| `certificate-ocr` Compose profile | Isolated qualification/deployment scaffolding | Networkless CPU-only sidecar, private UDS, read-only runtime | Not runnable for production: approved lock/models/identity/qualification are absent, and production Seal never invokes the OCR/extraction services |
 | Public production topology | Remote users | Trusted TLS, auth, rate limits, deliberate TURN | Requires external ingress/security work and remediation gates; not supplied as a ready stack |
 
 Recommended sequence:
@@ -59,6 +64,11 @@ Hard source constraints:
 - Git submodules and Git LFS;
 - FFmpeg and audio/graphics system libraries;
 - an NVIDIA GPU for the documented presets and container path.
+
+The certificate OCR sidecar is a deliberately separate CPU workload. It must
+not initialize CUDA or use the main application's GPU. Its CPU class, exact
+backend, thread count, models, package lock, hashes, and resource budgets are
+qualification inputs rather than extensions of the generic CUDA target.
 
 For the CUDA 12.8 image, use a Linux NVIDIA driver at or above `570.26` as the
 operational baseline. NVIDIA documents `525.60.13` as the lower CUDA 12.x
@@ -106,7 +116,7 @@ checked out. Do not use `git submodule update --remote` in a pinned deployment.
 The reviewed fork commit is:
 
 ```text
-8b7b3b45bca28ae9ab5fa72ee31bc03c5a99b08b
+6db2b96176afc9f324d022e01f96b3cf3d811699
 ```
 
 ### 5.2 Host checks
@@ -285,6 +295,130 @@ Then verify dependency discovery without installing:
 
 Both checks matter. The installer uses a different YAML parser and currently
 accepts the invalid Qwen duplicate that the runtime loader rejects.
+
+### 5.8 Enabled certificate capture is integration- and qualification-gated
+
+Certificate capture is opt-in and defaults to `false`. Enabling it changes
+application routing and security behavior, so copy a preset and add an explicit
+service block rather than mutating a shared deployment implicitly:
+
+For the exact M6B/M6C parser boundary and why it is not a production
+enablement surface, see the
+[certificate extractor module reference](certificate-extractor.md).
+
+```yaml
+default:
+  service:
+    host: "0.0.0.0"
+    port: 8282
+    workers: 1
+    cert_file: "/etc/openavatarchat/tls/fullchain.pem"
+    cert_key: "/etc/openavatarchat/tls/privkey.pem"
+    certificate_capture:
+      enabled: true
+      oidc:
+        issuer: "https://identity.example.com/"
+        jwks_url: "https://identity.example.com/.well-known/jwks.json"
+        audience: "openavatarchat"
+        allowed_algorithms:
+          - "ES256"
+        required_scope: "certificate:capture"
+```
+
+The values above are placeholders, not a bundled identity provider. The issuer
+and JWKS URL must be absolute HTTPS URLs. Access tokens must be signed with an
+explicit allowed asymmetric algorithm, use exact `typ=at+jwt`, match issuer and
+audience, carry valid temporal/subject claims, and include the purpose-specific
+scope. `certificate:capture` authorizes certificate/session control and frontend
+init config; `oac:manager` is independently required for version/health probes,
+Manager HTTP operations, and Manager WebSocket ticket issuance. The scopes are
+not interchangeable.
+
+Enabled startup fails closed if OIDC is missing/invalid, TLS material is absent,
+unreadable, encrypted, or mismatched, `workers` or `WEB_CONCURRENCY` is not
+exactly one, or legacy Gradio/RTC routes conflict. It mounts authenticated
+session control, app-owned RTC signalling, ticket-bound WebSocket admission,
+five private capture routes, and Manager authorization. Static UI assets remain
+public; do not confuse static delivery with authorization to backend resources.
+An enabled Manager client obtains its one-use WebSocket ticket with
+`POST /api/v1/manager/websocket-admission-tickets` using an `oac:manager`
+Bearer token. It then sends exactly one Manager `Sec-WebSocket-Protocol` token:
+`oac.manager-admission.v1.<admission_ticket>`. The raw ticket alone is invalid,
+and the issuance response is `no-store`.
+
+This enables secure capture control only, not successful production document
+processing. At current HEAD, `SealCapture` checks exclusively for a
+constructor-injected test processor and launches only the mock processor
+operation. It does not call the installed private OCR or extraction services.
+Therefore a production request that passes the three-unique-frame gate still
+returns `PROCESSOR_NOT_READY`, even when a valid OCR deployment manifest and
+healthy sidecar are present. The M6A–M7 components are owner-only seams validated
+in isolation, not a production Seal pipeline.
+
+The only supported capture profile is:
+
+| Item | Exact value |
+|---|---|
+| Template | `hbtc_admission_notice_v1` |
+| Trusted institution | `湖北交通职业技术学院` |
+| Extracted fields | `name`, `source_province`, `college`, `major` |
+| Field outcomes | `FOUND`, `AMBIGUOUS`, `NOT_FOUND` |
+| Release policy | `admission-notice-safe-release.v1` |
+
+The institution name is server-owned, not OCR output. Template `MATCHED` means
+only that text and layout are compatible with the fixed parser; it is not
+authenticity, issuer, or admission-status verification. There is no arbitrary
+profile registry or public OCR/extraction/result endpoint.
+
+Any future production composition has a separate hard qualification gate. All
+of the following must be provisioned from a reviewed isolated CPU
+qualification:
+
+- an approved, hash-frozen sidecar `uv.lock`;
+- exact read-only PP-OCRv6 model artifacts and dictionary/configuration hashes;
+- a complete CPU-only `InferenceIdentityV1` and qualification record;
+- measured accuracy, latency, RSS, thread/process, and realtime-contention
+  evidence for every declared production CPU class;
+- a strict local `oac.certificate-ocr-deployment.v1` manifest in an absolute
+  file that is not group/world writable;
+- matching UDS path, mode, sidecar UID/GID `10001:10001`, main-process peer
+  identity, and fixed timeout budgets.
+
+Only after those inputs exist may a deployment stage the strict candidate with:
+
+```bash
+export OPENAVATAR_CERTIFICATE_OCR_DEPLOYMENT_MANIFEST=\
+/etc/openavatarchat/certificate-ocr-deployment.json
+```
+
+The manifest contains identities, hashes, UDS policy, and timeouts—not tokens,
+capabilities, image paths, or OCR text. Missing, conflicting, unhealthy, or
+unqualified input leaves normal OpenAvatarChat operational but certificate OCR
+unavailable. A valid candidate still does not connect current Seal to OCR;
+setting this variable is not an enablement step for production capture.
+
+The root Compose profile demonstrates the required isolation shape:
+`network_mode: none`, no port, read-only root and model mount, bounded tmpfs,
+all capabilities dropped from the OCR process, and a separate networkless
+one-shot volume initializer. Validate its rendered structure with:
+
+```bash
+docker compose --profile certificate-ocr config --no-interpolate
+```
+
+Do not start that profile as a production service from this checkout. Its image
+is deliberately tagged `unqualified`; the approved lock/models/qualification
+are absent, the main service does not receive a production deployment manifest
+merely because the profile is selected, and production Seal has no OCR/extraction
+invocation path.
+
+M8 adds the fixed-profile WebUI workflow for one to three in-memory JPEGs. It
+never performs local OCR or displays OCR/extraction data. In this checkout its
+only production outcome after enough frames is `PROCESSOR_NOT_READY`, followed
+by EndCapture and browser-side camera/photo/capability cleanup. Qualification
+alone does not change that; production composition is also missing. A hidden
+success switch, constructor-injected test processor, synthetic manifest, or
+fallback backend is not an acceptable deployment workaround.
 
 ## 6. Native Linux deployment
 
@@ -528,7 +662,7 @@ Build with an explicit immutable tag:
 
 ```bash
 bash build_cuda128.sh \
-  --tag open-avatar-chat:8b7b3b45
+  --tag open-avatar-chat:6db2b96
 ```
 
 The helper's default is `open-avatar-chat:latest`. The runtime helper also
@@ -545,14 +679,14 @@ resources are mounted from the host.
 ### 7.2 Inspect the image
 
 ```bash
-docker image inspect open-avatar-chat:8b7b3b45
-docker history --no-trunc open-avatar-chat:8b7b3b45
+docker image inspect open-avatar-chat:6db2b96
+docker history --no-trunc open-avatar-chat:6db2b96
 docker run --rm --entrypoint test \
-  open-avatar-chat:8b7b3b45 \
+  open-avatar-chat:6db2b96 \
   -s /root/open-avatar-chat/src/handlers/avatar/flashhead/SoulX-FlashHead/flash_head/configs/infer_params.yaml
 docker run --rm --gpus all \
   --entrypoint uv \
-  open-avatar-chat:8b7b3b45 \
+  open-avatar-chat:6db2b96 \
   run --no-sync python -c \
   "import sys, torch; print(sys.version); print(torch.__version__); print(torch.cuda.is_available())"
 ```
@@ -593,7 +727,7 @@ docker run --rm --gpus all \
   -v /srv/openavatarchat/logs:/root/open-avatar-chat/logs \
   -v /etc/openavatarchat/config.yaml:/run/openavatarchat/config.yaml:ro \
   -v /etc/openavatarchat/tls:/etc/openavatarchat/tls:ro \
-  open-avatar-chat:8b7b3b45 \
+  open-avatar-chat:6db2b96 \
   --config /run/openavatarchat/config.yaml \
   --host 127.0.0.1 \
   --port 8282
@@ -855,6 +989,10 @@ Authenticated reverse proxy
       v
 Single OpenAvatarChat process ----> approved cloud APIs/models
       |
+      | optional private UDS
+      v
+Qualified CPU OCR sidecar (no network, no GPU)
+      |
       | ICE configuration
       v
 Hardened TURN host
@@ -867,6 +1005,10 @@ Required production gates:
 
 - application port reachable only from ingress/administration networks;
 - server-side authentication before UI/signalling/Manager;
+- when certificate mode is enabled: strict OIDC scopes, single worker,
+  authenticated WS/RTC/capture/Manager admission, and capture-route isolation;
+- reviewed production Seal-to-OCR/extraction/release composition with no
+  constructor-injected test processor;
 - per-user and global session quotas;
 - non-root application container/user;
 - immutable image digest and dependency/model manifests;
@@ -926,6 +1068,25 @@ production service.
 - restart loses only documented in-memory session state.
 - model/config/image digests are recorded.
 - rollback artifact is available and tested.
+
+### Secure certificate capture, when enabled
+
+- startup rejects missing/mismatched TLS, invalid OIDC, and multiple workers;
+- unauthenticated, wrong-scope, replayed, wrong-session, and wrong-capture
+  requests are rejected without creating session/capture side effects;
+- `/version`, `/liveness`, `/readiness`, and init config are probed with the
+  correct authorized scope rather than anonymously;
+- the M8 browser keeps photos/capabilities in memory, revokes Object URLs, and
+  restores the ordinary camera track on every cancel/error/End path;
+- the OCR container has no network, port, GPU/CUDA initialization, writable
+  model/root filesystem, or unexpected peer on its UDS;
+- EndCapture destroys the capture DEK and retires stale work before any one-use
+  sanitized ChatAgent turn in the future production composition;
+- logs and support bundles contain no JPEG, OCR text, extracted value, token,
+  capability, prompt context, or private-store identity;
+- current production Seal returns `PROCESSOR_NOT_READY` regardless of manifest;
+  treat any apparent production success through a test processor as a release
+  failure. A later release must prove both composition and qualification.
 
 See [Operations and validation](operations-validation.md) for ongoing runbook
 detail.

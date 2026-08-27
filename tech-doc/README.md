@@ -11,33 +11,39 @@ the quick-start example.
 
 | Item | Value |
 |---|---|
-| Review date | 2026-08-18 |
+| Review date | 2026-08-27 |
 | Branch | `main` |
-| Commit | `8b7b3b45bca28ae9ab5fa72ee31bc03c5a99b08b` |
+| Commit | `6db2b96176afc9f324d022e01f96b3cf3d811699` |
 | Application-reported version | `0.6.0` |
 | Root package version | `0.1.0` |
-| Primary runtime | Python 3.11, FastAPI/Uvicorn, FastRTC/WebRTC, PyTorch CUDA 12.8 |
-| Deployment artifacts | Native `uv`, Docker, Docker Compose with coturn |
-| Review basis | Current source, manifests, all presets, existing `docs/`, and bounded static/runtime checks |
+| Primary runtime | Python 3.11, FastAPI/Uvicorn, FastRTC/WebRTC, PyTorch CUDA 12.8; optional isolated CPU OCR sidecar |
+| Deployment artifacts | Native `uv`, Docker, Docker Compose with coturn and an integration/qualification-gated OCR profile |
+| Review basis | Original full-project review plus source-backed incremental review of Secure Certificate Capture V1 milestones 1–8 |
 
-Line references in these documents are pinned conceptually to the commit above.
-They may move after later edits.
+Source references and the secure-capture current-state sections are pinned
+conceptually to the commit above. They may move after later edits.
 
 External platform references in the deployment guide are advisory prerequisites
-and were current when reviewed; they are not evidence that this checkout passed
-an end-to-end deployment in the review environment.
+and retain their 2026-08-18 review date; they are not evidence that this checkout
+passed an end-to-end deployment in the review environment.
 
 ## Document map
 
 - [Technical report](technical-report.md) — architecture, execution model,
   components, data flow, state, interfaces, configuration, security boundaries,
-  and prioritized findings.
+  Secure Certificate Capture V1, and prioritized findings.
+- [Certificate extractor module](certificate-extractor.md) — the exact M6B/M6C
+  package boundary, deterministic four-field contract, HBTC compatibility
+  rules, private storage/fencing, failures, and current production integration
+  gap.
 - [Deployment guide](deployment-guide.md) — deployment decision, prerequisites,
   preset selection, native installation, Docker, Compose/TURN, and public
-  production topology.
+  production topology, including the integration/qualification-gated
+  certificate components.
 - [Operations and validation](operations-validation.md) — health checks,
   observability, capacity guidance, backup/upgrade/rollback, troubleshooting,
-  validation evidence, and residual uncertainty.
+  certificate privacy/cleanup gates, validation evidence, and residual
+  uncertainty.
 
 The deployment material is organized by deployment method, not by individual
 dependency.
@@ -49,29 +55,43 @@ The core design is a modular, configuration-driven real-time media pipeline:
 ```text
 Browser / LAM client
         |
-        v
-RTC or WebSocket client handler
+        +--> RTC or WebSocket client handler
+        |         |
+        |         v
+        |    VAD -> ASR -> LLM -> TTS -> avatar renderer
+        |         |                         |
+        |         +---- stream graph -------+
+        |         +---- signals/history ----+
         |
-        v
-VAD -> ASR -> LLM -> TTS -> avatar renderer
-        |                         |
-        +---- stream graph -------+
-        +---- signals/history ----+
-        |
-        v
-Audio, video, text, and interruption feedback
+        +--> Authenticated HTTPS admission-notice capture
+                  |
+                  v
+             WorkFenceV1 -> encrypted evidence
+                  |
+                  +--> production Seal -> PROCESSOR_NOT_READY
+                  |
+                  +--> owner-only seams (not production-wired):
+                       CPU OCR over private UDS -> fixed-template extraction
+                       -> one sanitized ChatAgent turn after EndCapture
 ```
 
 The source has several strong operational properties: explicit handler
 contracts, per-session contexts, stream ancestry and cancellation, bounded
 stream recycling, health endpoints, preset-specific dependency discovery, and
-pinned Git submodule commits.
+pinned Git submodule commits. The opt-in certificate mode now also has
+fail-closed TLS/OIDC startup, session/transport/Manager admission, generation
+fencing, and capture-scoped encrypted evidence. Networkless CPU OCR,
+deterministic fixed-template extraction, and one-use sanitized release are
+implemented as private components with isolated tests, but the production Seal
+path does not invoke them.
 
 However, the shipped deployment should be treated as a development/reference
 deployment until the production gates below are addressed:
 
-1. The application and Manager endpoints have no server-side authentication or
-   admission control. Do not expose port `8282`/`8283` directly to the Internet.
+1. Certificate capture is disabled by default. In that legacy/default mode the
+   application and Manager retain unauthenticated behavior. Enabled certificate
+   mode adds OIDC-backed admission, but it does not add rate limiting or make
+   direct exposure of `8282`/`8283` acceptable.
 2. The checked-in coturn configuration uses public static credentials, and the
    Compose file mounts the certificate as the TURN private key. TURN-over-TLS
    cannot work correctly in that form.
@@ -86,8 +106,18 @@ deployment until the production gates below are addressed:
 7. `.dockerignore` excludes every `*.yaml`/`*.yml` in the build context,
    including runtime YAML files used inside avatar/voice submodules. A stock
    image can build successfully and still be incomplete at handler startup.
-8. `src/demo.py` forces exit status `0` from its `finally` block, including for
-   startup failures. Process exit status alone is not valid success evidence.
+8. `src/demo.py` still leaves `exit_code` at `0` for startup failures outside
+   the explicitly handled certificate-configuration gates, then terminates from
+   `finally` with `os._exit(exit_code)`. Process exit status alone is not valid
+   success evidence.
+9. The admission-notice components are implemented through the M8 WebUI, but
+   they are not production-wired end to end: Seal only admits a
+   constructor-injected test processor and never invokes the private OCR or
+   extraction services. The checkout also lacks an approved OCR dependency
+   lock, production models, inference identity, and CPU qualification record.
+   Production Seal therefore unconditionally returns `PROCESSOR_NOT_READY`
+   after the frame-count gate; template matching is not authenticity
+   verification.
 
 See [Technical report: prioritized findings](technical-report.md#prioritized-findings)
 for evidence and mitigation detail.
@@ -101,6 +131,11 @@ for evidence and mitigation detail.
   image is still dependency-resolution-dependent and is not bit-reproducible.
 - Treat the supplied Compose/coturn stack as a scaffold. Apply every TURN and
   TLS correction in the deployment guide before using it outside a trusted lab.
+- Treat the `certificate-ocr` Compose profile as qualification scaffolding, not
+  a runnable production OCR service. Do not enable successful certificate
+  processing until the production Seal-to-OCR/extraction/release composition is
+  implemented and reviewed, and the exact CPU artifacts, deployment manifest,
+  UDS ownership policy, and acceptance evidence are provisioned.
 - For LAN or public users, terminate trusted TLS at an authenticated reverse
   proxy, keep the application on an internal network, and operate a deliberately
   configured TURN service.
@@ -120,5 +155,5 @@ These documents use the following terms deliberately:
 - **Finding** — a concrete code/deployment issue with a realistic trigger and
   material impact; it is not evidence that exploitation or an outage occurred.
 
-No product source was changed as part of this review. Only `tech-doc/` was
-added.
+This documentation refresh changes only `tech-doc/`; the product and WebUI
+milestone commits described here already existed in the reviewed checkout.

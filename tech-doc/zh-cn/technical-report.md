@@ -5,10 +5,8 @@
 ## 1. 执行摘要
 
 OpenAvatarChat 0.6.0 是一套模块化的实时数字人服务，由配置决定启用哪些处理程序。
-浏览器或 LAM 客户端输入音频、视频或文本，引擎再将类型化数据流依次交给
-VAD、ASR、LLM、TTS 和数字人处理程序，最后通过 WebRTC 或 WebSocket 返回结果。
-`standard`（标准）与 `duplex`（双工）对话模式共用同一套处理程序契约；
-双工模式额外提供类型覆盖、语句结束检测和中断处理。
+浏览器或 LAM 客户端输入音频、视频或文本，引擎再将类型化数据流依次交给 VAD、ASR、LLM、TTS 和数字人处理程序，最后通过 WebRTC 或 WebSocket 返回结果。
+`standard`（标准）与 `duplex`（双工）对话模式共用同一套处理程序契约；双工模式额外提供类型覆盖、语句结束检测和中断处理。
 
 该架构适合运行在单进程、GPU 加速的交互式服务中，并具备多项有助于保证正确性的设计：
 
@@ -20,16 +18,21 @@ VAD、ASR、LLM、TTS 和数字人处理程序，最后通过 WebRTC 或 WebSock
 - 提供存活、就绪和版本端点；
 - 可从预设推导依赖项/模型选择。
 
-如果没有额外的补偿性控制，当前部署方案尚未达到生产就绪要求。主应用没有身份验证；
-Manager 前端虽然提供令牌输入界面，后端却不会验证令牌；随附的 TURN 配置既不安全，
-连接方式也有误；TLS 在证书缺失时会静默回退到明文；模型未经校验，
-而 `torch.load` 又在全局启用了不安全模式；此外，仅凭受版本控制的文件无法复现依赖解析结果。
-在多会话或慢客户端场景下，生命周期管理与背压机制也存在缺口，
-进程还会以退出码 `0` 掩盖启动失败。
+如果没有额外的补偿性控制，当前部署方案尚未达到生产就绪要求。
+证书采集默认关闭；原始审查发现的应用和 Manager 未认证行为在该传统/默认模式下仍然存在。
+启用证书采集后，安全状态会发生实质变化：启动要求有效 TLS、单 worker 和严格 OIDC；会话、WebSocket、RTC、证书采集、健康/配置和 Manager 操作均使用按用途隔离的准入与所有权检查。
+但该可选模式仍没有通用限流，也不会修复随附 TURN 的不安全/错误配置、通用模型加载未校验、依赖解析浮动或 RTC 输出队列无界等问题。
 
-这是一项生产就绪性评估，并不表示项目无法使用。验证所选预设、模型、凭据和网络路径后，
-可以在受控的 Linux GPU 主机上采用原生或 Docker 部署方式。面向公网运行前，
-必须满足[部署指南](deployment-guide.md)列出的生产门槛。
+当前检出版本已包含截至 M8 WebUI 的录取通知书组件：采集转换和普通工作受代际围栏约束，JPEG 证据按采集密钥加密；
+私有 M6A OCR、M6B/M6C 四字段/模板、M7 净化释放和 M8 浏览器组件均已存在并有隔离测试，但尚未完成生产端到端组合。
+生产 Seal 路径只允许构造器注入的测试 processor，不会调用私有 OCR 或提取服务，因此无法为 M7 暂存释放。
+独立地，仓库也没有检入获批的生产 OCR 锁文件、模型、身份或 CPU 资格验证记录。
+即使提供有效部署清单，通过帧数门禁后，生产 Seal 仍返回 `PROCESSOR_NOT_READY`。
+模板解析和个性化也不代表文档真实性验证。
+
+这是一项生产就绪性评估，并不表示项目无法使用。
+验证所选预设、模型、凭据和网络路径后，可以在受控的 Linux GPU 主机上采用原生或 Docker 部署方式。
+面向公网运行前，必须满足[部署指南](deployment-guide.md)列出的生产门槛。
 
 ## 2. 审查范围、方法与排除项
 
@@ -38,11 +41,12 @@ Manager 前端虽然提供令牌输入界面，后端却不会验证令牌；随
 - 根清单、安装程序、模型下载器、Dockerfile、Compose 文件、shell 辅助程序、TLS 和 coturn 配置；
 - 全部 13 个已检入的 YAML 预设；
 - 第一方引擎、会话、流、信号、客户端、服务、处理程序和 Manager 代码；
+- 证书会话准入、安全信封、代际围栏、协调器、加密私有存储、OCR/提取/释放代码，以及对应的第一方专项测试；
+- CPU-only OCR sidecar 包及其 Compose 隔离边界；
 - 预构建前端边界及前端构建/类型检查状态；
 - 处理程序依赖清单和全部八个 Git 子模块边界；
 - 中英文项目文档，并以英文文档作为主要部署基线；
-- 审查时有效的 CUDA、NVIDIA Container Toolkit、Docker Compose、
-  浏览器安全上下文、WebRTC/TURN 和 coturn 权威资料。
+- 审查时有效的 CUDA、NVIDIA Container Toolkit、Docker Compose、浏览器安全上下文、WebRTC/TURN 和 coturn 权威资料。
 
 ### 2.2 作为外部依赖处理
 
@@ -57,22 +61,24 @@ Manager 前端虽然提供令牌输入界面，后端却不会验证令牌；随
 | CosyVoice | `0a496c18f78ca993c63f6d880fcc60778bfc85c1` |
 | Silero VAD | `9060f664f20eabb66328e4002a41479ff288f14c` |
 | Smart Turn | `7392230c2627503d0cefcaa79d60e5adbb381a54` |
-| OpenAvatarChat WebUI | `a6182afbda3f3b84a6608402a41e55a0c7bc6766` |
+| OpenAvatarChat WebUI | `b82f290c692a84d85108f03be046aa392350ca9a` |
 
-根仓库控制这些组件如何加载、配置和对外提供服务。因此，即使上游算法不在审查范围内，
-这些组件与主项目之间的集成边界仍属于本次审查范围。
+根仓库控制这些组件如何加载、配置和对外提供服务。
+因此，即使上游算法不在审查范围内，这些组件与主项目之间的集成边界仍属于本次审查范围。
 
 ### 2.3 未进行端到端验证
 
-当前检出版本不包含模型文件，审查环境也没有生产凭据、浏览器、可达的 TURN 服务器
-或已确认可用的 NVIDIA GPU。因此，本次审查没有：
+当前检出版本不包含模型文件，审查环境也没有生产凭据、浏览器、可达的 TURN 服务器或已确认可用的 NVIDIA GPU。
+因此，本次审查没有：
 
 - 下载数 GB 的模型或依赖项；
 - 调用付费 LLM、ASR、TTS 或托管 TURN API；
 - 启动完整媒体服务；
 - 构建或启动 CUDA 容器；
 - 跨真实 NAT 演练浏览器 WebRTC；
-- 测量延迟、吞吐量、GPU 内存或多会话容量。
+- 测量延迟、吞吐量、GPU 内存或多会话容量；
+- 配置或运行经过独立资格验证的 Paddle/PP-OCRv6 CPU sidecar；
+- 使用真实相机和真实通知书完成 M8 采集与个性化回复全流程。
 
 现有文档的延迟和 VRAM 数值是历史项目声明，而非在本审查中复现的结果。
 
@@ -84,7 +90,10 @@ Manager 前端虽然提供令牌输入界面，后端却不会验证令牌；随
 | `src/chat_engine/` | 处理程序发现、会话生命周期、流/信号图、数据模型 |
 | `src/handlers/` | 客户端、VAD、ASR、LLM、TTS、数字人、Manager 和 Beta Agent 集成 |
 | `src/service/` | 前端挂载、RTC/TURN 提供程序、Manager 服务、配置、TLS 与日志 |
+| `src/certificate_capture/` | 采集生命周期、私有证据、OCR、确定性提取和一次性释放 |
+| `services/certificate_ocr/` | 隔离式 CPU-only OCR sidecar 和资格验证工具 |
 | `config/` | 环境范围的运行时预设 |
+| `tests/service/` 与 `tests/chat_engine/` | 第一方安全、围栏、采集、提取、释放和服务测试 |
 | `scripts/` | 模型与数字人资源下载、TLS 创建、coturn 设置 |
 | `resource/` | 运行时挂载或复制的数字人资源 |
 | `models/` | 下载的模型根目录；由 Git 忽略 |
@@ -95,8 +104,7 @@ Manager 前端虽然提供令牌输入界面，后端却不会验证令牌；随
 | `docker-compose.yml` | 使用主机网络模式的应用与 coturn 编排脚手架 |
 
 由于子模块和本地环境已经填充，审查环境中的源代码目录约为 9.3 GB。
-这不是镜像大小或部署磁盘用量的估算值；模型目录目前为空，
-生产模型还会增加大量存储需求，具体取决于所选预设。
+这不是镜像大小或部署磁盘用量的估算值；模型目录目前为空，生产模型还会增加大量存储需求，具体取决于所选预设。
 
 ## 4. 运行时架构
 
@@ -122,15 +130,14 @@ flowchart LR
 ```
 
 各处理程序通过类型化数据连接，而不是通过硬编码的调用链耦合。
-处理程序声明自己消费和产生的 `ChatDataType` 值，会话据此创建输入端（sink）
-和输出流（streamer）。因此，生产者不需要了解消费者的具体类型，
-便可将数据分发给所有符合条件的消费者。
+处理程序声明自己消费和产生的 `ChatDataType` 值，会话据此创建输入端（sink）和输出流（streamer）。
+因此，生产者不需要了解消费者的具体类型，便可将数据分发给所有符合条件的消费者。
 
 源代码位置：
 
 - 处理程序契约：[`handler_base.py`](../../src/chat_engine/common/handler_base.py#L16)；
-- 会话路由：[`chat_session.py`](../../src/chat_engine/core/chat_session.py#L216)；
-- 流图：[`stream_manager.py`](../../src/chat_engine/core/stream_manager.py#L183)。
+- 会话路由：[`chat_session.py`](../../src/chat_engine/core/chat_session.py#L92)；
+- 流图：[`stream_manager.py`](../../src/chat_engine/core/stream_manager.py#L1390)。
 
 ### 4.2 启动序列
 
@@ -147,18 +154,18 @@ flowchart LR
 
 源代码位置：
 
-- CLI 和进程：[`demo.py`](../../src/demo.py#L23)；
-- 配置加载：[`service_config_loader.py`](../../src/service/service_utils/service_config_loader.py#L12)；
+- CLI 和进程：[`demo.py`](../../src/demo.py#L32)；
+- 配置加载：[`service_config_loader.py`](../../src/service/service_utils/service_config_loader.py#L27)；
 - 处理程序加载：[`handler_manager.py`](../../src/chat_engine/core/handler_manager.py#L38)；
-- TLS 选择：[`ssl_helpers.py`](../../src/service/service_utils/ssl_helpers.py#L9)。
+- TLS 选择：[`ssl_helpers.py`](../../src/service/service_utils/ssl_helpers.py#L95)。
 
 需要特别注意启动顺序：处理程序初始化完成后，就绪状态会被设为 `true`。
-但这并不验证 TURN 是否可达、模型是否完整、证书是否有效、外部 API 凭据是否可用，
-也不验证浏览器端媒体链路。
+但这并不验证 TURN 是否可达、模型是否完整、证书是否有效、外部 API 凭据是否可用，也不验证浏览器端媒体链路。
 
 ### 4.3 配置语义
 
-所有随附文件都包含一个 `default` Dynaconf 环境。有效对象为：
+所有随附文件都包含一个 `default` Dynaconf 环境。
+有效对象为：
 
 ```text
 default.logger        -> LoggerConfigData
@@ -177,32 +184,28 @@ default.chat_engine   -> ChatEngineConfigModel
 - 引擎级别的 `concurrent_limit` 会复制到每个已注册处理程序，覆盖任何处理程序级别值；
 - 自定义配置文件和 `.env` 是可信输入，因为它们控制模块加载、端点、凭据、模型路径和提示词。
 
-Pydantic 中的服务回退值为 `127.0.0.1:8080`，但随附预设都会显式绑定
-`0.0.0.0:8282`；Beta Agent 预设例外，它绑定 `0.0.0.0:8283`。
+Pydantic 中的服务回退值为 `127.0.0.1:8080`，但随附预设都会显式绑定 `0.0.0.0:8282`；Beta Agent 预设例外，它绑定 `0.0.0.0:8283`。
 因此，部署文档应以预设行为为准，不能把 Pydantic 的回退值当作实际部署默认值。
 
 `duplex` 预设中的顶层 `history` 块不会被加载到任何已验证的配置对象中。
-会话仍使用硬编码默认值构造 `SessionHistory`。参见审查发现 F-12。
+会话仍使用硬编码默认值构造 `SessionHistory`。
+参见审查发现 F-12。
 
 ### 4.4 处理程序生命周期
 
 处理程序有两个范围：
 
 - **进程级** — 仅构造、注册并调用一次 `load()`；计算开销较大的模型通常保存在这里；
-- **会话级** — 由 `create_context()`、`start_context()`、`handle()` 和
-  `destroy_context()` 管理单次会话的状态。
+- **会话级** — 由 `create_context()`、`start_context()`、`handle()` 和 `destroy_context()` 管理单次会话的状态。
 
-加载顺序由 `HandlerBaseInfo.load_priority` 决定。Manager 处理程序可以较早加载，
-以便观察数据；客户端处理程序则在所有非客户端处理程序之后完成准备，
-确保媒体开始传输前会话路由已经可用。
+加载顺序由 `HandlerBaseInfo.load_priority` 决定。
+Manager 处理程序可以较早加载，以便观察数据；客户端处理程序则在所有非客户端处理程序之后完成准备，确保媒体开始传输前会话路由已经可用。
 
-首次通用模型遍历中发现的处理程序配置验证错误只会被记录并跳过，不会阻止启动；
-模块导入失败或处理程序加载失败则会继续向上抛出。由于不同错误采用不同的处理策略，
-运维人员必须检查启动日志，并核对实际注册的处理程序是否与预期一致。
+首次通用模型遍历中发现的处理程序配置验证错误只会被记录并跳过，不会阻止启动；模块导入失败或处理程序加载失败则会继续向上抛出。
+由于不同错误采用不同的处理策略，运维人员必须检查启动日志，并核对实际注册的处理程序是否与预期一致。
 
-代码中虽然存在独立的 `LogicManager`，但 `ChatEngine._create_session()` 内创建会话逻辑的代码
-已被注释。当前预设通过 `src/handlers/logic/` 下的处理程序实现中断逻辑，
-并未启用 `LogicManager` 图。
+代码中虽然存在独立的 `LogicManager`，但 `ChatEngine._create_session()` 内创建会话逻辑的代码已被注释。
+当前预设通过 `src/handlers/logic/` 下的处理程序实现中断逻辑，并未启用 `LogicManager` 图。
 
 ### 4.5 会话、线程和关闭
 
@@ -216,28 +219,26 @@ Pydantic 中的服务回退值为 `127.0.0.1:8080`，但随附预设都会显式
 - 每会话处理程序上下文；
 - 内存中的 `SessionHistory`。
 
-处理程序线程每 30 ms 轮询一次队列。它会捕获 `handler.handle()` 抛出的异常，
-然后继续处理下一项。`SignalManager` 不会捕获信号监听器抛出的异常，
-因此单个监听器失败就可能终止该会话的信号分发线程。
+处理程序线程每 30 ms 轮询一次队列。
+它会捕获 `handler.handle()` 抛出的异常，然后继续处理下一项。
+`SignalManager` 不会捕获信号监听器抛出的异常，因此单个监听器失败就可能终止该会话的信号分发线程。
 
-停止会话时，系统会清除 `active` 标志，等待每个队列处理线程结束，
-销毁处理程序上下文，停止信号线程，清除处理程序，并调用当前为空实现的
-`SessionContext.cleanup()`。关闭整个引擎时，系统会销毁进程级处理程序，
-却不会遍历并停止 `ChatEngine.sessions` 中的活动会话。因此，进程退出时的媒体会话清理
-依赖客户端或框架的拆除顺序。
+停止传统会话时，系统会清除 `active` 标志，等待队列处理线程结束，销毁处理程序上下文、停止信号线程并清除处理程序。
+安全会话现在还会执行有界工作退役、队列/传输拆除、采集清理，并隔离抗取消工作。
+引擎级异步关闭会在销毁进程级处理程序前退役安全会话；传统预设的完整关闭验收仍未完成。
 
-模块退出时，`src/demo.py` 会在 `finally` 块中无条件调用 `os._exit(0)`。
-这会绕过正常的异常传播、析构和缓冲区刷新，并让 shell 与监督程序把启动或运行时异常
-误判为成功。使用缺失配置进行的启动探针已经复现了退出码为 `0` 的问题。
+模块退出时，`src/demo.py` 会在 `finally` 块中调用 `os._exit(exit_code)`。
+显式证书配置/启动错误会设置 `exit_code=1`，但任意启动或运行时异常仍可能保留默认值零，强制退出也会绕过析构和日志缓冲区刷新。
+使用缺失配置进行的启动探针已复现退出码 `0`。
 
 源代码位置：
 
-- 会话启动/停止：[`chat_session.py`](../../src/chat_engine/core/chat_session.py#L334)；
-- 信号线程：[`signal_manager.py`](../../src/chat_engine/core/signal_manager.py#L20)；
-- 引擎关闭：[`chat_engine.py`](../../src/chat_engine/chat_engine.py#L107)。
+- 会话启动/停止：[`chat_session.py`](../../src/chat_engine/core/chat_session.py#L1289)；
+- 信号线程：[`signal_manager.py`](../../src/chat_engine/core/signal_manager.py#L59)；
+- 引擎关闭：[`chat_engine.py`](../../src/chat_engine/chat_engine.py#L1033)。
 
-该架构假定每个实例只运行一个应用进程。启动多个 Uvicorn worker 会分别创建模型实例、
-会话字典、Manager hub 和 GPU 分配，却没有共享路由或会话亲和性支持。
+该架构假定每个实例只运行一个应用进程。
+启动多个 Uvicorn worker 会分别创建模型实例、会话字典、Manager hub 和 GPU 分配，却没有共享路由或会话亲和性支持。
 因此，多 worker 并不是受支持的扩展方式。
 
 ### 4.6 数据流、取消与双工行为
@@ -252,11 +253,12 @@ Pydantic 中的服务回退值为 `127.0.0.1:8080`，但随附预设都会显式
 - 下游引用；
 - 普通和可继承元数据。
 
-取消状态可以沿数据流图传播。系统会在输入端分发前检查数据流是否已取消，
-并在消费者调用处理程序前再次检查。这样既能拦截生产者迟到的写入，
-也能丢弃中断发生前已经进入队列的数据。
+取消状态可以沿数据流图传播。
+系统会在输入端分发前检查数据流是否已取消，并在消费者调用处理程序前再次检查。
+这样既能拦截生产者迟到的写入，也能丢弃中断发生前已经进入队列的数据。
 
-完成的流会短暂保留，以允许下游处理程序链接祖先关系。流存储会定期回收无引用的已完成/已取消流。
+完成的流会短暂保留，以允许下游处理程序链接祖先关系。
+流存储会定期回收无引用的已完成/已取消流。
 
 `standard` 模式的数据流大致如下：
 
@@ -266,15 +268,15 @@ HUMAN_TEXT -> LLM -> AVATAR_TEXT -> TTS -> AVATAR_AUDIO
 AVATAR_AUDIO -> avatar -> AVATAR_VIDEO + AVATAR_AUDIO -> client
 ```
 
-`duplex` 模式增加连续 VAD、`HUMAN_DUPLEX_AUDIO`、`HUMAN_DUPLEX_TEXT`、
-Smart Turn EOU、语义中断判断、会话历史和中断信号。借助类型覆盖，
-SenseVoice 等普通处理程序无需修改内部契约，也能处理 `duplex` 数据类型。
+`duplex` 模式增加连续 VAD、`HUMAN_DUPLEX_AUDIO`、`HUMAN_DUPLEX_TEXT`、Smart Turn EOU、语义中断判断、会话历史和中断信号。
+借助类型覆盖，SenseVoice 等普通处理程序无需修改内部契约，也能处理 `duplex` 数据类型。
 
 ### 4.7 RTC 和 WebSocket 传输
 
 #### RTC
 
-RTC 客户端挂载 FastRTC 双向音频/视频服务。它使用：
+RTC 客户端挂载 FastRTC 双向音频/视频服务。
+它使用：
 
 - 麦克风输入：16 kHz、单声道；
 - 数字人音频输出：24 kHz、每帧 480 个采样点；
@@ -285,14 +287,13 @@ RTC 客户端挂载 FastRTC 双向音频/视频服务。它使用：
 - 可选 ICE/TURN 配置。
 
 音频和视频输出由处理程序线程写入 `asyncio.Queue`，再由 WebRTC 事件循环消费。
-这些队列没有容量上限，生产者也没有通过线程安全的事件循环桥接写入，
-因此慢客户端和并发访问会带来显著风险（F-06）。
+这些队列没有容量上限，生产者也没有通过线程安全的事件循环桥接写入，因此慢客户端和并发访问会带来显著风险（F-06）。
 
 #### WebSocket 和 LAM
 
 通用 WebSocket 客户端和 LAM 客户端都提供 `/ws/session/{session_id}`。
-连接到不存在的会话时会自动创建会话，但系统没有通过身份验证或授权
-把会话 ID 绑定到特定用户。
+在传统/默认模式下，连接到不存在的会话时会自动创建会话，但系统没有通过身份验证把会话 ID 绑定到特定用户。
+启用证书模式后，握手必须在接受连接或创建会话状态之前，通过 `Sec-WebSocket-Protocol` 精确提交一个一次性准入票据。
 
 LAM 支持：
 
@@ -300,8 +301,7 @@ LAM 支持：
 - `ws` 用于纯 WebSocket 输入/输出；
 - `/download/lam_asset/{file_name}` 用于下载配置指定的资源包。
 
-LAM 资源路由将文件名限制在保守字符集内，并检查规范化后的路径，
-可有效降低路径遍历风险。
+LAM 资源路由将文件名限制在保守字符集内，并检查规范化后的路径，可有效降低路径遍历风险。
 
 ### 4.8 状态和持久化
 
@@ -313,6 +313,8 @@ LAM 资源路由将文件名限制在保守字符集内，并检查规范化后�
 | `duplex` 会话历史 | 每会话内存 | 重启时丢失；持久化方法尚未实现 |
 | Manager 最近事件 | 进程内存，有界双端队列（`deque`） | 重启时丢失 |
 | Manager 音频/图像 | `temp/data_tool/<session>/` | 文件会一直保留，需由外部清理 |
+| 证书帧/OCR/提取 | 进程内存中的采集级 AES-256-GCM 密文 | End、超时、断开、失败或替换时先销毁 DEK，再清理密文/索引 |
+| 净化后的录取上下文 | M7 owner-only 组合中的一个类型化采集后 continuation | 仅供一个 ChatAgent 代际使用；不会直接存入历史/记忆；生产 Seal 不可达 |
 | 日志 | stdout 和 `logs/log.log*` | 依赖文件/容器日志保留策略 |
 | 模型 | `models/` 和处理程序特定路径 | 持久卷/本地磁盘 |
 | 数字人资源 | `resource/` | 持久卷/本地磁盘 |
@@ -323,27 +325,65 @@ Manager 上下文会把缓冲区标记为过期，但只有当会话数超过服
 
 ### 4.9 HTTP 接口与网络暴露面
 
-| 接口或服务 | 默认路径/端口 | 应用内身份验证 | 说明 |
+| 接口或服务 | 默认路径/端口 | 传统/默认模式 | 启用证书模式 |
 |---|---|---|---|
-| 主界面 | `/` -> `/ui/index.html` | 无 | 前端 `dist` 缺失时回退到 `/gradio` |
-| 前端资产 | `/ui/*` | 无 | 预构建子模块输出 |
-| 前端初始化配置 | `/openavatarchat/initconfig` | 无 | 可能包含 ICE/TURN 凭据 |
-| Gradio 占位符 | `/gradio` | 无 | 即使有外部 UI 也会挂载 |
-| 版本 | `/version` | 无 | 硬编码为 `0.6.0` |
-| 存活检查 | `/liveness` | 无 | 仅检查进程级响应 |
-| 就绪检查 | `/readiness` | 无 | 仅反映引擎初始化状态 |
-| FastRTC 信令/媒体 | FastRTC 挂载的路由 | 项目中无 | 会消耗 GPU/API 资源的会话入口 |
-| 通用/LAM 会话 | `/ws/session/{session_id}` | 无 | 创建/复用会话 |
-| LAM 资产 | `/download/lam_asset/{file_name}` | 无 | 所选配置存档 |
-| Manager 流 | `/ws/manager/data_tool` | 无 | 全会话快照和远程中断 |
-| Manager 文件 | `/download/manager/data_tool/file` | 无 | 限制到 `temp/data_tool`，但未访问控制 |
-| 应用监听器 | TCP `8282` | 无 | Beta Agent 预设使用 `8283` |
-| TURN | UDP/TCP `3478` | TURN 凭据 | TLS 监听器 TCP `5349` |
-| TURN 中继 | 预期 UDP `49152-65535` | TURN 权限 | 必须匹配实际 coturn 配置/防火墙 |
+| 主界面/静态资产 | `/`、`/ui/*` | 公共静态文件；挂载 `/gradio` | 公共静态文件；不挂载传统 Gradio |
+| 前端初始化配置 | `/openavatarchat/initconfig` | 无应用身份验证 | 需要带 `certificate:capture` 的 Bearer token |
+| 版本/存活/就绪 | `/version`、`/liveness`、`/readiness` | 无应用身份验证 | 需要带 `oac:manager` 的 Bearer token；就绪仍只表示引擎初始化 |
+| RTC 信令 | FastRTC 传统路由 | 项目内无身份验证 | 仅保留应用自有 `/webrtc/offer`，并执行 OIDC/会话/传输准入 |
+| 通用/LAM 会话 | `/ws/session/{session_id}` | 项目内无身份验证；可创建/复用会话 | 接受前须消费一次性 `oac.cert-admission.v1` WebSocket 子协议票据 |
+| LAM 资产 | `/download/lam_asset/{file_name}` | 配置指定的资产 | 仅允许配置指定的公共资产名 |
+| 会话控制 | `/api/v1/session-capabilities`、`/api/v1/sessions/...` | 不挂载 | OIDC `certificate:capture`、不透明能力和一次性传输票据 |
+| 证书采集 | `/api/v1/sessions/{session_id}/certificate-captures` 下五条路由 | 不挂载 | OIDC 所有权及会话/采集能力；不提供 OCR/结果端点 |
+| Manager WS 票据 | `POST /api/v1/manager/websocket-admission-tickets` | 不挂载 | Bearer `oac:manager`；返回 `no-store` 一次性票据。唯一 Manager `Sec-WebSocket-Protocol` token 必须是 `oac.manager-admission.v1.<admission_ticket>` |
+| Manager 流/文件 | `/ws/manager/data_tool`、`/download/manager/data_tool/file` | 项目内无身份验证 | OIDC `oac:manager`；WebSocket 接受前消费一次性票据 |
+| 应用监听器 | TCP `8282`（Beta 预设为 `8283`） | 直接暴露不安全 | 仍不得直接暴露；没有内建限流 |
+| TURN 与中继 | `3478`、`5349`、预期 UDP `49152-65535` | TURN 凭据 | 行为不变；必须单独加固并与防火墙/客户端配置一致 |
 
-Manager 前端会保存一个可选令牌，并把它附加到 HTTP 请求或 WebSocket 查询字符串中，
-但 Python 后端不会验证这两种令牌。因此，英文 Manager 文档中提到的身份验证
-并不是已经实现的服务端控制。
+启用模式下的 scope 故意相互隔离：`certificate:capture` 不能授权 Manager，`oac:manager` 也不能授权证书控制。
+准入票据和能力不会写入查询字符串，相关响应统一使用 `no-store`。
+
+### 4.10 安全录取通知书组件及缺失的生产组合
+
+```mermaid
+flowchart LR
+    OIDC[OIDC access token] --> SA[Session and WS/RTC admission]
+    SA --> BC[BeginCapture]
+    BC --> WF[Generation gate and WorkFenceV1]
+    WF --> PS[PrivateEvidenceStoreV1<br/>AES-256-GCM per capture]
+    PS --> STOP[Production Seal<br/>PROCESSOR_NOT_READY]
+    PS -. owner-only seam, not called by production Seal .-> OCR[CPU OCR sidecar<br/>private UDS, no network]
+    OCR --> TM[HBTC template match<br/>four-field extraction]
+    TM --> EC[Encrypted extraction receipt]
+    EC --> END[EndCapture<br/>retire work and destroy DEK]
+    END --> REL[One-use sanitized context]
+    REL --> CA[ChatAgent turn<br/>tools disabled]
+```
+
+里程碑 1A–1E 提供失败关闭启动、严格 `at+jwt` 验证、服务端会话权威、经认证的 WS/RTC 准入和按用途隔离的 Manager 授权。
+M2 在“处理程序可信”的同进程威胁模型下，阻止证书私有载荷进入普通 sink。
+M3/M3B 在出队、外部调用、回调、变更、存储和 WS/RTC 出口执行精确父代围栏。
+M4A/M4B 加入采集协调器和五条私有路由；转换期间的普通输入会被丢弃，不会缓存后重放。
+
+M5A 使用单个采集 DEK、AES-256-GCM、单调 nonce 和身份绑定 AAD，保存 JPEG 证据及辅助记录。
+M6A 进行私有 CPU OCR，仅保存加密的 `OcrPageResultV1`；
+M6B 使用 `FOUND | AMBIGUOUS | NOT_FOUND` 提取且仅提取 `name`、`source_province`、`college` 和 `major`；
+M6C 只接受湖北交通职业技术学院的 `hbtc_admission_notice_v1`。
+模板匹配只表示解析兼容。
+[证书提取模块参考](certificate-extractor.md)进一步说明纯解析器、模板匹配器、私有服务、字段规则、加密契约和稳定失败结果。
+
+M7 的 owner-only 组合会在 EndCapture 时重新解析加密提取结果，只允许 `FOUND` 值和服务端持有的学校名称进入 `SanitizedAdmissionContextV1`。
+只有在销毁私有密钥、完成清理、验证后继代际并重新开放普通准入后，才会提交该上下文。
+上下文只能使用一次，不会直接进入历史/记忆，也不能启用工具。
+M8 提供仅内存的 WebUI 流程，覆盖 1–3 张 JPEG、相机轨道让渡、有界图像处理、轮询、清理和普通不可用状态处理；浏览器不会收到 OCR、结构化提取或 M7 上下文。
+
+这些 M6A–M7 服务只通过 coordinator owner seam 和隔离/测试组合暴露。
+当前生产 `SealCapture` 会检查构造器注入的 `_test_processor_v1`，只启动 mock processor 操作，从不调用已安装的 OCR 或提取服务。
+加载有效 OCR 部署清单只能暂存服务候选，不能让 Seal 启动生产处理或到达 M7。
+
+系统刻意不提供公共 OCR/提取/结果 API、任意学校 profile、真实性/发行方校验、远程 OCR fallback、浏览器本地 OCR 或生产成功模拟。
+在当前检出版本中，无论是否提供清单，生产 Seal 都必须返回 `PROCESSOR_NOT_READY`。
+后续版本必须同时完成生产 Seal 到 OCR/提取/释放的集成，以及单独的真实 CPU 资格验证。
 
 ## 5. 组件与预设矩阵
 
@@ -362,8 +402,7 @@ Manager 前端会保存一个可选令牌，并把它附加到 HTTP 请求或 We
 
 ### 5.2 已检入预设
 
-下表中的“运行时配置”指实际的 Dynaconf/Pydantic 配置加载流程，
-而不只是安装程序使用 PyYAML 独立完成的依赖扫描。
+下表中的“运行时配置”指实际的 Dynaconf/Pydantic 配置加载流程，而不只是安装程序使用 PyYAML 独立完成的依赖扫描。
 
 | 预设 | 客户端 / 模式 | ASR | 响应 | 数字人 | 限制 | 运行时配置 |
 |---|---|---|---|---|---:|---|
@@ -381,15 +420,13 @@ Manager 前端会保存一个可选令牌，并把它附加到 HTTP 请求或 We
 | `chat_with_qwen_omni.yaml` | RTC 标准模式 | SenseVoice + Qwen S2S | Qwen-Omni 音频/文本 | LiteAvatar | 1 | **无效：`connection_ttl` 重复** |
 | `chat_with_openai_compatible_bailian_cosyvoice_flashhead_duplex_agent.yaml` | RTC 双工 Beta 模式 | SenseVoice | Chat Agent + Bailian TTS | FlashHead | 1 | 原生方式有效；容器存在限制 |
 
-安装程序的试运行（`dry-run`）能够解析全部 13 个预设的依赖项，
-因为 PyYAML 会静默保留重复键中的后一个值；Dynaconf 则会拒绝 Qwen 预设。
+安装程序的试运行（`dry-run`）能够解析全部 13 个预设的依赖项，因为 PyYAML 会静默保留重复键中的后一个值；Dynaconf 则会拒绝 Qwen 预设。
 因此，这两项检查缺一不可。
 
 ### 5.3 Beta Agent 与 OpenClaw 的集成边界
 
 Beta 预设使用端口 `8283`，并可在 `8011` 启动回调监听器，回调令牌默认为空。
-Dockerfile 不会把 `src/handlers/agent/pyproject.toml` 复制到依赖发现层，
-因此镜像内的 `install.py --all` 不会安装相应的 `mcp` 依赖项。
+Dockerfile 不会把 `src/handlers/agent/pyproject.toml` 复制到依赖发现层，因此镜像内的 `install.py --all` 不会安装相应的 `mcp` 依赖项。
 在解决容器依赖和回调安全问题前，该预设仅适合原生开发环境。
 
 此处不包含更多 OpenClaw 运维细节，因为它不是本审查的关键部署目标。
@@ -404,8 +441,7 @@ Dockerfile 不会把 `src/handlers/agent/pyproject.toml` 复制到依赖发现�
 - 容器基础镜像：CUDA `12.8.1`、cuDNN 开发镜像、Ubuntu 22.04。
 - ONNX Runtime GPU：约 `1.20.2`。
 
-根包名称与版本（`open-video-chat` 0.1.0）、应用端点版本（0.6.0）
-和镜像 `APP_VERSION`（由构建脚本根据 Git 分支/提交生成）是三套不同的标识。
+根包名称与版本（`open-video-chat` 0.1.0）、应用端点版本（0.6.0）和镜像 `APP_VERSION`（由构建脚本根据 Git 分支/提交生成）是三套不同的标识。
 发布与回滚流程必须记录 Git 提交和镜像摘要，不能只依赖单个版本字符串。
 
 ### 6.2 依赖项安装
@@ -429,8 +465,8 @@ Dockerfile 不会把 `src/handlers/agent/pyproject.toml` 复制到依赖发现�
 未来的生产构建应采用按预设拆分的镜像或可选依赖组。
 
 Docker 构建上下文还会根据 `.dockerignore` 中的宽泛规则排除所有 `*.yaml` 和 `*.yml`。
-这些规则同样作用于 `src/`，并不只针对 Kubernetes 文件。例如，FlashHead 在加载模块时
-会导入 `flash_head/configs/infer_params.yaml`，但该文件在 `COPY ./src` 前就已被排除。
+这些规则同样作用于 `src/`，并不只针对 Kubernetes 文件。
+例如，FlashHead 在加载模块时会导入 `flash_head/configs/infer_params.yaml`，但该文件在 `COPY ./src` 前就已被排除。
 LiteAvatar、MuseTalk、本地 CosyVoice 和其他子模块也包含运行时 YAML。
 因此，标准镜像构建成功并不能证明复制进去的处理程序能够运行。
 
@@ -444,9 +480,7 @@ LiteAvatar、MuseTalk、本地 CosyVoice 和其他子模块也包含运行时 YA
 | Smart Turn | 精确预设路径 `models/smart_turn/smart-turn-v3.1-cpu.onnx` |
 | FlashHead | `models/SoulX-FlashHead-1_3B`、`models/wav2vec2-base-960h` |
 
-下载程序支持 ModelScope、Hugging Face、第三方 Hugging Face 镜像源、
-Git clone、OSS 和直接解压归档文件，但不会固定不可变的模型修订版本，
-也不会校验产物摘要。
+下载程序支持 ModelScope、Hugging Face、第三方 Hugging Face 镜像源、Git clone、OSS 和直接解压归档文件，但不会固定不可变的模型修订版本，也不会校验产物摘要。
 
 ## 7. 安全、隐私和信任边界
 
@@ -457,11 +491,14 @@ Git clone、OSS 和直接解压归档文件，但不会固定不可变的模型�
 - `.env` 和进程环境；
 - 本地挂载的模型和数字人资源；
 - TLS/TURN 配置和凭据；
+- OIDC issuer/JWKS/audience 配置，以及服务端持有的 HBTC 模板身份；
+- 将来配置生产包时，经过审查的证书 OCR 身份、模型哈希、资格验证记录和部署清单；
 - 预构建前端文件。
 
 ### 7.2 不可信输入
 
 - 浏览器/WebSocket 客户端及其媒体/文本/会话 ID；
+- 采集的 JPEG 字节和所有 OCR 派生文档文本；
 - 公共 HTTP/WebSocket 请求；
 - 上游 LLM/TTS/ASR 输出；
 - 模型注册表、镜像和可变模型产物；
@@ -470,174 +507,150 @@ Git clone、OSS 和直接解压归档文件，但不会固定不可变的模型�
 
 ### 7.3 密钥路径
 
-普通预设读取 `DASHSCOPE_API_KEY`；可选路径还会读取 `DIFY_API_KEY`、
-`SEMANTIC_LLM_EAS_TOKEN` 和 `INTERRUPT_JUDGE_LLM_EAS_TOKEN`。
-TURN 用户名、密码和提供商令牌也属于运行时密钥。
+普通预设读取 `DASHSCOPE_API_KEY`；可选路径还会读取 `DIFY_API_KEY`、`SEMANTIC_LLM_EAS_TOKEN` 和 `INTERRUPT_JUDGE_LLM_EAS_TOKEN`。
+TURN 用户名、密码、提供商令牌、OIDC access token、会话/准入/采集能力，以及私有证据 DEK 也属于运行时密钥。
 
-启用 Manager 时，不要把 API 密钥直接写入 YAML。`HandlerDataTool` 会序列化
-`engine_config`，任意 WebSocket 客户端都能收到当前配置快照。
-TURN 配置也会完整写入 INFO 日志，包括静态凭据。密钥应在运行时注入，
-从配置快照和日志中排除，并通过文件权限或容器密钥机制加以保护。
+启用 Manager 时，不要把 API 密钥直接写入 YAML。
+`HandlerDataTool` 会序列化 `engine_config`，任意 WebSocket 客户端都能收到当前配置快照。
+TURN 配置也会完整写入 INFO 日志，包括静态凭据。
+密钥应在运行时注入，从配置快照和日志中排除，并通过文件权限或容器密钥机制加以保护。
 
 ### 7.4 会话数据
 
 标准 LLM 处理程序会把完整的用户输入和响应片段写入 INFO 日志。
 Manager 模式会保存文本、音频和图像观察数据，并把媒体文件写入 `temp/data_tool`。
-Beta Agent 还会记录部分记忆回写内容。因此，生产环境必须明确规定转录文本、
-媒体和日志的保留期限与访问策略。
+Beta Agent 还会记录部分记忆回写内容。
+因此，生产环境必须明确规定转录文本、媒体和日志的保留期限与访问策略。
+
+证书帧、OCR span、提取候选值和 M7 结构化上下文不得进入这些通用路径。
+采集/释放日志仅允许记录稳定 reason code、策略版本、不透明 release ID、字段数、生命周期状态和耗时；不得记录释放值、prompt、能力或私有存储来源信息。
 
 <a id="prioritized-findings"></a>
 
 ## 8. 按优先级排序的审查发现
 
-严重级别反映按照现有文档部署时可能产生的影响。除非另有说明，
-以下审查发现均为高置信度。
+严重级别反映按照现有文档部署时可能产生的影响。
+除非另有说明，以下审查发现均为高置信度。
 
-### F-01 — 严重：公网服务没有身份验证或准入控制
+### F-01 — 严重：传统/默认模式没有公网服务准入控制
 
-**证据：**预设绑定 `0.0.0.0`；FastRTC 与前端路由分别在
-[`client_handler_rtc.py`](../../src/handlers/client/rtc_client/client_handler_rtc.py#L402)
-和 [`frontend_service.py`](../../src/service/frontend_service/frontend_service.py#L58)
-中挂载，均未配置身份验证。
+**证据：**证书采集默认关闭。
+在该模式下，预设仍绑定 `0.0.0.0`，传统 FastRTC/WS/前端行为保持不变，应用不会执行身份验证。
+启用模式则安装严格 OIDC、会话能力、一次性 WS/RTC 准入和所有权检查。
 
 **触发条件：**直接公开 `8282`/`8283`，包括通过文档中的端口映射。
 
 **影响：**匿名用户可以消耗 GPU 容量和付费 API 凭据，占用较低的并发限制，并使用对话服务。
 
-**所需门槛：**经身份验证的 TLS 入口、会话准入、速率/并发限制，以及阻止直接访问应用监听器的防火墙。
+**所需门槛：**传统模式需要经身份验证的 TLS 入口、会话准入、速率/并发限制，以及阻止直接访问应用监听器的防火墙。
+启用证书模式虽覆盖准入，仍需入口限流、配额和监听器隔离。
 
-### F-02 — 高：Manager 身份验证只停留在前端
+### F-02 — 高：传统/默认模式的 Manager 未认证
 
-**证据：**前端会附加已保存的令牌，但
-[`data_tool_service.py`](../../src/service/manager_service/data_tool_service.py#L106)
-接受所有 WebSocket 连接；
-[`manager_service_register.py`](../../src/service/manager_service/manager_service_register.py#L54)
-提供文件下载时也没有身份验证依赖。
+**证据：**传统/默认模式下，Manager WebSocket 和文件路由保留兼容行为。
+启用证书模式后，Manager HTTP 操作必须使用带 `oac:manager` 的 OIDC token，Manager WebSocket 也必须在接受前消费一个按用途绑定的一次性票据。
 
 **触发条件：**启用 `Manager` 并公开服务。
 
-**影响：**任何客户端都能接收全部会话快照和当前配置、下载已知路径下的临时媒体，
-并远程中断会话。直接写入处理程序配置的 API 密钥可能随配置快照一同泄露。
-每个 Manager 订阅者还会获得一个无界异步队列；生成媒体路径时，
-代码会把未经验证的会话 ID 拼接到名义上的基目录下。根据客户端或代理的路径处理方式，
-精心构造的 ID 可能越出该目录。
+**影响：**任何客户端都能接收全部会话快照和当前配置、下载已知路径下的临时媒体，并远程中断会话。
+直接写入处理程序配置的 API 密钥可能随配置快照一同泄露。
+每个 Manager 订阅者还会获得一个无界异步队列；生成媒体路径时，代码会把未经验证的会话 ID 拼接到名义上的基目录下。
+根据客户端或代理的路径处理方式，精心构造的 ID 可能越出该目录。
 
-**所需门槛：**在生产环境中隔离或禁用 Manager；
-如需启用，则必须在入口层或应用层对 WebSocket 与下载路径强制执行服务端授权。
-同时限制订阅者队列，并在预期基目录内规范化和验证会话文件路径。
+**所需门槛：**在传统生产环境中隔离或禁用 Manager，或在入口/应用层增加服务端授权。
+启用模式需同时验证允许与拒绝路径，保持 `oac:manager` 与 `certificate:capture` 隔离，限制订阅者队列并保留路径约束。
 
 ### F-03 — 高：仓库中的 coturn 凭据与暴露配置不安全
 
-**证据：**[`turnserver.conf`](../../coturn-data/turnserver.conf#L1)
-包含 `admin:admin` 并监听所有接口，Compose 还使用主机网络模式；
+**证据：**[`turnserver.conf`](../../coturn-data/turnserver.conf#L5)包含 `admin:admin` 并监听所有接口，Compose 还使用主机网络模式；
 `setup_coturn.sh` 则会写入 `username:password`。
 
 **触发条件：**在公网可达的主机上启动随附的 TURN 服务。
 
-**影响：**任何人都能使用公开的静态凭据，可能导致中继和带宽被滥用，
-甚至耗尽服务资源。
+**影响：**任何人都能使用公开的静态凭据，可能导致中继和带宽被滥用，甚至耗尽服务资源。
 
-**所需门槛：**使用唯一、可轮换或限时的凭据；明确设置 realm 与监听地址；
-配置配额、有界中继范围、对等方限制、防火墙规则和日志监控。
+**所需门槛：**使用唯一、可轮换或限时的凭据；明确设置 realm 与监听地址；配置配额、有界中继范围、对等方限制、防火墙规则和日志监控。
 绝不能部署仓库中的默认凭据。
 
 ### F-04 — 高：Compose 中的 TURN/TLS 配置错误，且未向客户端下发
 
-**证据：**[`docker-compose.yml`](../../docker-compose.yml#L10)
-把 `localhost.crt` 同时挂载为 TURN 证书和私钥。目标应用配置没有 `turn_config`；
-[`client_handler_rtc.py`](../../src/handlers/client/rtc_client/client_handler_rtc.py#L402)
-也只有在提供该配置时才会发送 ICE 配置。
+**证据：**[`docker-compose.yml`](../../docker-compose.yml#L12)把 `localhost.crt` 同时挂载为 TURN 证书和私钥。
+目标应用配置没有 `turn_config`；
+[`client_handler_rtc.py`](../../src/handlers/client/rtc_client/client_handler_rtc.py#L484)也只有在提供该配置时才会发送 ICE 配置。
 
 **触发条件：**执行 `docker compose up`，并期望公网或 NAT 后的 WebRTC 客户端能够连接。
 
-**影响：**TURN-over-TLS 无法加载有效私钥，浏览器也收不到 TURN 服务器配置；
-处于受限 NAT 后的客户端仍可能无法连接。
+**影响：**TURN-over-TLS 无法加载有效私钥，浏览器也收不到 TURN 服务器配置；处于受限 NAT 后的客户端仍可能无法连接。
 
-**所需门槛：**挂载真正的私钥，修正并验证 coturn 配置，
-添加 `RtcClient.turn_config`，再从外部网络验证 ICE 中继候选项。
+**所需门槛：**挂载真正的私钥，修正并验证 coturn 配置，添加 `RtcClient.turn_config`，再从外部网络验证 ICE 中继候选项。
 
 ### F-05 — 高：不安全的模型反序列化叠加未校验的可变下载
 
-**证据：**[`demo.py`](../../src/demo.py#L31) 会在全局强制调用
-`torch.load(..., weights_only=False)`，除非调用方明确传入 `True`；
-[`download_models.py`](../../scripts/download_models.py#L134)
-既不固定模型修订版本，也不验证校验和。
+**证据：**[`demo.py`](../../src/demo.py#L40) 会在全局强制调用 `torch.load(..., weights_only=False)`，除非调用方明确传入 `True`；
+[`download_models.py`](../../scripts/download_models.py#L134)既不固定模型修订版本，也不验证校验和。
 
 **触发条件：**从遭入侵的模型仓库或镜像源加载文件，或加载被修改的模型卷和非预期产物。
 
-**影响：**兼容 pickle 格式的恶意模型可以服务用户身份执行代码；
-容器目前以 root 用户运行，并能访问密钥和挂载数据。
+**影响：**兼容 pickle 格式的恶意模型可以服务用户身份执行代码；容器目前以 root 用户运行，并能访问密钥和挂载数据。
 
-**所需门槛：**使用经过校验的不可变产物、安全格式或 `weights_only=True`；
-隔离无法替换的旧式模型，并以非 root 用户运行服务。
+**所需门槛：**使用经过校验的不可变产物、安全格式或 `weights_only=True`；隔离无法替换的旧式模型，并以非 root 用户运行服务。
 
 ### F-06 — 高：RTC 队列无界，且跨线程写入不安全
 
-**证据：**处理程序线程在
-[`client_handler_rtc.py`](../../src/handlers/client/rtc_client/client_handler_rtc.py#L563)
-中调用 `asyncio.Queue.put_nowait()`，WebRTC 事件循环则在
-[`rtc_stream.py`](../../src/service/rtc_service/rtc_stream.py#L161) 中等待这些队列。
+**证据：**处理程序线程在[`client_handler_rtc.py`](../../src/handlers/client/rtc_client/client_handler_rtc.py#L731)中调用 `asyncio.Queue.put_nowait()`，WebRTC 事件循环则在[`rtc_stream.py`](../../src/service/rtc_service/rtc_stream.py#L346) 中等待这些队列。
 
 **触发条件：**正常的并发输出或卡顿/缓慢客户端。
 
-**影响：**丢失唤醒或发生竞态时，媒体传输可能停滞；
-排队的音频和视频还可能无限增长，最终耗尽内存。
+**影响：**丢失唤醒或发生竞态时，媒体传输可能停滞；排队的音频和视频还可能无限增长，最终耗尽内存。
 
-**所需门槛：**采用线程安全的事件循环写入方式、有界队列、过期视频帧丢弃策略、
-有界音频延迟，并覆盖慢客户端场景测试。
+**所需门槛：**采用线程安全的事件循环写入方式、有界队列、过期视频帧丢弃策略、有界音频延迟，并覆盖慢客户端场景测试。
 
 ### F-07 — 高：Docker 构建上下文会排除处理程序所需的运行时 YAML
 
-**证据：**[`.dockerignore`](../../.dockerignore#L164)
-会在整个构建上下文中排除 `*.yaml` 和 `*.yml`，Dockerfile 随后才复制 `src`。
-FlashHead 会明确切换到其子模块，因为上游导入需要打开
-`flash_head/configs/infer_params.yaml`；这一必需文件正好匹配忽略规则。
+**证据：**[`.dockerignore`](../../.dockerignore#L170)会在整个构建上下文中排除 `*.yaml` 和 `*.yml`，Dockerfile 随后才复制 `src`。
+FlashHead 会明确切换到其子模块，因为上游导入需要打开 `flash_head/configs/infer_params.yaml`；这一必需文件正好匹配忽略规则。
 
 **触发条件：**构建标准镜像，并启用源代码或运行时资源中包含 YAML 的处理程序。
 
 **影响：**镜像可能成功构建，却在导入处理程序或初始化模型时失败。
-FlashHead 已确认依赖相应 YAML；其他多个随附子模块也包含 YAML 资源，
-需要按预设逐一验证。
+FlashHead 已确认依赖相应 YAML；其他多个随附子模块也包含 YAML 资源，需要按预设逐一验证。
 
-**所需门槛：**把忽略规则限定在确实不需要打包的路径，
-或重新纳入 `src` 下的运行时 YAML；随后逐一检查并测试最终镜像中的目标处理程序。
+**所需门槛：**把忽略规则限定在确实不需要打包的路径，或重新纳入 `src` 下的运行时 YAML；随后逐一检查并测试最终镜像中的目标处理程序。
 
 ### F-08 — 中：随附预设中的 RTC 与数字人 FPS 不一致，需要集成验证
 
 **证据：**`ClientRtcConfigModel` 要求输出 FPS 与数字人处理程序匹配。
 MuseTalk 会强制校验相等，其预设设置为 `24`/`24`；其他数字人模式没有同类运行时保护。
-大多数 LiteAvatar 和非 Agent 的 FlashHead 预设将数字人 FPS 设为 `25`，
-而 RTC 仍保留默认值 `30`。
+大多数 LiteAvatar 和非 Agent 的 FlashHead 预设将数字人 FPS 设为 `25`，而 RTC 仍保留默认值 `30`。
 
 **触发条件：**以不匹配预设之一运行持续对话。
 
 **影响：**调度过程可能重复或丢弃帧，也可能偏离 24 kHz 音频时序。
 本次审查没有通过运行时测试确认实际可见影响。
 
-**所需门槛：**明确设置两个值且相等，然后运行长时 A/V 同步测试。添加跨处理程序配置验证。
+**所需门槛：**明确设置两个值且相等，然后运行长时 A/V 同步测试。
+添加跨处理程序配置验证。
 
 ### F-09 — 中：TLS 配置失败后仍会回退到明文
 
-**证据：**[`ssl_helpers.py`](../../src/service/service_utils/ssl_helpers.py#L19) 记录缺失文件并返回无 SSL 设置。
+**证据：**在传统/默认模式下，[`ssl_helpers.py`](../../src/service/service_utils/ssl_helpers.py#L117)会记录缺失文件并返回无 SSL 设置。
+启用证书模式后，系统要求可读、相互匹配且未加密的证书/密钥材料，并会在应用初始化前失败关闭。
 
 **触发条件：**一个或两个证书文件缺失或挂载错误。
 
 **影响：**`0.0.0.0` 服务仍会通过 HTTP 启动；远程浏览器媒体权限失败，或运维人员意外公开明文流量。
 
-**所需门槛：**对非回环地址部署执行明确的前置检查，并在 TLS 配置无效时阻止启动；
-优先在入口代理处终止受信任 TLS。
+**所需门槛：**对非回环地址部署执行明确的前置检查，并在 TLS 配置无效时阻止启动；优先在入口代理处终止受信任 TLS。
 
 ### F-10 — 中：构建无法复现
 
-**证据：**依赖版本范围过宽、直接执行 `uv pip install`、`uv.lock` 被忽略、
-`uv` 版本浮动、基础镜像标签来自浮动镜像源，以及 coturn 镜像未固定。
+**证据：**依赖版本范围过宽、直接执行 `uv pip install`、`uv.lock` 被忽略、`uv` 版本浮动、基础镜像标签来自浮动镜像源，以及 coturn 镜像未固定。
 
 **触发条件：**在上游依赖、镜像或包索引发生变化后重新构建。
 
 **影响：**源等价构建可能不同或无法继续构建；回滚和事件重建变得不可靠。
 
-**所需门槛：**纳入版本控制且经过审查的锁文件或约束、锁定安装、
-镜像摘要、产物哈希、SBOM、来源证明和不可变发布标识。
+**所需门槛：**纳入版本控制且经过审查的锁文件或约束、锁定安装、镜像摘要、产物哈希、SBOM、来源证明和不可变发布标识。
 
 ### F-11 — 中：模型下载成功检查不完整
 
@@ -651,10 +664,8 @@ MuseTalk 会强制校验相等，其预设设置为 `24`/`24`；其他数字人�
 
 ### F-12 — 中：已配置的历史保留被忽略
 
-**证据：**`duplex` 配置定义了 `default.history`，但
-[`service_config_loader.py`](../../src/service/service_utils/service_config_loader.py#L30)
-不会加载它；[`chat_engine.py`](../../src/chat_engine/chat_engine.py#L69)
-创建 `SessionContext` 时也没有传入 `HistoryConfig`。
+**证据：**`duplex` 配置定义了 `default.history`，但[`service_config_loader.py`](../../src/service/service_utils/service_config_loader.py#L27)不会加载它；
+[`chat_engine.py`](../../src/chat_engine/chat_engine.py#L273)创建 `SessionContext` 时也没有传入 `HistoryConfig`。
 
 **触发条件：**调整预设中的任意历史保留值。
 
@@ -663,46 +674,42 @@ MuseTalk 会强制校验相等，其预设设置为 `24`/`24`；其他数字人�
 **所需门槛：**将该配置接入运行时并完成测试，或从运维说明中移除相关调优声明。
 当前默认值为 1,000 个事件、保留一小时、每 60 秒清理一次。
 
-### F-13 — 中：关闭和部分会话清理缺口
+### F-13 — 中：传统生命周期清理仍需完整验收
 
-**证据：**引擎关闭时不会停止活动会话；客户端处理程序完成准备之前，
-系统就已保存新建的会话。
+**证据：**安全会话现已使用有界代际退役、采集/传输清理、隔离区和异步引擎关闭。
+但这些变化本身不能证明所有传统处理程序、第三方上下文或进程退出路径均能事务性清理。
 
 **触发条件：**带活动会话的进程关闭，或客户端上下文准备失败。
 
 **影响：**资源/线程可能依赖强制进程退出；失败启动可能留下部分注册会话，直至重启/手动清理。
 
-**所需门槛：**在销毁处理程序前停止全部会话，使创建具备事务性，并测试 SIGTERM 及失败上下文情形。
+**所需门槛：**保留安全生命周期测试，并针对每个目标生产预设运行 SIGTERM、失败上下文、抗取消处理程序和进程退出测试。
 
 ### F-14 — 中：就绪检查与容器隔离不足
 
-**证据：**`/readiness` 只检查 `states.inited`；镜像以 root 用户运行；
-Compose 以读写方式挂载密钥、配置和模型，且没有健康检查或资源限制。
+**证据：**`/readiness` 只检查 `states.inited`；镜像以 root 用户运行；Compose 以读写方式挂载密钥、配置和模型，且没有健康检查或资源限制。
 
 **触发条件：**缺少模型/证书/TURN/API 前提条件，或发生运行时攻破。
 
-**影响：**流量可能被发送到功能不可用的实例；
-一旦容器遭到攻破，攻击者仍可获得不必要的写入权限。
+**影响：**流量可能被发送到功能不可用的实例；一旦容器遭到攻破，攻击者仍可获得不必要的写入权限。
 
-**所需门槛：**能够感知前置条件的健康检查、非 root UID、尽可能使用只读挂载、
-移除不必要的 Linux capabilities、启用 `no-new-privileges`，
-并限制 CPU、内存、GPU 和会话资源。
+**所需门槛：**能够感知前置条件的健康检查、非 root UID、尽可能使用只读挂载、移除不必要的 Linux capabilities、启用 `no-new-privileges`，并限制 CPU、内存、GPU 和会话资源。
 
 ### F-15 — 中：Qwen-Omni 预设无法加载
 
-**证据：**`connection_ttl` 同时出现在 [`chat_with_qwen_omni.yaml`](../../config/chat_with_qwen_omni.yaml#L15) 的第 17 和 19 行。Dynaconf 抛出 `DuplicateKeyError`。
+**证据：**`connection_ttl` 同时出现在 [`chat_with_qwen_omni.yaml`](../../config/chat_with_qwen_omni.yaml#L17) 的第 17 和 19 行。
+Dynaconf 抛出 `DuplicateKeyError`。
 
 **触发条件：**启动文档中的 Qwen 预设。
 
-**影响：**启动会在配置加载阶段停止。安装程序的试运行会让人误以为配置可用，
-因为其解析器只保留重复键中的后一个值。
+**影响：**启动会在配置加载阶段停止。
+安装程序的试运行会让人误以为配置可用，因为其解析器只保留重复键中的后一个值。
 
 **所需门槛：**移除重复项，并使用运行时加载器验证。
 
 ### F-16 — 中：日志会记录敏感内容和 TURN 凭据
 
-**证据：**标准 LLM 的输入和输出会写入 INFO 日志；日志会保留十份轮转文件；
-RTC 提供程序还会记录完整配置，包括静态 TURN 凭据。
+**证据：**标准 LLM 的输入和输出会写入 INFO 日志；日志会保留十份轮转文件；RTC 提供程序还会记录完整配置，包括静态 TURN 凭据。
 
 **触发条件：**普通会话或启用 TURN 的启动。
 
@@ -712,32 +719,31 @@ RTC 提供程序还会记录完整配置，包括静态 TURN 凭据。
 
 ### F-17 — 中：进程退出码会掩盖失败并绕过清理
 
-**证据：**[`demo.py`](../../src/demo.py#L101) 无论 `main()` 如何退出，都会在 `finally` 中调用 `os._exit(0)`。以缺失配置启动时记录了错误，却返回 shell 状态 `0`。
+**证据：**[`demo.py`](../../src/demo.py) 现在会对显式的证书配置/启动错误类返回退出码 `1`，但仍通过 `os._exit(exit_code)` 终止，且不会把任意配置错误、处理程序加载或运行时异常转换为非零状态。
+原始的缺失配置探测返回 `0`。
 
 **触发条件：**任意启动异常、未被 `main()` 捕获的运行时异常，或服务器正常返回。
 
-**影响：**CI、systemd `Restart=on-failure`、部署自动化和运维人员可能将失败启动视为成功。强制退出还会绕过正常清理和排队日志刷新。
+**影响：**CI、systemd `Restart=on-failure`、部署自动化和运维人员可能将失败启动视为成功。
+强制退出还会绕过正常清理和排队日志刷新。
 
-**所需门槛：**保留真实的失败退出码并采用有序关闭；
-测试缺失配置、无效配置、处理程序加载、SIGTERM 和正常停止时的退出码与清理行为。
+**所需门槛：**保留真实的失败退出码并采用有序关闭；测试缺失配置、无效配置、处理程序加载、SIGTERM 和正常停止时的退出码与清理行为。
 修复前，部署必须要求明确的就绪证据，并采用不依赖非零退出码的重启策略。
 
 ### F-18 — 中：构建脚本会执行用户可控的命令字符串
 
-**证据：**[`build_cuda128.sh`](../../build_cuda128.sh#L141) 将 `--tag` 和构建元数据插入 `BUILD_CMD`，随后调用 `eval`。
+**证据：**[`build_cuda128.sh`](../../build_cuda128.sh#L142) 将 `--tag` 和构建元数据插入 `BUILD_CMD`，随后调用 `eval`。
 
 **触发条件：**构建管线或运维人员传入不可信/格式错误的镜像 tag。
 
-**影响：**shell 元字符可能以构建用户权限执行命令；
-Docker 用户组权限通常等同于主机 root 权限。
+**影响：**shell 元字符可能以构建用户权限执行命令；Docker 用户组权限通常等同于主机 root 权限。
 
-**所需门槛：**使用 Bash 数组构造 Docker 命令，移除 `eval`，
-校验标签和镜像仓库参数，并禁止把不可信的 PR 或分支数据传入特权构建参数。
+**所需门槛：**使用 Bash 数组构造 Docker 命令，移除 `eval`，校验标签和镜像仓库参数，并禁止把不可信的 PR 或分支数据传入特权构建参数。
 
 ### F-19 — 低：发布标识符和文档漂移
 
 示例包括：根包版本为 `0.1.0`，应用版本却为 `0.6.0`；
-Manager 身份验证文档与实际未进行身份验证的后端不一致；
+Manager 安全行为随 feature mode 不同；
 参考文档中的默认值与 Pydantic 定义不同；
 构建脚本输出还提到了 Dockerfile 中未定义的 `BUILD_COMMIT` 变量。
 
@@ -749,29 +755,44 @@ Manager 身份验证文档与实际未进行身份验证的后端不一致；
 
 Docker 依赖层遗漏了 Agent 清单；Beta 回调默认使用空令牌绑定 `0.0.0.0:8011`。
 
-**所需门槛：**保持禁用；如需启用，则必须安装缺失依赖，
-要求非空令牌、回环或私网地址绑定，以及有界队列。
+**所需门槛：**保持禁用；如需启用，则必须安装缺失依赖，要求非空令牌、回环或私网地址绑定，以及有界队列。
+
+### F-21 — 发布阻断项：生产证书处理尚未连线，也未通过资格验证
+
+**证据：**仓库包含 CPU-only sidecar、严格清单、资格验证工具、私有 UDS/Compose 隔离和合成里程碑测试，但没有获批的 sidecar `uv.lock`、生产 PP-OCRv6 产物、已资格验证的 `InferenceIdentityV1`、资格验证记录或真实文档 fixture。
+更直接的是，`SealCapture` 只允许构造器注入的测试 processor，并只启动 mock 操作。
+生产 Seal 从不调用 owner-only M6A OCR 和 M6B/M6C 提取 seam，因此仅有有效清单也无法到达这些组件或 M7。
+
+**影响：**这是刻意的失败关闭状态。
+即使有合格清单，通过帧数门禁后，生产 Seal 仍返回 `PROCESSOR_NOT_READY`；M6A/M6B/M6C/M7 和 M8 个性化成功路径无法通过生产 API 执行。
+合成成功只能证明组件，不能证明生产组合、模型质量、延迟、内存或就绪状态。
+
+**所需门槛：**先实现并独立审查受精确围栏保护的生产 Seal→OCR→提取→释放组合，且不得暴露私有结果。
+再单独完成隔离 CPU 资格验证，冻结并审查全部哈希、身份、线程和资源结果，配置只读产物与严格部署清单。
+最后在启用生产前重新执行安全、统计、资源争用、清理、失败和真实相机验收。
 
 ## 9. 质量与测试现状
 
-- 未发现项目自有的核心测试套件或 CI 测试任务。
-- 唯一的根 CI 工作流构建/部署 VitePress 文档。
-- 已声明 Pytest 依赖项，但发现的测试主要位于上游子模块中。
-- 源代码语法检查范围很广，但不能证明运行时兼容性、正确的媒体时序、取消正确性或会话隔离。
-- 预构建前端文件在正常部署中提供；重建前端当前有类型检查失败。
+- 当前检出版本已在 `tests/service/`、`tests/chat_engine/security/`、`tests/chat_engine/fencing/` 和截至 M7 的里程碑目录中加入大量第一方测试，覆盖准入、能力、dispatch 隔离、精确父代围栏、协调器竞争、加密存储、OCR/UDS 契约、确定性提取/模板匹配、释放和 ChatAgent 工具抑制。
+- WebUI 子模块加入了 M8 TypeScript 测试，覆盖会话状态、API 隐私、相机让渡、图像边界和工作流，并检入生产构建。
+- 根 CI 仍未执行这套安全测试。
+  组合 pytest 收集还存在顶层 `conftest` 和非 package 同名模块冲突，因此必须分别运行里程碑和服务套件。
+- 合成 fixture 和模拟/仅测试处理器只能证明确定性行为，不能证明真实 Paddle/PP-OCRv6 的精度、容量或浏览器端到端运行。
+- 2026-08-18 的前端类型检查失败仅是历史证据；刷新后的 M8 前端仍需在固定子模块和受支持 Node/pnpm 环境中重新验证。
 
 最高价值的缺失测试是：
 
 1. 通过真实加载器验证每个预设的配置；
-2. 使用模拟模型加载器构造处理程序图；
-3. 两个会话之间的隔离，以及并发限制是否得到强制执行；
-4. 慢速/断开 RTC 客户端背压；
-5. 流取消和残余队列拒绝；
-6. 带活动会话的 SIGTERM；
-7. 经身份验证的公共/Manager 路由行为；
+2. 不使用测试 processor，由生产 Seal 调用受精确围栏保护的 OCR、提取、释放、失败和清理路径；
+3. 独立配置的真实 CPU OCR 资格验证和 holdout 评估；
+4. 从真实相机 M8 采集到清理及一次回复的完整流程；
+5. 慢速/断开 RTC 客户端背压；
+6. 带传统、安全和采集会话的 SIGTERM；
+7. 使用真实模型加载器构造受支持预设的处理程序图；
 8. TURN 配置生成和外部中继 ICE 候选项；
-9. 精确模型清单验证；
-10. 依赖锁定的干净镜像构建。
+9. 依赖锁定的主镜像和 OCR 镜像干净构建；
+10. 部署环境中的生产清单、UDS peer 和无 GPU 负向测试；
+11. 目标并发量及实时 GPU 处理程序/CPU OCR 争用测试。
 
 ## 10. 值得保留的优势
 
@@ -780,6 +801,10 @@ Docker 依赖层遗漏了 Agent 清单；Beta 回调默认使用空令牌绑定 
 - 用于复用 `duplex` 处理程序的可配置类型重映射。
 - 显式的流祖先关系和取消传播。
 - 生产者侧和消费者侧取消保护。
+- 启用模式下按用途绑定的 OIDC/会话/WS/RTC/Manager 准入。
+- 精确代际 WorkFence 覆盖和失败关闭采集转换。
+- 采集密钥加密，以及无网络、CPU-only 的私有 OCR 接口。
+- 确定性的四字段/模板策略和一次性净化释放。
 - 固定的源代码子模块，而不是检出时浮动的 Git 分支。
 - Manager 下载和 LAM 资产服务的路径检查。
 - 有界 Manager 事件缓冲区和会话历史默认值。
@@ -798,4 +823,5 @@ Docker 依赖层遗漏了 Agent 清单；Beta 回调默认使用空令牌绑定 
 | 未经身份验证直接暴露到公网 | 不可接受 |
 | 生产级多用户服务 | 在完成修复、负载测试和必要的运维控制前，不具备就绪条件 |
 | 横向多 worker/多节点部署 | 当前内存架构不支持 |
+| HBTC 录取通知书个性化 | 组件已实现到 M8，但生产 Seal 不会调用 M6A–M7；在完成组合、CPU OCR 资格验证和真实相机验收前不具备生产就绪条件 |
 | Beta OpenClaw 部署 | 当前状态下次要、仅限原生开发 |

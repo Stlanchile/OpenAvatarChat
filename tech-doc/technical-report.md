@@ -24,13 +24,27 @@ service and has several useful correctness mechanisms:
 - dependency/model selection can be derived from a preset.
 
 The current deployment surface is not production-ready without compensating
-controls. The main application has no authentication, the Manager surface is
-unauthenticated despite frontend token UI, the bundled TURN service is unsafe
-and miswired, TLS can silently fall back to plaintext, models are unverified
-while `torch.load` is globally placed in unsafe mode, and the dependency set is
-not reproducible from tracked files. Several lifecycle and backpressure gaps
-also matter under multiple or slow sessions, and the process currently masks
-startup failures with exit status zero.
+controls. Certificate capture is disabled by default; that legacy/default mode
+retains the unauthenticated application and Manager behavior found in the
+original review. Enabling certificate capture changes the security posture
+materially: startup requires valid TLS, one worker, and strict OIDC; session,
+WebSocket, RTC, capture, health/config, and Manager operations use purpose-bound
+admission and ownership checks. This opt-in mode still has no general
+rate-limiter and does not fix the unsafe/miswired bundled TURN service,
+unverified generic model loading, floating dependency resolution, or unbounded
+RTC output queues.
+
+The reviewed checkout now contains admission-notice components through the M8
+WebUI: capture transitions and normal work are generation-fenced, JPEG evidence
+is capture-key encrypted, and private M6A OCR, M6B/M6C four-field/template, M7
+sanitized-release, and M8 browser components exist with isolated tests. They are
+not production-composed end to end. The production Seal path only admits a
+constructor-injected test processor; it never calls the private OCR or
+extraction services, so it cannot stage M7 release. Independently, no approved
+production OCR lock, models, identity, or CPU qualification record is committed.
+Production Seal therefore returns `PROCESSOR_NOT_READY` after the frame-count
+gate even if a valid deployment manifest is supplied. Template parsing and
+personalization also would not constitute document authenticity verification.
 
 This is a readiness assessment, not a claim that the project cannot be used.
 The native and Docker paths are viable for a controlled Linux GPU host after
@@ -47,6 +61,10 @@ operation requires the production gates in the
 - all 13 checked-in YAML presets;
 - first-party engine, session, stream, signal, client, service, handler, and
   manager code;
+- certificate session admission, security envelopes, generation fencing,
+  coordinator, encrypted private store, OCR/extraction/release code, and their
+  dedicated first-party test suites;
+- the CPU-only OCR sidecar package and its Compose isolation boundary;
 - the prebuilt frontend boundary and frontend build/type-check state;
 - handler dependency manifests and all eight Git submodule boundaries;
 - English and Chinese project documentation, with the English documentation
@@ -68,7 +86,7 @@ to a full independent implementation audit:
 | CosyVoice | `0a496c18f78ca993c63f6d880fcc60778bfc85c1` |
 | Silero VAD | `9060f664f20eabb66328e4002a41479ff288f14c` |
 | Smart Turn | `7392230c2627503d0cefcaa79d60e5adbb381a54` |
-| OpenAvatarChat WebUI | `a6182afbda3f3b84a6608402a41e55a0c7bc6766` |
+| OpenAvatarChat WebUI | `b82f290c692a84d85108f03be046aa392350ca9a` |
 
 The root repository controls how these components are loaded, configured, and
 exposed, so those integration seams are in scope even where the upstream
@@ -85,7 +103,10 @@ Accordingly, this review did not:
 - start the full media service;
 - build or start the CUDA container;
 - exercise browser WebRTC across a real NAT;
-- measure latency, throughput, GPU memory, or multi-session capacity.
+- measure latency, throughput, GPU memory, or multi-session capacity;
+- provision or run the independently qualified Paddle/PP-OCRv6 CPU sidecar;
+- complete a real-camera, real-document M8 capture and personalized-response
+  flow.
 
 The existing documentation's latency and VRAM figures are historical project
 claims, not results reproduced in this review.
@@ -98,7 +119,10 @@ claims, not results reproduced in this review.
 | `src/chat_engine/` | handler discovery, session lifecycle, stream/signal graph, data models |
 | `src/handlers/` | client, VAD, ASR, LLM, TTS, avatar, manager, and beta agent integrations |
 | `src/service/` | frontend mounting, RTC/TURN providers, manager service, config/TLS/logging |
+| `src/certificate_capture/` | capture lifecycle, private evidence, OCR, deterministic extraction, and one-use release |
+| `services/certificate_ocr/` | isolated CPU-only OCR sidecar and qualification tooling |
 | `config/` | environment-scoped runtime presets |
+| `tests/service/` and `tests/chat_engine/` | first-party security, fencing, capture, extraction, release, and service tests |
 | `scripts/` | model/avatar downloads, TLS creation, coturn setup |
 | `resource/` | avatar assets mounted or copied at runtime |
 | `models/` | downloaded model root; ignored by Git |
@@ -144,8 +168,8 @@ fan out to all eligible consumers without knowing their concrete classes.
 Source anchors:
 
 - handler contract: [`handler_base.py`](../src/chat_engine/common/handler_base.py#L16);
-- session wiring: [`chat_session.py`](../src/chat_engine/core/chat_session.py#L216);
-- stream graph: [`stream_manager.py`](../src/chat_engine/core/stream_manager.py#L183).
+- session wiring: [`chat_session.py`](../src/chat_engine/core/chat_session.py#L92);
+- stream graph: [`stream_manager.py`](../src/chat_engine/core/stream_manager.py#L1390).
 
 ### 4.2 Boot sequence
 
@@ -162,10 +186,10 @@ Source anchors:
 
 Source anchors:
 
-- CLI and process: [`demo.py`](../src/demo.py#L23);
-- config load: [`service_config_loader.py`](../src/service/service_utils/service_config_loader.py#L12);
+- CLI and process: [`demo.py`](../src/demo.py#L32);
+- config load: [`service_config_loader.py`](../src/service/service_utils/service_config_loader.py#L27);
 - handler load: [`handler_manager.py`](../src/chat_engine/core/handler_manager.py#L38);
-- TLS selection: [`ssl_helpers.py`](../src/service/service_utils/ssl_helpers.py#L9).
+- TLS selection: [`ssl_helpers.py`](../src/service/service_utils/ssl_helpers.py#L95).
 
 An important ordering detail is that readiness becomes true after handler
 initialization, but it does not verify TURN reachability, model completeness
@@ -246,23 +270,24 @@ The handler pump polls its queue every 30 ms. It catches exceptions from
 are not caught inside `SignalManager`, so one listener failure can terminate
 the session's signal-distribution thread.
 
-Session stop clears the active flag, joins each pump thread, destroys handler
-contexts, stops the signal thread, clears handlers, and calls an empty
-`SessionContext.cleanup()`. Engine-wide shutdown destroys process-scope
-handlers, but does not iterate and stop `ChatEngine.sessions`. Active media
-sessions therefore depend on client/framework teardown ordering during process
-shutdown.
+Legacy session stop clears the active flag, joins pump threads, destroys handler
+contexts, stops the signal thread, and clears handlers. Secure sessions now add
+bounded work retirement, queue/transport teardown, capture cleanup, and
+quarantine of cancellation-resistant work. Engine-wide asynchronous shutdown
+retires secure sessions before process-scope handlers are destroyed; full
+legacy-preset shutdown acceptance remains outstanding.
 
-At module exit, `src/demo.py` unconditionally calls `os._exit(0)` from a
-`finally` block. This bypasses normal exception propagation, destructors, and
-buffer flushing and reports startup/runtime exceptions as success to shells and
-supervisors. A missing-config startup probe reproduced exit code zero.
+At module exit, `src/demo.py` calls `os._exit(exit_code)` from a `finally`
+block. Explicit certificate configuration/startup errors set `exit_code=1`,
+but arbitrary startup/runtime exceptions can still leave the default zero and
+the forced exit bypasses destructors and buffered-log flushing. A missing-config
+startup probe reproduced exit code zero.
 
 Source anchors:
 
-- session start/stop: [`chat_session.py`](../src/chat_engine/core/chat_session.py#L334);
-- signal thread: [`signal_manager.py`](../src/chat_engine/core/signal_manager.py#L20);
-- engine shutdown: [`chat_engine.py`](../src/chat_engine/chat_engine.py#L107).
+- session start/stop: [`chat_session.py`](../src/chat_engine/core/chat_session.py#L1289);
+- signal thread: [`signal_manager.py`](../src/chat_engine/core/signal_manager.py#L59);
+- engine shutdown: [`chat_engine.py`](../src/chat_engine/chat_engine.py#L1033).
 
 This model assumes one application process. Running multiple Uvicorn workers
 would create independent model instances, session dictionaries, manager hubs,
@@ -327,7 +352,10 @@ and concurrency risk (F-06).
 
 The generic WebSocket client and LAM client expose
 `/ws/session/{session_id}`. If the session does not exist, connecting creates
-it. No authentication or authorization binds a session ID to a principal.
+it in legacy/default mode, where no authentication binds a session ID to a
+principal. In enabled certificate mode the handshake must present exactly one
+single-use admission ticket in the `Sec-WebSocket-Protocol` value before the
+connection is accepted or session state is created.
 
 LAM supports:
 
@@ -348,6 +376,8 @@ checks the resolved path, which is a useful path-traversal control.
 | Duplex session history | per-session memory | Lost on restart; persistence methods are placeholders |
 | Manager recent events | process memory, bounded deque | Lost on restart |
 | Manager audio/images | `temp/data_tool/<session>/` | Files remain until externally removed |
+| Certificate frames/OCR/extraction | capture-scoped AES-256-GCM ciphertext in process memory | DEK destroyed before ciphertext/index cleanup on End, timeout, disconnect, failure, or replacement |
+| Sanitized admission context | one typed post-capture continuation in the owner-only M7 composition | One ChatAgent generation only; never stored directly in history/memory; not reachable from production Seal |
 | Logs | stdout and `logs/log.log*` | File/container-log retention dependent |
 | Models | `models/` and handler-specific paths | Persistent volume/local disk |
 | Avatar resources | `resource/` | Persistent volume/local disk |
@@ -359,28 +389,86 @@ automatic retention cleanup in the reviewed code.
 
 ### 4.9 HTTP and network surface
 
-| Surface | Default path/port | Auth in application | Notes |
+| Surface | Default path/port | Legacy/default mode | Enabled certificate mode |
 |---|---|---|---|
-| Main UI | `/` -> `/ui/index.html` | None | Falls back to `/gradio` when frontend dist is absent |
-| Frontend assets | `/ui/*` | None | Prebuilt submodule output |
-| Frontend init config | `/openavatarchat/initconfig` | None | May include ICE/TURN credentials |
-| Gradio placeholder | `/gradio` | None | Mounted even with external UI |
-| Version | `/version` | None | Hard-coded `0.6.0` |
-| Liveness | `/liveness` | None | Process-level only |
-| Readiness | `/readiness` | None | Engine initialization only |
-| FastRTC signalling/media | FastRTC-mounted routes | None in project | GPU/API-consuming session entry |
-| Generic/LAM session | `/ws/session/{session_id}` | None | Creates/reuses session |
-| LAM asset | `/download/lam_asset/{file_name}` | None | Selected configured archive |
-| Manager stream | `/ws/manager/data_tool` | None | All-session snapshots and remote interrupt |
-| Manager file | `/download/manager/data_tool/file` | None | Restricted to `temp/data_tool`, but not access-controlled |
-| App listener | TCP `8282` | None | `8283` for beta agent preset |
-| TURN | UDP/TCP `3478` | TURN credential | TLS listener TCP `5349` |
-| TURN relay | UDP `49152-65535` intended | TURN permission | Must match actual coturn config/firewall |
+| Main UI/assets | `/`, `/ui/*` | Public static files; `/gradio` mounted | Public static files; legacy Gradio omitted |
+| Frontend init config | `/openavatarchat/initconfig` | No application auth | Bearer token with `certificate:capture` |
+| Version/liveness/readiness | `/version`, `/liveness`, `/readiness` | No application auth | Bearer token with `oac:manager`; readiness still means engine initialization only |
+| RTC signalling | FastRTC legacy routes | No project auth | Only app-owned `/webrtc/offer`, with OIDC/session/transport admission |
+| Generic/LAM session | `/ws/session/{session_id}` | No project auth; may create/reuse session | One-use `oac.cert-admission.v1` WebSocket subprotocol ticket before accept |
+| LAM asset | `/download/lam_asset/{file_name}` | Selected configured archive | Only the configured public asset name is admitted |
+| Session control | `/api/v1/session-capabilities`, `/api/v1/sessions/...` | Not mounted | OIDC `certificate:capture`, opaque capabilities, one-use transport tickets |
+| Certificate capture | five routes under `/api/v1/sessions/{session_id}/certificate-captures` | Not mounted | OIDC ownership plus session/capture capabilities; no OCR/result endpoint |
+| Manager WS ticket | `POST /api/v1/manager/websocket-admission-tickets` | Not mounted | Bearer `oac:manager`; returns a `no-store` one-use ticket. The sole Manager `Sec-WebSocket-Protocol` token must be `oac.manager-admission.v1.<admission_ticket>` |
+| Manager stream/file | `/ws/manager/data_tool`, `/download/manager/data_tool/file` | No project auth | OIDC `oac:manager`; one-use WebSocket ticket before accept |
+| App listener | TCP `8282` (`8283` in beta preset) | Direct exposure unsafe | Direct exposure still unsafe; no built-in rate limit |
+| TURN and relay | `3478`, `5349`, intended UDP `49152-65535` | TURN credential | Unchanged; must be separately hardened and matched to firewall/client config |
 
-The Manager frontend stores an optional token and attaches it to HTTP requests
-or WebSocket query strings, but the Python backend never validates either form.
-The English Manager document's authentication claim is therefore not an
-implemented server-side control.
+The enabled-mode scopes are intentionally separate: `certificate:capture`
+cannot authorize Manager operations, and `oac:manager` cannot authorize
+certificate control. Admission tokens and capabilities are kept out of query
+strings and responses use `no-store`.
+
+### 4.10 Secure admission-notice components and missing production composition
+
+```mermaid
+flowchart LR
+    OIDC[OIDC access token] --> SA[Session and WS/RTC admission]
+    SA --> BC[BeginCapture]
+    BC --> WF[Generation gate and WorkFenceV1]
+    WF --> PS[PrivateEvidenceStoreV1<br/>AES-256-GCM per capture]
+    PS --> STOP[Production Seal<br/>PROCESSOR_NOT_READY]
+    PS -. owner-only seam, not called by production Seal .-> OCR[CPU OCR sidecar<br/>private UDS, no network]
+    OCR --> TM[HBTC template match<br/>four-field extraction]
+    TM --> EC[Encrypted extraction receipt]
+    EC --> END[EndCapture<br/>retire work and destroy DEK]
+    END --> REL[One-use sanitized context]
+    REL --> CA[ChatAgent turn<br/>tools disabled]
+```
+
+Milestones 1A–1E supply fail-closed startup, strict `at+jwt` validation,
+server-owned session authority, authenticated WS/RTC admission, and
+purpose-separated Manager authorization. M2 prevents certificate-private
+payloads from reaching ordinary sinks in the trusted-handler process model.
+M3/M3B add exact-parent generation fencing at dequeue, external calls,
+callbacks, mutation, storage, and WS/RTC egress. M4A/M4B add the capture
+coordinator and five private routes; normal inputs are dropped during capture
+transitions rather than buffered.
+
+M5A stores JPEG evidence and auxiliary records under one capture DEK using
+AES-256-GCM with monotonic nonces and identity-bound AAD. M6A performs private
+CPU OCR and stores only encrypted `OcrPageResultV1`; M6B extracts exactly
+`name`, `source_province`, `college`, and `major` with
+`FOUND | AMBIGUOUS | NOT_FOUND`; M6C accepts only
+`hbtc_admission_notice_v1` for `湖北交通职业技术学院`. Matching is parser
+compatibility only. The dedicated
+[certificate extractor module reference](certificate-extractor.md) documents
+the pure parser, template matcher, private service, field rules, encrypted
+contract, and stable failure outcomes.
+
+M7's owner-only composition reparses encrypted extraction at EndCapture and may
+release only `FOUND` values plus the server-owned institution name into
+`SanitizedAdmissionContextV1`. It commits only after private-key destruction,
+cleanup, successor-generation validation, and normal-admission reopen. The
+context is one-use, omitted from direct history/memory storage, and cannot
+enable tools. M8 adds an in-memory WebUI workflow for one to three JPEGs,
+camera-track handoff, bounded image preparation, polling, cleanup, and ordinary
+unavailable-state handling; the browser never receives OCR, extraction, or M7
+context.
+
+These M6A–M7 services are exposed only through coordinator-owner seams and
+isolated/test composition. Current production `SealCapture` checks for a
+constructor-injected `_test_processor_v1`, launches only the mock processor
+operation, and never invokes the installed OCR or extraction service. Loading a
+valid OCR deployment manifest can stage a service candidate but cannot make
+Seal start production processing or reach M7.
+
+There is deliberately no public OCR/extraction/result API, arbitrary school
+profile, authenticity/issuer check, remote OCR fallback, local browser OCR, or
+production success simulation. In this checkout, production Seal must fail with
+`PROCESSOR_NOT_READY` regardless of manifest availability. A future release
+must both integrate the production Seal-to-OCR/extraction/release chain and pass
+the separate real CPU qualification.
 
 ## 5. Component and preset matrix
 
@@ -503,11 +591,16 @@ model revisions or validate artifact digests.
 - `.env` and process environment;
 - locally mounted models and avatar resources;
 - TLS/TURN configuration and credentials;
+- OIDC issuer/JWKS/audience configuration and the server-owned HBTC template
+  identity;
+- reviewed certificate OCR identity, model hashes, qualification record, and
+  deployment manifest when that future production bundle is provisioned;
 - prebuilt frontend files.
 
 ### 7.2 Untrusted inputs
 
 - browser/WebSocket clients and their media/text/session IDs;
+- captured JPEG bytes and all OCR-derived document text;
 - public HTTP/WebSocket requests;
 - upstream LLM/TTS/ASR output;
 - model registries, mirrors, and mutable model artifacts;
@@ -518,7 +611,8 @@ model revisions or validate artifact digests.
 
 Normal presets read `DASHSCOPE_API_KEY`; optional paths read `DIFY_API_KEY`,
 `SEMANTIC_LLM_EAS_TOKEN`, and `INTERRUPT_JUDGE_LLM_EAS_TOKEN`. TURN username,
-credential, and provider tokens are runtime secrets.
+credential, provider tokens, OIDC access tokens, session/admission/capture
+capabilities, and the private evidence DEK are runtime secrets.
 
 Do not place API keys directly in YAML when Manager is enabled:
 `HandlerDataTool` serializes `engine_config`, and any WebSocket client receives
@@ -535,6 +629,12 @@ Manager mode stores text/audio/image observations and writes media beneath
 Production operation therefore needs an explicit transcript/media/log
 retention and access policy.
 
+Certificate frames, OCR spans, extraction candidates, and M7 structured context
+must not enter these generic paths. Capture/release logs are restricted to
+stable reason codes, policy version, opaque release identity, field count,
+lifecycle state, and duration; they must not contain released values, prompts,
+capabilities, or private-store provenance.
+
 <a id="prioritized-findings"></a>
 
 ## 8. Prioritized findings
@@ -542,13 +642,12 @@ retention and access policy.
 Severity reflects impact if the documented deployment is followed. Confidence
 is high for all findings below unless marked otherwise.
 
-### F-01 — Critical: no authentication or admission control on the public service
+### F-01 — Critical: legacy/default mode has no public-service admission control
 
-**Evidence:** presets bind `0.0.0.0`; FastRTC and frontend routes are mounted
-without authentication in
-[`client_handler_rtc.py`](../src/handlers/client/rtc_client/client_handler_rtc.py#L402)
-and
-[`frontend_service.py`](../src/service/frontend_service/frontend_service.py#L58).
+**Evidence:** certificate capture defaults to disabled. In that mode presets
+still bind `0.0.0.0`, and legacy FastRTC/WS/frontend behavior is preserved
+without application authentication. Enabled mode instead installs strict OIDC,
+session capability, one-use WS/RTC admission, and ownership checks.
 
 **Trigger:** publish `8282`/`8283` directly, including through the documented
 port mapping.
@@ -556,16 +655,17 @@ port mapping.
 **Impact:** anonymous users can consume GPU capacity and paid API credentials,
 occupy the low concurrency limit, and use the conversational service.
 
-**Required gate:** authenticated TLS ingress, session admission, rate/concurrency
-limits, and a firewall that prevents direct access to the application listener.
+**Required gate:** for legacy mode, authenticated TLS ingress, session
+admission, rate/concurrency limits, and a firewall that prevents direct access
+to the application listener. Enabled certificate mode covers admission but
+still needs ingress rate limits, quotas, and listener isolation.
 
-### F-02 — High: Manager authentication is UI-only
+### F-02 — High: Manager is unauthenticated in legacy/default mode
 
-**Evidence:** the frontend attaches a stored token, but
-[`data_tool_service.py`](../src/service/manager_service/data_tool_service.py#L106)
-accepts every WebSocket, and
-[`manager_service_register.py`](../src/service/manager_service/manager_service_register.py#L54)
-serves files without an auth dependency.
+**Evidence:** in legacy/default mode the Manager WebSocket and file route retain
+their compatibility behavior. In enabled certificate mode, HTTP Manager
+operations require an OIDC token with `oac:manager`, and the Manager WebSocket
+must consume a purpose-bound one-use admission ticket before accept.
 
 **Trigger:** enable `Manager` and expose the service.
 
@@ -576,14 +676,14 @@ subscriber also receives an unbounded async queue, and generated media paths
 join an unvalidated session ID beneath the nominal base directory; depending on
 the client/proxy path, a crafted ID can escape that directory.
 
-**Required gate:** isolate or disable Manager in production, or enforce
-server-side authorization at ingress/application level for both WebSocket and
-download paths. Bound subscriber queues and validate/resolve session file paths
-inside the intended base directory.
+**Required gate:** isolate or disable Manager in legacy production, or add
+server-side authorization at ingress/application level. For enabled mode,
+validate both authorized and denied paths, keep `oac:manager` separate from
+`certificate:capture`, bound subscriber queues, and retain path containment.
 
 ### F-03 — High: bundled coturn credentials and exposure are unsafe
 
-**Evidence:** [`turnserver.conf`](../coturn-data/turnserver.conf#L1) contains
+**Evidence:** [`turnserver.conf`](../coturn-data/turnserver.conf#L5) contains
 `admin:admin`, listens on all interfaces, and is used with host networking;
 `setup_coturn.sh` writes `username:password`.
 
@@ -598,10 +698,10 @@ firewall rules, and monitored logs. Never deploy checked-in credentials.
 
 ### F-04 — High: Compose TURN/TLS is miswired and not advertised to clients
 
-**Evidence:** [`docker-compose.yml`](../docker-compose.yml#L10) mounts
+**Evidence:** [`docker-compose.yml`](../docker-compose.yml#L12) mounts
 `localhost.crt` as both TURN certificate and private key. The selected app
 config has no `turn_config`, and
-[`client_handler_rtc.py`](../src/handlers/client/rtc_client/client_handler_rtc.py#L402)
+[`client_handler_rtc.py`](../src/handlers/client/rtc_client/client_handler_rtc.py#L484)
 only sends ICE configuration when one is supplied.
 
 **Trigger:** use `docker compose up` expecting public/NAT WebRTC to work.
@@ -615,7 +715,7 @@ network.
 
 ### F-05 — High: unsafe model deserialization plus unverified mutable downloads
 
-**Evidence:** [`demo.py`](../src/demo.py#L31) globally forces
+**Evidence:** [`demo.py`](../src/demo.py#L40) globally forces
 `torch.load(..., weights_only=False)` unless a caller explicitly passes `True`.
 [`download_models.py`](../scripts/download_models.py#L134) does not pin model
 revisions or validate checksums.
@@ -633,9 +733,9 @@ runtime.
 ### F-06 — High: RTC queues are unbounded and cross threads unsafely
 
 **Evidence:** handler pump threads call `asyncio.Queue.put_nowait()` in
-[`client_handler_rtc.py`](../src/handlers/client/rtc_client/client_handler_rtc.py#L563);
+[`client_handler_rtc.py`](../src/handlers/client/rtc_client/client_handler_rtc.py#L731);
 the WebRTC loop awaits those queues in
-[`rtc_stream.py`](../src/service/rtc_service/rtc_stream.py#L161).
+[`rtc_stream.py`](../src/service/rtc_service/rtc_stream.py#L346).
 
 **Trigger:** normal concurrent output or a stalled/slow client.
 
@@ -647,7 +747,7 @@ policy, bounded audio latency, and slow-client tests.
 
 ### F-07 — High: Docker build context strips handler runtime YAML
 
-**Evidence:** [`.dockerignore`](../.dockerignore#L164) excludes `*.yaml` and
+**Evidence:** [`.dockerignore`](../.dockerignore#L170) excludes `*.yaml` and
 `*.yml` globally, while the Dockerfile later copies `src`. FlashHead explicitly
 changes into its submodule because the upstream import opens
 `flash_head/configs/infer_params.yaml`; that required file matches the ignore
@@ -682,8 +782,10 @@ long-duration A/V synchronization test. Add cross-handler config validation.
 
 ### F-09 — Medium: TLS fails open to plaintext
 
-**Evidence:** [`ssl_helpers.py`](../src/service/service_utils/ssl_helpers.py#L19)
-logs missing files and returns no SSL settings.
+**Evidence:** [`ssl_helpers.py`](../src/service/service_utils/ssl_helpers.py#L117)
+logs missing files and returns no SSL settings in legacy/default mode. Enabled
+certificate mode now requires readable, matching, unencrypted certificate/key
+material and fails closed before application initialization.
 
 **Trigger:** one or both certificate files are absent or mounted incorrectly.
 
@@ -724,9 +826,9 @@ downloads, atomic promotion, and a no-network `verify-models --config` preflight
 ### F-12 — Medium: configured history retention is ignored
 
 **Evidence:** duplex configs define `default.history`, but
-[`service_config_loader.py`](../src/service/service_utils/service_config_loader.py#L30)
+[`service_config_loader.py`](../src/service/service_utils/service_config_loader.py#L27)
 does not load it and
-[`chat_engine.py`](../src/chat_engine/chat_engine.py#L69) creates
+[`chat_engine.py`](../src/chat_engine/chat_engine.py#L273) creates
 `SessionContext` without `HistoryConfig`.
 
 **Trigger:** tune any history retention value in a preset.
@@ -736,10 +838,12 @@ does not load it and
 **Required gate:** wire and test the configuration, or remove it from operational
 claims. Current defaults are 1,000 events, one hour, 60-second cleanup interval.
 
-### F-13 — Medium: shutdown and partial-session cleanup gaps
+### F-13 — Medium: legacy lifecycle cleanup still needs full acceptance
 
-**Evidence:** engine shutdown does not stop active sessions; session creation is
-stored before client handler preparation completes.
+**Evidence:** secure sessions now use bounded generation retirement,
+capture/transport cleanup, quarantine, and asynchronous engine shutdown.
+However, these changes do not by themselves prove every legacy handler,
+third-party context, or process-exit path cleans up transactionally.
 
 **Trigger:** process shutdown with active sessions, or client context
 preparation failure.
@@ -747,8 +851,9 @@ preparation failure.
 **Impact:** resources/threads may depend on forced process exit; a failed start
 can leave a partially registered session until restart/manual cleanup.
 
-**Required gate:** stop all sessions before handler destruction, make creation
-transactional, and test SIGTERM plus failed-context cases.
+**Required gate:** retain the secure lifecycle suites, then run SIGTERM,
+failed-context, cancellation-resistant handler, and process-exit tests for every
+selected production preset.
 
 ### F-14 — Medium: readiness and container isolation are insufficient
 
@@ -769,7 +874,7 @@ CPU/memory/GPU/session resources.
 ### F-15 — Medium: Qwen-Omni preset cannot load
 
 **Evidence:** `connection_ttl` occurs at both lines 17 and 19 of
-[`chat_with_qwen_omni.yaml`](../config/chat_with_qwen_omni.yaml#L15).
+[`chat_with_qwen_omni.yaml`](../config/chat_with_qwen_omni.yaml#L17).
 Dynaconf raises `DuplicateKeyError`.
 
 **Trigger:** start the documented Qwen preset.
@@ -793,9 +898,11 @@ filtering, restrictive permissions, and an explicit retention/deletion policy.
 
 ### F-17 — Medium: process exit status masks failures and bypasses cleanup
 
-**Evidence:** [`demo.py`](../src/demo.py#L101) calls `os._exit(0)` in `finally`
-regardless of how `main()` exits. Starting with a missing config logged the
-error but returned shell status `0`.
+**Evidence:** [`demo.py`](../src/demo.py) now returns exit code `1` for the
+explicit certificate configuration/startup error classes, but still terminates
+with `os._exit(exit_code)` and does not translate arbitrary configuration,
+handler-load, or runtime exceptions into a nonzero status. The original
+missing-config probe returned `0`.
 
 **Trigger:** any startup exception, runtime exception escaping `main()`, or
 normal server return.
@@ -811,7 +918,7 @@ restart policy that does not depend on a nonzero code.
 
 ### F-18 — Medium: build helper evaluates a user-controlled command string
 
-**Evidence:** [`build_cuda128.sh`](../build_cuda128.sh#L141) interpolates
+**Evidence:** [`build_cuda128.sh`](../build_cuda128.sh#L142) interpolates
 `--tag` and build metadata into `BUILD_CMD`, then invokes `eval`.
 
 **Trigger:** a build pipeline or operator passes an untrusted/malformed image
@@ -827,9 +934,9 @@ privileged build arguments.
 ### F-19 — Low: release identifiers and documentation drift
 
 Examples include package `0.1.0` versus application `0.6.0`; the Manager
-authentication documentation versus unauthenticated backend; defaults in
-reference docs that differ from Pydantic; and build-script output mentioning a
-`BUILD_COMMIT` variable that the Dockerfile does not define.
+security behavior differing by feature mode; defaults in reference docs that
+differ from Pydantic; and build-script output mentioning a `BUILD_COMMIT`
+variable that the Dockerfile does not define.
 
 **Impact:** operator confusion and unreliable support evidence.
 
@@ -845,29 +952,67 @@ defaults to `0.0.0.0:8011` with an empty token.
 **Required gate:** keep disabled, or install the missing dependency and require
 a non-empty token with loopback/private binding and bounded queues.
 
+### F-21 — Release blocker: production certificate processing is not wired or qualified
+
+**Evidence:** the repository contains the CPU-only sidecar, strict manifests,
+qualification tooling, private UDS/Compose isolation, and synthetic milestone
+tests, but no approved sidecar `uv.lock`, production PP-OCRv6 artifacts,
+qualified `InferenceIdentityV1`, qualification record, or real document
+fixtures. More immediately, `SealCapture` admits only a constructor-injected
+test processor and launches only the mock operation. The owner-only M6A OCR and
+M6B/M6C extraction seams are never called by production Seal, so a valid
+manifest alone cannot reach them or M7.
+
+**Impact:** this is a deliberate fail-closed state. Production Seal returns
+`PROCESSOR_NOT_READY` after the frame-count gate even with a qualified manifest;
+M6A/M6B/M6C/M7 and the M8 personalized-success path cannot be exercised through
+the production API. Synthetic success is component evidence, not production
+composition, model quality, latency, memory, or readiness evidence.
+
+**Required gate:** first implement and independently review the exact
+production-fenced Seal-to-OCR-to-extraction-to-release composition without
+exposing private results. Separately perform isolated CPU qualification, freeze
+and review every hash/identity/thread/resource result, and provision the
+read-only artifacts and strict deployment manifest. Then repeat security,
+statistical, contention, cleanup, failure, and real-camera acceptance before
+enabling production.
+
 ## 9. Quality and test posture
 
-- No project-owned core test suite or CI test job was found.
-- The only root CI workflow builds/deploys VitePress documentation.
-- Pytest dependencies are declared, but discovered tests are predominantly
-  inside upstream submodules.
-- Source syntax checks are broad, but do not establish runtime compatibility,
-  correct media timing, cancellation correctness, or session isolation.
-- Prebuilt frontend files are served in normal deployment; rebuilding the
-  frontend currently has type-check failures.
+- The checkout now has substantial first-party suites under `tests/service/`,
+  `tests/chat_engine/security/`, `tests/chat_engine/fencing/`, and milestone
+  directories through M7. They cover admission, capabilities, dispatch
+  isolation, exact-parent fencing, coordinator races, encrypted storage,
+  OCR/UDS contracts, deterministic extraction/template matching, release, and
+  ChatAgent tool suppression.
+- The WebUI submodule adds M8 TypeScript tests for session state, API privacy,
+  camera handoff, image bounds, and workflow, plus a checked-in production
+  build.
+- The root CI still does not execute this security suite. Combined pytest
+  collection also has baseline top-level `conftest` and duplicate non-package
+  module collisions, so milestone/service suites must be run independently.
+- Synthetic fixtures and mocked/test-only processors establish deterministic
+  behavior, not real Paddle/PP-OCRv6 accuracy, capacity, or end-to-end browser
+  operation.
+- The original 2026-08-18 frontend type-check failure is historical evidence;
+  the refreshed M8 frontend build/toolchain must be validated from its pinned
+  submodule with the supported Node/pnpm environment.
 
 The highest-value missing tests are:
 
 1. config validation for every preset through the real loader;
-2. handler graph construction with mocked model loaders;
-3. two-session isolation and concurrency-limit enforcement;
-4. slow/disconnected RTC client backpressure;
-5. stream cancellation and residual-queue rejection;
-6. SIGTERM with active sessions;
-7. authenticated public/Manager route behavior;
+2. production Seal composition that invokes exact-fenced OCR, extraction,
+   release, failure, and cleanup paths without a test processor;
+3. independently provisioned real CPU OCR qualification and holdout evaluation;
+4. real-camera M8 flow through capture, cleanup, and one response;
+5. slow/disconnected RTC client backpressure;
+6. SIGTERM with active legacy, secure, and capture sessions;
+7. supported-preset handler graph construction with real model loaders;
 8. TURN config generation and external relay ICE candidate;
-9. exact model-manifest verification;
-10. dependency-locked clean image build.
+9. dependency-locked clean main and OCR image builds;
+10. production manifest, UDS peer, and no-GPU negative tests in the deployed
+   environment;
+11. target concurrency and realtime GPU-handler/CPU-OCR contention tests.
 
 ## 10. Strengths worth preserving
 
@@ -876,6 +1021,10 @@ The highest-value missing tests are:
 - Configurable type remapping for duplex reuse.
 - Explicit stream ancestry and cancellation propagation.
 - Producer- and consumer-side cancellation guards.
+- Purpose-bound OIDC/session/WS/RTC/Manager admission in enabled mode.
+- Exact-generation WorkFence coverage and fail-closed capture transitions.
+- Capture-key encryption and a networkless, CPU-only private OCR interface.
+- Deterministic four-field/template policy and one-use sanitized release.
 - Pinned source submodules rather than floating Git branches at checkout time.
 - Path checks on Manager downloads and LAM asset serving.
 - Bound Manager event buffers and session-history defaults.
@@ -895,4 +1044,5 @@ with a second parallel orchestration layer.
 | Unauthenticated direct Internet exposure | Not acceptable |
 | Production multi-user service | Not ready without remediation, load testing, and operational controls |
 | Horizontal multi-worker/multi-node deployment | Not supported by current in-memory architecture |
+| HBTC admission-notice personalization | Components implemented through M8, but production Seal does not invoke M6A–M7; not ready until composition, CPU OCR qualification, and real-camera acceptance pass |
 | Beta OpenClaw deployment | Secondary, native-development-only in current state |
