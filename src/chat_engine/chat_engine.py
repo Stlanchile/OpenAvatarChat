@@ -1,5 +1,6 @@
 import os
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional, Dict
 from dotenv import load_dotenv
@@ -35,6 +36,7 @@ class ChatEngine(object):
         self.states = ChatEngineBaseStates()
 
         self.sessions: Dict[str, ChatSession] = {}
+        self._session_stop_observers: list[Callable[[str, ChatSession], None]] = []
 
     def initialize(self, engine_config: ChatEngineConfigModel, app=None, ui=None, parent_block=None):
         if self.states.inited:
@@ -109,7 +111,26 @@ class ChatEngine(object):
         if session is None:
             logger.warning(f"Session {session_id} already stopped or not found.")
             return
+        for observer in tuple(self._session_stop_observers):
+            try:
+                observer(session_id, session)
+            except Exception:
+                logger.error("Session stop observer failed.")
         session.stop()
+
+    def add_session_stop_observer(
+        self, observer: Callable[[str, ChatSession], None]
+    ) -> None:
+        if observer not in self._session_stop_observers:
+            self._session_stop_observers.append(observer)
+
+    def remove_session_stop_observer(
+        self, observer: Callable[[str, ChatSession], None]
+    ) -> None:
+        try:
+            self._session_stop_observers.remove(observer)
+        except ValueError:
+            pass
     
     def shutdown(self):
         logger.info("Shutting down chat engine...")

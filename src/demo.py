@@ -11,6 +11,10 @@ from fastapi import FastAPI
 from loguru import logger
 
 from engine_utils.directory_info import DirectoryInfo
+from service.admission_notice_lite_routes import (
+    register_admission_notice_lite_routes,
+)
+from service.admission_notice_lite_service import AdmissionNoticeLiteService
 from service.service_utils.logger_utils import config_loggers
 from service.service_utils.service_config_loader import load_configs
 from service.service_utils.ssl_helpers import create_ssl_context
@@ -38,12 +42,26 @@ torch.load = patched_torch_load
 
 class OpenAvatarChatWebServer(uvicorn.Server):
 
-    def __init__(self, chat_engine: ChatEngine, *args, **kwargs):
+    def __init__(
+        self,
+        chat_engine: ChatEngine,
+        *args,
+        admission_notice_lite_service: AdmissionNoticeLiteService | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.chat_engine = chat_engine
+        self.admission_notice_lite_service = admission_notice_lite_service
     
     async def shutdown(self, sockets=None):
         logger.info("Start normal shutdown process")
+        if self.admission_notice_lite_service is not None:
+            try:
+                await self.admission_notice_lite_service.shutdown()
+            except Exception:
+                logger.error(
+                    "Admission Notice Lite shutdown failed reason=INTERNAL_ERROR"
+                )
         self.chat_engine.shutdown()
         await super().shutdown(sockets)
 
@@ -90,11 +108,20 @@ def main():
     
     chat_engine = ChatEngine()
     chat_engine.initialize(engine_config, app=demo_app, ui=ui, parent_block=parent_block)
+    admission_notice_lite_service = register_admission_notice_lite_routes(
+        app=demo_app,
+        chat_engine=chat_engine,
+        config=service_config.admission_notice_lite,
+    )
 
     ssl_context = create_ssl_context(args, service_config)
 
     uvicorn_config = uvicorn.Config(demo_app, host=service_config.host, port=service_config.port, **ssl_context)
-    server = OpenAvatarChatWebServer(chat_engine, uvicorn_config)
+    server = OpenAvatarChatWebServer(
+        chat_engine,
+        uvicorn_config,
+        admission_notice_lite_service=admission_notice_lite_service,
+    )
     server.run()
 
 
