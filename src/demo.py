@@ -14,6 +14,9 @@ from engine_utils.directory_info import DirectoryInfo
 from service.admission_notice_lite_routes import (
     register_admission_notice_lite_routes,
 )
+from service.admission_notice_lite_ocr import (
+    build_qualified_admission_notice_ocr_processor_lite_v1,
+)
 from service.admission_notice_lite_service import AdmissionNoticeLiteService
 from service.service_utils.logger_utils import config_loggers
 from service.service_utils.service_config_loader import load_configs
@@ -108,10 +111,16 @@ def main():
     
     chat_engine = ChatEngine()
     chat_engine.initialize(engine_config, app=demo_app, ui=ui, parent_block=parent_block)
+    admission_notice_ocr_processor = (
+        build_qualified_admission_notice_ocr_processor_lite_v1(
+            service_config.admission_notice_lite
+        )
+    )
     admission_notice_lite_service = register_admission_notice_lite_routes(
         app=demo_app,
         chat_engine=chat_engine,
         config=service_config.admission_notice_lite,
+        processor=admission_notice_ocr_processor,
     )
 
     ssl_context = create_ssl_context(args, service_config)

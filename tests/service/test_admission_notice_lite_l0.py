@@ -108,6 +108,9 @@ def test_feature_defaults_to_disabled() -> None:
         "enabled": False,
         "recognition_ttl_seconds": 120,
         "max_global_recognition_jobs": 1,
+        "ocr_socket_path": "/run/openavatarchat-admission-lite/ocr.sock",
+        "ocr_connect_timeout_seconds": 1.0,
+        "ocr_timeout_seconds": 30.0,
     }
     assert config.model_config["extra"] == "forbid"
     assert config.model_config["frozen"] is True
@@ -139,9 +142,9 @@ def test_non_boolean_enabled_values_are_rejected(invalid_value: object) -> None:
 @pytest.mark.parametrize(
     ("unknown_key", "value"),
     (
-        ("ocr_timeout_seconds", 30),
-        ("ocr_socket_path", "/run/openavatarchat-admission-lite/ocr.sock"),
         ("fake_processor", True),
+        ("ocr_backend", "auto"),
+        ("ocr_model_family", "other"),
         ("unknown", "value"),
     ),
 )
@@ -164,6 +167,27 @@ def test_unknown_lite_keys_are_rejected(unknown_key: str, value: object) -> None
     ),
 )
 def test_l1_control_plane_limits_are_strict_and_bounded(
+    key: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        AdmissionNoticeLiteFeatureConfigV1.model_validate({key: value})
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("ocr_socket_path", "relative.sock"),
+        ("ocr_socket_path", "/tmp/\x00bad.sock"),
+        ("ocr_socket_path", "/" + "x" * 101),
+        ("ocr_connect_timeout_seconds", True),
+        ("ocr_connect_timeout_seconds", 0.01),
+        ("ocr_connect_timeout_seconds", 2.01),
+        ("ocr_timeout_seconds", True),
+        ("ocr_timeout_seconds", 0.99),
+        ("ocr_timeout_seconds", 60.01),
+    ),
+)
+def test_l3_ocr_configuration_is_strict_and_bounded(
     key: str, value: object
 ) -> None:
     with pytest.raises(ValidationError):

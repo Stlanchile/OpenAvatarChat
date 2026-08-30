@@ -36,6 +36,7 @@ dump_talk_audio.pcm
 dump_avatar_audio.pcm
 exp/
 uv.lock
+!services/admission_notice_ocr/uv.lock
 logs/
 .lock
 node_modules/
@@ -56,3 +57,12 @@ tests/**/outputs/
 
 # tmux session logs
 tmux-client-*.log
+
+# Admission Notice Lite OCR model binaries and private qualification inputs.
+services/admission_notice_ocr/models/*
+!services/admission_notice_ocr/models/.gitignore
+!services/admission_notice_ocr/models/README.md
+services/admission_notice_ocr/qualification/private-fixtures/*
+!services/admission_notice_ocr/qualification/private-fixtures/.gitignore
+!services/admission_notice_ocr/qualification/private-fixtures/README.md
+services/admission_notice_ocr/qualification/sidecar-qualification.json

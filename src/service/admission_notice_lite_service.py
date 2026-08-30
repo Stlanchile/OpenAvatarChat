@@ -73,7 +73,7 @@ class _RecognitionJobRuntimeLiteV1:
 
 
 class AdmissionNoticeLiteService:
-    """Process-local owner for Admission Notice Lite L1 recognition jobs."""
+    """Process-local owner for Admission Notice Lite recognition jobs."""
 
     def __init__(
         self,
@@ -373,6 +373,23 @@ class AdmissionNoticeLiteService:
             if task is not current and not task.done():
                 task.cancel()
 
+    async def _processor_ready_for_ingestion(self) -> bool:
+        processor = self._processor
+        if processor is None:
+            return False
+        readiness = getattr(processor, "prepare_for_ingestion", None)
+        if readiness is None:
+            return True
+        try:
+            return await readiness() is True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - sanitize the readiness boundary
+            logger.warning(
+                "Admission Notice Lite processor unavailable reason=SERVICE_UNAVAILABLE"
+            )
+            return False
+
     async def begin_ingestion(
         self, owning_session_id: str
     ) -> _RecognitionIngestionPermitLiteV1:
@@ -383,12 +400,13 @@ class AdmissionNoticeLiteService:
                 RecognitionErrorReasonLiteV1.RECOGNITION_NOT_FOUND
             )
 
+        processor_ready = await self._processor_ready_for_ingestion()
         now = self._clock()
         tasks_to_cancel: list[asyncio.Task[Any]]
         async with self._lock:
             tasks_to_cancel = self._expire_due_jobs_locked(now)
             self._purge_terminal_jobs_locked(now)
-            if not self._accepting or self._processor is None:
+            if not self._accepting or self._processor is None or not processor_ready:
                 error = AdmissionNoticeLiteError(
                     RecognitionErrorReasonLiteV1.SERVICE_UNAVAILABLE
                 )

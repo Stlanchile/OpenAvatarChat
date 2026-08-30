@@ -879,6 +879,9 @@ def test_production_config_and_routes_cannot_select_test_processor() -> None:
         "enabled",
         "recognition_ttl_seconds",
         "max_global_recognition_jobs",
+        "ocr_socket_path",
+        "ocr_connect_timeout_seconds",
+        "ocr_timeout_seconds",
     }
 
     production_text = "\n".join(
@@ -894,14 +897,11 @@ def test_production_config_and_routes_cannot_select_test_processor() -> None:
         assert forbidden not in production_text
 
 
-def test_lite_source_has_no_ocr_or_hardened_dependencies() -> None:
+def test_lite_control_plane_source_has_no_l4_or_hardened_dependencies() -> None:
     source_text = "\n".join(
         path.read_text(encoding="utf-8") for path in LITE_SOURCE_PATHS
     ).lower()
     for forbidden in (
-        "paddle",
-        "paddleocr",
-        "ocrpage",
         "certificate_capture",
         "securityenvelope",
         "workfence",

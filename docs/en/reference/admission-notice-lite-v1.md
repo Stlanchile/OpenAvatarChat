@@ -5,11 +5,15 @@
 This document is the normative architecture, privacy boundary, and threat model
 for Admission Notice Lite v1. It freezes the target behavior for milestones
 L0–L7. L0 provided the disabled configuration surface, L1 provided the
-process-local recognition control plane, and L2 now provides bounded
-memory-only multipart JPEG ingress on the recognition POST. L2 validates real
-images but does not perform OCR or recognize an admission notice. Extraction,
-ChatAgent generation, and WebUI behavior remain requirements for later
-milestones, not claims about current runtime behavior.
+process-local recognition control plane, L2 provided bounded memory-only
+multipart JPEG ingress, and L3 now implements a separately locked local CPU
+PaddleOCR sidecar over AF_UNIX. The current schema-v2 real-host qualification
+passed and its exact manifest is production-approved. When the matching
+sidecar is reachable, L3 performs bounded OCR and discards the validated
+result. It does not recognize an admission notice semantically.
+Template/college matching, field extraction, major handling, ChatAgent
+generation, and WebUI behavior remain requirements for later milestones, not
+claims about current runtime behavior.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
 **SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **MAY**, and **OPTIONAL** are to be
@@ -200,7 +204,8 @@ Memory-only multipart parser
 Strict JPEG validation
           │
           ▼
-Sequential per-frame CPU OCR over UDS
+One bounded 1–3-frame UDS request
+  sequential CPU OCR in the sidecar
           │
           ▼
 Transient bounded OCR spans
@@ -240,8 +245,8 @@ All personal input and intermediate recognition data are memory-only:
 | Browser | `Blob` and ObjectURL | Revoked on removal, retake, close, completion, and teardown |
 | HTTP | Bounded bytearrays | Until validation; never `UploadFile`, `request.form()`, or temporary-file spooling |
 | JPEG validation | Immutable encoded bytes plus transient decoded pixels | Decoded pixels released immediately after validation; source bytes released when processor work unwinds |
-| OCR | One frame per UDS request | Frame released after its response |
-| OCR spans | Bounded typed objects | Until matching and extraction finish |
+| OCR | One bounded 1–3-frame UDS request | Request buffers released after the response or disconnect |
+| OCR spans | `OcrBatchLiteV1` | Validated and discarded when the L3 processor returns |
 | Extracted fields | Local values | Until typed context is built or the job fails |
 | Typed context | `AdmissionNoticeContextLiteV1` | Exactly one ChatAgent turn |
 | Job record | Identifier, owner, state, times, cancellation handle | In-memory TTL only |
@@ -265,8 +270,8 @@ max_ocr_characters_per_span         = 512
 max_ocr_utf8_bytes_per_span         = 2,048
 max_ocr_aggregate_characters        = 8,192
 max_ocr_aggregate_utf8_bytes        = 32,768
-max_ocr_result_json_bytes           = 49,152
-ocr_timeout_seconds_per_frame       = 30
+ocr_connect_timeout_seconds         = 1
+ocr_timeout_seconds                 = 30
 recognition_ttl_seconds             = 120
 max_global_recognition_jobs         = 1
 ```
@@ -443,15 +448,25 @@ Pillow, parser, and unexpected processor exception text is neither logged nor
 returned.
 
 When `enabled` is false, routes, service, registry, observer, processor, and
-tasks are absent. When enabled in production L2, there is still no processor:
-after the session and basic multipart headers are checked, POST returns
-`503 SERVICE_UNAVAILABLE` without consuming the body and creates no job. Tests
-may inject a `RecognitionProcessorLiteV1` directly into trusted construction;
-its `process(context, frames)` method receives only the validated immutable
-frame tuple. No HTTP value, header, environment variable, or production
-configuration key can select that fake. Fake completion means only that the
-image-ingestion and control-plane call ended; it performs no admission-notice
-recognition and has no ChatAgent, TTS, history, WebSocket, or RTC side effect.
+tasks are absent. When enabled in production L3, construction performs a
+bounded UDS `ping`. It installs `AdmissionNoticeOcrProcessorLiteV1` only when
+the sidecar returns the exact protocol, CPU package versions, two-thread tuple,
+and qualified model-manifest hash frozen below. If the socket is absent or the
+identity differs, the processor remains absent and POST returns
+`503 SERVICE_UNAVAILABLE` before consuming the body or creating a job. A
+sidecar failure after startup fails only the current job with the existing
+coarse `INTERNAL_ERROR` and marks the processor unavailable. Before accepting
+the next upload, the service performs one bounded identity ping. It returns a
+pre-body `503` while the sidecar is still unavailable or its previous timed-out
+native inference is active, and resumes only when the exact qualified identity
+is reachable and the one inference worker is ready. This is request-driven
+readiness, not a background health monitor; Paddle exception text is never
+public.
+
+Tests may still inject a `RecognitionProcessorLiteV1` directly into trusted
+construction. No HTTP value, header, environment variable, or production
+configuration key can select that fake, and production never uses it as a
+fallback.
 
 Before consuming a body byte, the service claims a transient exact-session
 admission permit from the configured global recognition capacity. The permit
@@ -477,22 +492,212 @@ also release partial multipart ownership in `finally`.
 
 ## OCR Process Boundary
 
-The backend sends one validated JPEG per OCR UDS request, sequentially, at most
-three times per job. The sidecar MUST:
+L3 uses a deployment-managed process under
+`services/admission_notice_ocr/`. The OpenAvatarChat environment imports no
+`paddle`, `paddleocr`, `paddlex`, or OpenVINO package. Its stdlib-only
+`AdmissionNoticeOcrClientLiteV1` opens one connection to the configurable
+`/run/openavatarchat-admission-lite/ocr.sock`, sends the complete 1–3-frame
+batch, reads one response, and closes on every path.
 
-- expose only a local Unix Domain Socket and no TCP listener;
-- run CPU-only with a fixed thread count;
-- use no GPU, CUDA, remote OCR, fallback, or runtime model download;
-- use strict, bounded request framing and JSON response parsing;
-- remain independently restartable so a crash does not crash the backend;
-- stop active work when cancellation closes the UDS request; and
-- omit images, OCR text, and personal fields from logs.
+Request framing is:
 
-The OCR boundary MUST enforce every request, response, span, polygon, character,
-byte, and timeout bound listed in this document. Lite MUST NOT carry
+```text
+"ANLQ" | uint8 version=1 | uint32 JSON header length
+UTF-8 JSON header (maximum 8,192 bytes)
+repeat frame_count times:
+    uint32 JPEG length
+    exact JPEG bytes
+EOF on the client write side
+```
+
+The strict header contains only `schema_version`, `operation="ocr"`,
+`frame_count`, and contiguous per-frame `frame_index`, `encoded_size`,
+`logical_width`, `logical_height`, and `exif_orientation`. It contains no
+session, recognition, filename, student, college, major, or ChatAgent value.
+The sidecar independently enforces 1–3 frames, 2 MiB per JPEG, exact sizes and
+indices, the L2 logical dimension/pixel bounds, complete framing, and no
+trailing bytes.
+
+The response uses `"ANLR"`, version 1, a bounded uint32 JSON length, and at most
+65,536 UTF-8 bytes. A successful OCR response contains only:
+
+```text
+OcrSpanLiteV1 {
+    text: non-empty UTF-8 string, <= 512 characters and <= 2,048 bytes
+    polygon: exactly four [x, y] points normalized to [0, 1]
+    score: finite raw Paddle recognition score in [0, 1]
+}
+
+OcrFrameLiteV1 {
+    frame_index: 1..3
+    spans: tuple[OcrSpanLiteV1, ...], <= 128
+}
+
+OcrBatchLiteV1 {
+    frames: unique contiguous tuple[OcrFrameLiteV1, ...], 1..3
+}
+```
+
+Each frame is bounded to 8,192 aggregate characters and 32,768 aggregate UTF-8
+bytes. Text receives only surrounding transport-whitespace stripping; L3 does
+not perform NFKC, punctuation conversion, dictionary correction, province or
+major correction, or other semantic normalization. `score` is an uncalibrated
+engine scalar, not a probability of field or document correctness. Polygons
+are normalized against the explicitly oriented logical image dimensions for
+future L4 reading order.
+
+The sidecar decodes the already validated JPEG, applies the supplied EXIF
+orientation deterministically, requires the resulting dimensions to match L2,
+converts transient pixels for Paddle, and processes frames sequentially through
+one warmed model instance. It retains no image or result store. The backend
+strictly reparses the bounded response into the immutable contracts, verifies
+the exact requested frame set and every text/score/polygon bound, then discards
+the `OcrBatchLiteV1`.
+
+The request also permits a payload-free `ping`. Its response contains only this
+diagnostic, non-authorizing summary:
+
+```text
+OcrRuntimeIdentityLiteV1 {
+    backend = "paddle_static"
+    device = "cpu"
+    thread_count = 2
+    paddle_version = "3.3.0"
+    paddleocr_version = "3.7.0"
+    paddlex_version = "3.7.2"
+    model_manifest_sha256 =
+      "1de89743e56affd2a220ae90fa2ce383bc8856714400737a5e4828beb0cd012b"
+}
+```
+
+This identity is only a startup/qualification diagnostic. It is not an
+authority, capability, attestation, calibration identity, or evidence lineage.
+
+The locked sidecar contains the Linux x86-64 `paddlepaddle==3.3.0` CPU wheel,
+content-pinned as
+`a4f2e0595e827c179b4fff4278fb41a24f4abe5927ffd5efb1ace26a916145f2`,
+plus `paddleocr==3.7.0` and the required `paddlex==3.7.2`. It uses the official
+`PP-OCRv6_medium_det` and `PP-OCRv6_medium_rec` inference files provisioned from
+immutable official PaddlePaddle repository revisions. The tracked
+`model_manifest.json` records the SHA-256 and byte size of every
+`inference.json`, `inference.pdiparams`, and `inference.yml`. Model binaries are
+gitignored. Startup verifies the complete exact file inventory, hashes, package
+versions, CPU device, two-thread setting, and runtime flags before importing
+the pipeline or creating the socket.
+
+The fixed engine is native `paddle_static` CPU. `enable_hpi`, TensorRT,
+document orientation, document unwarping, text-line orientation, and MKL-DNN
+are disabled. The selected stack's MKL-DNN path failed real PP-OCRv6 inference
+on an unsupported oneDNN array attribute; disabling it is the smallest
+evidence-backed correction and preserves the required model family. There is
+no backend/device/model auto-selection or fallback.
+
+Normal startup has no model acquisition code. Before Paddle import, the
+sidecar replaces `HOME`, XDG, Paddle, PaddleX, Hugging Face, and ModelScope
+cache roots with private directories below an explicit ephemeral runtime
+directory beside the socket. A developer cache cannot satisfy missing
+production assets. Qualification starts each candidate with fresh launch and
+runtime cache roots and checks that no model artifact appears there. Deployment
+MUST deny all sidecar network access.
+
+The sidecar:
+
+- exposes only a local Unix Domain Socket and no TCP listener;
+- requires a sidecar-owned, non-group/non-other-writable runtime directory
+  (normally mode `0750` or tighter) and creates the AF_UNIX node with mode `0660`;
+- runs one process, one warmed pipeline, and one active inference;
+- uses no GPU, CUDA, remote OCR, fallback, or runtime model download;
+- uses strict, bounded request framing and JSON response parsing;
+- remains independently restartable so a crash does not crash the backend; and
+- omits images, OCR text, and personal fields from logs.
+
+One daemon inference thread serializes calls into the warmed Paddle pipeline,
+so the asyncio listener and signal handlers remain responsive during native
+OCR. SIGINT/SIGTERM stops accepts, waits up to five seconds, removes its owned
+socket, and abandons an unfinished native call when the sidecar process exits.
+Backend task cancellation closes the connection and stops waiting. During
+ordinary continued service, Paddle C++ may finish an already-running inference;
+the disconnected result is discarded before the single warmed pipeline serves
+the next request. No generation fence or cross-process cleanup handshake is
+added.
+
+The OCR boundary enforces every request, response, span, polygon, character,
+byte, and timeout bound listed here. Lite does not carry
 `CaptureEpoch`, `WorkFence`, encrypted evidence stores, receipts, private
-authorities, or hardened deployment manifests into this boundary. L0 starts no
-OCR process and creates no OCR code.
+authorities, HMAC request authority, or hardened inference lineage into this
+boundary.
+
+### L3 Runtime Qualification
+
+The machine-readable
+[`qualification.json`](../../../services/admission_notice_ocr/qualification/qualification.json)
+currently records `PASS`. Its source hash remains the exact hash produced by
+the real pre-approval host run. The later approval constant is intentionally
+the only differing source byte-set and is verified separately; the report hash
+was not rewritten to imply that the run used an enabled gate. The approved
+model manifest SHA-256 is
+`1de89743e56affd2a220ae90fa2ce383bc8856714400737a5e4828beb0cd012b`;
+the selected backend is `paddle_static`, the device is CPU, and the selected
+thread count is two. The report records successful real AF_UNIX integration,
+the real backend client and isolated sidecar, typed `OcrBatchLiteV1`, offline
+model use, and a production-shaped processor path reaching `COMPLETED`. GPU
+instrumentation collected live samples and observed no sidecar allocation.
+The earlier schema-v1 `PASS` remains stale and is not accepted.
+
+Qualification has two explicit dependency lanes. The sidecar-only command runs
+inside `services/admission_notice_ocr/.venv`, imports no FastAPI or
+OpenAvatarChat module, generates sidecar-native non-sensitive
+Chinese/English/digit JPEGs, and directly qualifies the real Paddle pipeline:
+
+```bash
+cd /home/xs/projects/OpenAvatarChat-admission-lite/services/admission_notice_ocr
+.venv/bin/python -m admission_notice_ocr.qualify --sidecar-only
+```
+
+It verifies the exact hashed CPU wheel and installed RECORD files, model
+manifest, fresh offline cache roots, CPU device, loaded libraries, GPU
+observation where available, determinism, startup, model initialization,
+first/warmed latency, RSS, CPU, errors, and the `1, 2, 4, 6, 8` thread matrix.
+Its ignored `qualification/sidecar-qualification.json` is intermediate
+evidence only. A sidecar-only `PASS` cannot produce a final qualification or
+enable production.
+
+The main-environment controller consumes that bounded evidence, generates the
+same class of synthetic JPEGs through the actual L2 validator, and launches the
+sidecar with its own Python executable and a sanitized environment:
+
+```bash
+cd /home/xs/projects/OpenAvatarChat-admission-lite
+/home/xs/projects/OpenAvatarChat/.venv/bin/python \
+  scripts/admission_notice_lite_l3_qualify.py
+```
+
+It exercised the real backend client, AF_UNIX listener, framed request
+and response, typed `OcrBatchLiteV1`, production processor/service lifecycle,
+and terminal `COMPLETED` path, then combined both lanes into the tracked
+schema-v2 report. It never imported Paddle into the main environment, and the
+sidecar never imported the main service.
+
+The reviewed production gate now approves exactly the qualified manifest above.
+Production construction is eligible only when the sidecar ping also matches
+`paddle_static`, CPU, two threads, PaddlePaddle 3.3.0, PaddleOCR 3.7.0,
+PaddleX 3.7.2, and the exact manifest hash. Missing service, stale or invalid
+qualification evidence, or any runtime identity mismatch remains fail-closed.
+The approval constant is not a model registry, fallback, or dynamic artifact
+authorization mechanism. A representative Avatar/RTC workload was not
+available during qualification.
+Operational commands and all six model artifact hashes are documented in the
+[`sidecar README`](../../../services/admission_notice_ocr/README.md).
+
+In L3, a successful processor return and job `COMPLETED` mean only:
+
+> The configured local OCR pipeline successfully processed the submitted
+> frames.
+
+It does not mean the document is an HBTC admission notice, the college is
+交通信息学院, any name/province/major was extracted, any major is supported, or
+personalization occurred. No template/college matcher or field recognition
+exists in production L3.
 
 ## ChatAgent Turn Boundary
 
@@ -602,9 +807,10 @@ history, or WebUI behavior.
 
 L2 replaces only the POST's historical empty body with the bounded multipart
 contract above, adds `ValidatedAdmissionFrameLiteV1`, and passes its frame tuple
-through the processor seam. Production still has no processor. L3 has not been
-implemented: Admission Notice Lite validates real JPEG input but cannot OCR or
-recognize an admission notice.
+through the processor seam. L3 adds only the qualified CPU OCR sidecar,
+protocol, typed transient OCR batch, client, and real processor described
+above. Admission Notice Lite can now perform real local CPU OCR, but it cannot
+understand the admission notice semantically.
 
 Later regression suites MUST permanently cover prefix collisions, cross-session
 isolation, stale identifiers, admission before body reads, global and
@@ -614,8 +820,9 @@ wording.
 
 ## L0 and L1 Configuration
 
-L0 introduced the section with `enabled: false`. L1 activates only the two
-control-plane limits it needs:
+L0 introduced the section with `enabled: false`. L1 activated its two
+control-plane limits, and L3 now accepts only the three operational OCR
+connection values it needs:
 
 ```yaml
 default:
@@ -624,6 +831,9 @@ default:
       enabled: false
       recognition_ttl_seconds: 120
       max_global_recognition_jobs: 1
+      ocr_socket_path: /run/openavatarchat-admission-lite/ocr.sock
+      ocr_connect_timeout_seconds: 1.0
+      ocr_timeout_seconds: 30.0
 ```
 
 Omitting `admission_notice_lite` produces a fresh disabled default. L1 accepts
@@ -633,12 +843,13 @@ limit is a strict integer from 1 through 32. Unknown Lite keys are rejected
 with the ordinary Pydantic `ValidationError`. Existing YAML presets remain
 unchanged and default to disabled by omission.
 
-These keys remain deferred and MUST NOT be accepted in L1:
-
-| Key | Future default | Owner |
-|---|---:|---|
-| `ocr_timeout_seconds` | `30` | L3 |
-| `ocr_socket_path` | `/run/openavatarchat-admission-lite/ocr.sock` | L3 |
+`ocr_socket_path` is a bounded absolute Unix path. The connect timeout is a
+strict float from 0.05 through 2 seconds and defaults to 1 second. The overall
+write/inference/read timeout is a strict float from 1 through 60 seconds and
+defaults to 30 seconds. School, college, profile, template, catalog, backend,
+device, model-family, thread-count, and fake-processor configuration remain
+prohibited; the production tuple comes only from the qualified manifest and
+startup identity.
 
 The following are fixed v1 invariants, not configuration:
 
@@ -657,10 +868,10 @@ decoding, OCR contract or process, job, session association, fake adapter,
 ChatAgent behavior, TTS behavior, frontend change, dependency, listener,
 firewall manifest, PKI, or runtime integration. L1 added only the control-plane
 items described above. L2 adds only the memory-only multipart/JPEG ingress and
-processor-frame seam described above; it adds no OCR, extractor, ChatAgent,
-TTS, or frontend behavior.
+processor-frame seam described above. L3 adds only the local CPU OCR layer; it
+adds no extractor, ChatAgent, TTS, or frontend behavior.
 
-L0 also does not qualify OCR, a remote-capable preset, a TTS deployment,
-horizontal scaling, or end-to-end behavior. Those claims require their assigned
-later milestones. L0 stops after the normative document, disabled-only model,
-its `ServiceConfigData` field, and focused static/configuration tests.
+L3 qualification does not qualify an HBTC template, field extraction, a
+remote-capable preset, TTS deployment, Avatar/RTC contention, horizontal
+scaling, or end-to-end personalization. Those claims require their assigned
+later milestones.

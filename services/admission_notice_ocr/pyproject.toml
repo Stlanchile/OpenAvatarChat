@@ -1,0 +1,43 @@
+[project]
+name = "openavatarchat-admission-notice-ocr"
+version = "0.1.0"
+description = "CPU-only PP-OCRv6 sidecar for Admission Notice Lite v1"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy==1.26.4",
+    "paddleocr==3.7.0",
+    "paddlepaddle @ https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.0-cp311-cp311-linux_x86_64.whl#sha256=a4f2e0595e827c179b4fff4278fb41a24f4abe5927ffd5efb1ace26a916145f2",
+    "paddlex[ocr-core]==3.7.2",
+    "pillow==11.3.0",
+]
+
+[project.scripts]
+admission-notice-ocr = "admission_notice_ocr.app:main"
+admission-notice-ocr-provision = "admission_notice_ocr.provision_models:main"
+admission-notice-ocr-qualify = "admission_notice_ocr.qualify:main"
+
+[dependency-groups]
+dev = [
+    "loguru==0.7.3",
+    "pytest==8.4.2",
+    "pytest-asyncio==1.2.0",
+    "ruff==0.12.12",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/admission_notice_ocr"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+markers = [
+    "admission_notice_ocr_integration: real AF_UNIX and PaddleOCR integration",
+    "admission_notice_ocr_qualification: full CPU/runtime qualification matrix",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"

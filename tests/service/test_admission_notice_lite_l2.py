@@ -1700,24 +1700,19 @@ def test_pillow_is_existing_explicit_dependency_without_new_image_stack() -> Non
     )
 
 
-def test_l2_production_source_has_no_ocr_frontend_or_hardened_dependencies() -> None:
+def test_l3_backend_source_has_no_l4_frontend_or_hardened_dependencies() -> None:
     paths = (
         PROJECT_ROOT / "src" / "service" / "admission_notice_lite_contracts.py",
         PROJECT_ROOT / "src" / "service" / "admission_notice_lite_ingestion.py",
+        PROJECT_ROOT / "src" / "service" / "admission_notice_lite_ocr.py",
         PROJECT_ROOT / "src" / "service" / "admission_notice_lite_routes.py",
         PROJECT_ROOT / "src" / "service" / "admission_notice_lite_service.py",
     )
     source = "\n".join(path.read_text(encoding="utf-8") for path in paths).lower()
 
     for forbidden in (
-        "paddle",
-        "paddleocr",
-        "paddlex",
         "openvino",
         "onnxruntime",
-        "ocrpage",
-        "ocr_result",
-        "unix domain socket",
         "template_match",
         "major_catalog",
         "chatagent",
@@ -1752,8 +1747,6 @@ def test_l2_documentation_states_current_ingestion_boundary() -> None:
         "2,073,600",
         "memory-only",
         "EXIF",
-        "no processor",
-        "does not perform OCR",
     ):
         assert required in document
 

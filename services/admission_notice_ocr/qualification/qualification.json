@@ -1,0 +1,438 @@
+{
+  "af_unix_integration": {
+    "passed": true,
+    "socket_family": "AF_UNIX"
+  },
+  "backend": "paddle_static",
+  "clean_start_offline": {
+    "developer_cache_used": false,
+    "mechanism": "fresh_home_and_cache_roots_with_linux_user_and_network_namespace",
+    "passed": true,
+    "runtime_model_download": false
+  },
+  "contention_notes": {
+    "backend_event_loop_max_lag_ms": 0.992,
+    "representative_avatar_workload": "not_available"
+  },
+  "device": "cpu",
+  "font_source": "system-cjk",
+  "gpu_observation": {
+    "after_process_count": 0,
+    "available": true,
+    "before_process_count": 0,
+    "live_inference_sample_count": 20,
+    "sidecar_allocations": []
+  },
+  "host": {
+    "cpu": "Intel(R) Core(TM) i9-14900HX",
+    "logical_cpu_count": 32,
+    "platform": "linux-x86_64"
+  },
+  "manifest_thread_count": 2,
+  "model_manifest_sha256": "1de89743e56affd2a220ae90fa2ce383bc8856714400737a5e4828beb0cd012b",
+  "package_audit": {
+    "forbidden_packages": [],
+    "paddle_cpu_wheel_lock_enforced": true,
+    "paddle_cpu_wheel_sha256": "a4f2e0595e827c179b4fff4278fb41a24f4abe5927ffd5efb1ace26a916145f2",
+    "paddle_cpu_wheel_size": 193703893,
+    "paddle_installed_record_files_verified": 3467,
+    "paddle_package": "paddlepaddle"
+  },
+  "package_versions": {
+    "paddleocr": "3.7.0",
+    "paddlepaddle": "3.3.0",
+    "paddlex": "3.7.2"
+  },
+  "production_processor_path": {
+    "backend_event_loop_max_lag_ms": 0.992,
+    "builder_gate_enabled": false,
+    "frame_count": 3,
+    "passed": true,
+    "sidecar_model_init_ms": 1394.889,
+    "sidecar_startup_ms": 1476.9,
+    "span_count": 10,
+    "terminal_state": "COMPLETED",
+    "typed_batch_valid": true
+  },
+  "python_version": "3.11.16",
+  "qualification_source_sha256": "e4bea8fafc4e2e2499f2b2fa2c1c667abc15261cc6ea29c404f215841f3b0463",
+  "result": "PASS",
+  "schema_version": 2,
+  "selected": {
+    "cache_environment_match": true,
+    "cold_startup_ms": 1739.498,
+    "compiled_with_cuda": false,
+    "cpu_percent": 201.122,
+    "determinism": {
+      "polygon_max_abs_delta": 0.0,
+      "polygon_shape_stable": true,
+      "score_max_abs_delta": 0.0,
+      "score_shape_stable": true,
+      "span_count_stable": true,
+      "span_text_stable": true
+    },
+    "device": "cpu",
+    "error_count": 0,
+    "first_inference_ms": 2757.384,
+    "functional": {
+      "chinese": true,
+      "digits": true,
+      "latin": true,
+      "polygon": true,
+      "score": true,
+      "span_count": 3
+    },
+    "gpu_live_observation": {
+      "instrumentation_available": true,
+      "live_inference_samples": 4,
+      "sidecar_allocation_samples_mb": []
+    },
+    "isolated_cache_file_count": 0,
+    "isolated_cache_model_file_count": 0,
+    "loaded_libraries": {
+      "available": true,
+      "bundled_openvino_loaded": [
+        "libopenvino.so.2500",
+        "libopenvino_paddle_frontend.so.2500"
+      ],
+      "forbidden_loaded": []
+    },
+    "model_init_ms": 1618.885,
+    "one_frame": {
+      "p50_ms": 2473.426,
+      "p95_ms": 2496.0,
+      "samples": 8
+    },
+    "result": "PASS",
+    "rss_mb": 897.848,
+    "schema_version": 1,
+    "tcp_listener_count": 0,
+    "thread_count": 2,
+    "thread_environment_match": true,
+    "three_frame": {
+      "p50_ms": 7427.84,
+      "p95_ms": 7594.802,
+      "samples": 8
+    },
+    "two_frame": {
+      "p50_ms": 4938.255,
+      "p95_ms": 5206.592,
+      "samples": 8
+    }
+  },
+  "selected_thread_count": 2,
+  "sidecar_source_sha256": "f5ac3602a63e89ca106015f599ca4ad973dc06a1c0483db19e69f991dd5840aa",
+  "thread_candidates": [
+    {
+      "cache_environment_match": true,
+      "cold_startup_ms": 1463.968,
+      "compiled_with_cuda": false,
+      "cpu_percent": 100.635,
+      "determinism": {
+        "polygon_max_abs_delta": 0.0,
+        "polygon_shape_stable": true,
+        "score_max_abs_delta": 0.0,
+        "score_shape_stable": true,
+        "span_count_stable": true,
+        "span_text_stable": true
+      },
+      "device": "cpu",
+      "error_count": 0,
+      "first_inference_ms": 3283.91,
+      "functional": {
+        "chinese": true,
+        "digits": true,
+        "latin": true,
+        "polygon": true,
+        "score": true,
+        "span_count": 3
+      },
+      "gpu_live_observation": {
+        "instrumentation_available": true,
+        "live_inference_samples": 4,
+        "sidecar_allocation_samples_mb": []
+      },
+      "isolated_cache_file_count": 0,
+      "isolated_cache_model_file_count": 0,
+      "loaded_libraries": {
+        "available": true,
+        "bundled_openvino_loaded": [
+          "libopenvino.so.2500",
+          "libopenvino_paddle_frontend.so.2500"
+        ],
+        "forbidden_loaded": []
+      },
+      "model_init_ms": 1347.591,
+      "one_frame": {
+        "p50_ms": 3025.012,
+        "p95_ms": 3074.688,
+        "samples": 8
+      },
+      "result": "PASS",
+      "rss_mb": 904.414,
+      "schema_version": 1,
+      "tcp_listener_count": 0,
+      "thread_count": 1,
+      "thread_environment_match": true,
+      "three_frame": {
+        "p50_ms": 8979.237,
+        "p95_ms": 9395.721,
+        "samples": 8
+      },
+      "two_frame": {
+        "p50_ms": 6164.481,
+        "p95_ms": 6259.071,
+        "samples": 8
+      }
+    },
+    {
+      "cache_environment_match": true,
+      "cold_startup_ms": 1739.498,
+      "compiled_with_cuda": false,
+      "cpu_percent": 201.122,
+      "determinism": {
+        "polygon_max_abs_delta": 0.0,
+        "polygon_shape_stable": true,
+        "score_max_abs_delta": 0.0,
+        "score_shape_stable": true,
+        "span_count_stable": true,
+        "span_text_stable": true
+      },
+      "device": "cpu",
+      "error_count": 0,
+      "first_inference_ms": 2757.384,
+      "functional": {
+        "chinese": true,
+        "digits": true,
+        "latin": true,
+        "polygon": true,
+        "score": true,
+        "span_count": 3
+      },
+      "gpu_live_observation": {
+        "instrumentation_available": true,
+        "live_inference_samples": 4,
+        "sidecar_allocation_samples_mb": []
+      },
+      "isolated_cache_file_count": 0,
+      "isolated_cache_model_file_count": 0,
+      "loaded_libraries": {
+        "available": true,
+        "bundled_openvino_loaded": [
+          "libopenvino.so.2500",
+          "libopenvino_paddle_frontend.so.2500"
+        ],
+        "forbidden_loaded": []
+      },
+      "model_init_ms": 1618.885,
+      "one_frame": {
+        "p50_ms": 2473.426,
+        "p95_ms": 2496.0,
+        "samples": 8
+      },
+      "result": "PASS",
+      "rss_mb": 897.848,
+      "schema_version": 1,
+      "tcp_listener_count": 0,
+      "thread_count": 2,
+      "thread_environment_match": true,
+      "three_frame": {
+        "p50_ms": 7427.84,
+        "p95_ms": 7594.802,
+        "samples": 8
+      },
+      "two_frame": {
+        "p50_ms": 4938.255,
+        "p95_ms": 5206.592,
+        "samples": 8
+      }
+    },
+    {
+      "cache_environment_match": true,
+      "cold_startup_ms": 1492.469,
+      "compiled_with_cuda": false,
+      "cpu_percent": 401.209,
+      "determinism": {
+        "polygon_max_abs_delta": 0.0,
+        "polygon_shape_stable": true,
+        "score_max_abs_delta": 0.0,
+        "score_shape_stable": true,
+        "span_count_stable": true,
+        "span_text_stable": true
+      },
+      "device": "cpu",
+      "error_count": 0,
+      "first_inference_ms": 2432.056,
+      "functional": {
+        "chinese": true,
+        "digits": true,
+        "latin": true,
+        "polygon": true,
+        "score": true,
+        "span_count": 3
+      },
+      "gpu_live_observation": {
+        "instrumentation_available": true,
+        "live_inference_samples": 4,
+        "sidecar_allocation_samples_mb": []
+      },
+      "isolated_cache_file_count": 0,
+      "isolated_cache_model_file_count": 0,
+      "loaded_libraries": {
+        "available": true,
+        "bundled_openvino_loaded": [
+          "libopenvino.so.2500",
+          "libopenvino_paddle_frontend.so.2500"
+        ],
+        "forbidden_loaded": []
+      },
+      "model_init_ms": 1371.195,
+      "one_frame": {
+        "p50_ms": 2133.065,
+        "p95_ms": 2220.374,
+        "samples": 8
+      },
+      "result": "PASS",
+      "rss_mb": 918.688,
+      "schema_version": 1,
+      "tcp_listener_count": 0,
+      "thread_count": 4,
+      "thread_environment_match": true,
+      "three_frame": {
+        "p50_ms": 6425.669,
+        "p95_ms": 6559.214,
+        "samples": 8
+      },
+      "two_frame": {
+        "p50_ms": 4368.999,
+        "p95_ms": 4515.249,
+        "samples": 8
+      }
+    },
+    {
+      "cache_environment_match": true,
+      "cold_startup_ms": 1474.23,
+      "compiled_with_cuda": false,
+      "cpu_percent": 601.323,
+      "determinism": {
+        "polygon_max_abs_delta": 0.0,
+        "polygon_shape_stable": true,
+        "score_max_abs_delta": 0.0,
+        "score_shape_stable": true,
+        "span_count_stable": true,
+        "span_text_stable": true
+      },
+      "device": "cpu",
+      "error_count": 0,
+      "first_inference_ms": 2413.47,
+      "functional": {
+        "chinese": true,
+        "digits": true,
+        "latin": true,
+        "polygon": true,
+        "score": true,
+        "span_count": 3
+      },
+      "gpu_live_observation": {
+        "instrumentation_available": true,
+        "live_inference_samples": 4,
+        "sidecar_allocation_samples_mb": []
+      },
+      "isolated_cache_file_count": 0,
+      "isolated_cache_model_file_count": 0,
+      "loaded_libraries": {
+        "available": true,
+        "bundled_openvino_loaded": [
+          "libopenvino.so.2500",
+          "libopenvino_paddle_frontend.so.2500"
+        ],
+        "forbidden_loaded": []
+      },
+      "model_init_ms": 1363.347,
+      "one_frame": {
+        "p50_ms": 2146.534,
+        "p95_ms": 2214.897,
+        "samples": 8
+      },
+      "result": "PASS",
+      "rss_mb": 905.754,
+      "schema_version": 1,
+      "tcp_listener_count": 0,
+      "thread_count": 6,
+      "thread_environment_match": true,
+      "three_frame": {
+        "p50_ms": 6741.686,
+        "p95_ms": 7115.935,
+        "samples": 8
+      },
+      "two_frame": {
+        "p50_ms": 4505.762,
+        "p95_ms": 4801.567,
+        "samples": 8
+      }
+    },
+    {
+      "cache_environment_match": true,
+      "cold_startup_ms": 1453.507,
+      "compiled_with_cuda": false,
+      "cpu_percent": 801.452,
+      "determinism": {
+        "polygon_max_abs_delta": 0.0,
+        "polygon_shape_stable": true,
+        "score_max_abs_delta": 0.0,
+        "score_shape_stable": true,
+        "span_count_stable": true,
+        "span_text_stable": true
+      },
+      "device": "cpu",
+      "error_count": 0,
+      "first_inference_ms": 2406.72,
+      "functional": {
+        "chinese": true,
+        "digits": true,
+        "latin": true,
+        "polygon": true,
+        "score": true,
+        "span_count": 3
+      },
+      "gpu_live_observation": {
+        "instrumentation_available": true,
+        "live_inference_samples": 4,
+        "sidecar_allocation_samples_mb": []
+      },
+      "isolated_cache_file_count": 0,
+      "isolated_cache_model_file_count": 0,
+      "loaded_libraries": {
+        "available": true,
+        "bundled_openvino_loaded": [
+          "libopenvino.so.2500",
+          "libopenvino_paddle_frontend.so.2500"
+        ],
+        "forbidden_loaded": []
+      },
+      "model_init_ms": 1344.093,
+      "one_frame": {
+        "p50_ms": 2210.402,
+        "p95_ms": 2325.707,
+        "samples": 8
+      },
+      "result": "PASS",
+      "rss_mb": 896.422,
+      "schema_version": 1,
+      "tcp_listener_count": 0,
+      "thread_count": 8,
+      "thread_environment_match": true,
+      "three_frame": {
+        "p50_ms": 7249.996,
+        "p95_ms": 7520.312,
+        "samples": 8
+      },
+      "two_frame": {
+        "p50_ms": 4813.794,
+        "p95_ms": 5014.263,
+        "samples": 8
+      }
+    }
+  ],
+  "timestamp": "2026-08-30T16:11:49.110050+00:00"
+}

@@ -83,7 +83,7 @@ def register_admission_notice_lite_routes(
     config: AdmissionNoticeLiteFeatureConfigV1,
     processor: RecognitionProcessorLiteV1 | None = None,
 ) -> AdmissionNoticeLiteService | None:
-    """Register the L2 ingestion and L1 control routes when explicitly enabled."""
+    """Register the L3 OCR-backed Lite routes when explicitly enabled."""
 
     if not config.enabled:
         return None

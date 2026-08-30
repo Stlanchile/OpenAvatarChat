@@ -1,0 +1,65 @@
+{
+  "backend": "paddle_static",
+  "device": "cpu",
+  "models": [
+    {
+      "files": [
+        {
+          "path": "inference.json",
+          "sha256": "0f1a7ec35da36173529c7a60238b7f7919e3831929c3f700ad90ad4896adecd5",
+          "size": 312150
+        },
+        {
+          "path": "inference.pdiparams",
+          "sha256": "85218d2e3d98f5a21c58b4220627be923a97aee5db3cc71f39536ab31ac53960",
+          "size": 61960476
+        },
+        {
+          "path": "inference.yml",
+          "sha256": "7298d5ead546584af2504d03355f881ac7a7bc0eb1e282d3e159277c1d0af871",
+          "size": 886
+        }
+      ],
+      "name": "PP-OCRv6_medium_det",
+      "relative_path": "PP-OCRv6_medium_det_infer",
+      "role": "text_detection"
+    },
+    {
+      "files": [
+        {
+          "path": "inference.json",
+          "sha256": "0b2e25e990bd072f1bf77d59d67d508bce6c4bd44af6624e0fb27d6da2cd00e8",
+          "size": 221814
+        },
+        {
+          "path": "inference.pdiparams",
+          "sha256": "1b01c79a914587933f615569e75de54f2e638ebb5d3f3b3c1b38c24ede8c7319",
+          "size": 76465087
+        },
+        {
+          "path": "inference.yml",
+          "sha256": "991b700facf5b50a7de193468207d5f4255b538dde0d312ae3b7c7a9b6873129",
+          "size": 150580
+        }
+      ],
+      "name": "PP-OCRv6_medium_rec",
+      "relative_path": "PP-OCRv6_medium_rec_infer",
+      "role": "text_recognition"
+    }
+  ],
+  "package_versions": {
+    "paddleocr": "3.7.0",
+    "paddlepaddle": "3.3.0",
+    "paddlex": "3.7.2"
+  },
+  "runtime_flags": {
+    "enable_hpi": false,
+    "enable_mkldnn": false,
+    "use_doc_orientation_classify": false,
+    "use_doc_unwarping": false,
+    "use_tensorrt": false,
+    "use_textline_orientation": false
+  },
+  "schema_version": 1,
+  "thread_count": 2
+}
