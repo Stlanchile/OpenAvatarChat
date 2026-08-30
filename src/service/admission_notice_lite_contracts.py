@@ -17,6 +17,11 @@ class RecognitionStateLiteV1(str, Enum):
 
 class RecognitionErrorReasonLiteV1(str, Enum):
     INVALID_REQUEST = "INVALID_REQUEST"
+    INVALID_IMAGE = "INVALID_IMAGE"
+    IMAGE_TOO_LARGE = "IMAGE_TOO_LARGE"
+    IMAGE_DIMENSIONS_UNSUPPORTED = "IMAGE_DIMENSIONS_UNSUPPORTED"
+    TOO_MANY_FRAMES = "TOO_MANY_FRAMES"
+    UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
     SERVICE_BUSY = "SERVICE_BUSY"
     RECOGNITION_ALREADY_ACTIVE = "RECOGNITION_ALREADY_ACTIVE"
@@ -33,9 +38,35 @@ class RecognitionJobContextLiteV1:
     cancel_event: asyncio.Event = field(repr=False, compare=False)
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedAdmissionFrameLiteV1:
+    frame_index: int
+    jpeg_bytes: bytes = field(repr=False)
+    encoded_size: int
+    width: int
+    height: int
+    exif_orientation: int = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.jpeg_bytes) is not bytes:
+            raise TypeError("jpeg_bytes must be immutable bytes")
+        if not 1 <= self.frame_index <= 3:
+            raise ValueError("frame_index must be between 1 and 3")
+        if self.encoded_size != len(self.jpeg_bytes) or self.encoded_size < 1:
+            raise ValueError("encoded_size must match non-empty jpeg_bytes")
+        if self.width < 1 or self.height < 1:
+            raise ValueError("logical dimensions must be positive")
+        if self.exif_orientation not in range(1, 9):
+            raise ValueError("exif_orientation must be between 1 and 8")
+
+
 class RecognitionProcessorLiteV1(Protocol):
-    async def process(self, context: RecognitionJobContextLiteV1) -> None:
-        """Complete one payload-free L1 control-plane operation."""
+    async def process(
+        self,
+        context: RecognitionJobContextLiteV1,
+        frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
+    ) -> None:
+        """Process one bounded tuple of validated L2 JPEG frames."""
 
 
 @dataclass(frozen=True, slots=True)

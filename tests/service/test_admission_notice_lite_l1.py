@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import re
 from pathlib import Path
@@ -7,6 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from loguru import logger
+from PIL import Image
 
 import service.admission_notice_lite_service as lite_service_module
 from chat_engine.chat_engine import ChatEngine
@@ -15,6 +17,7 @@ from service.admission_notice_lite_contracts import (
     RecognitionErrorReasonLiteV1,
     RecognitionJobContextLiteV1,
     RecognitionStateLiteV1,
+    ValidatedAdmissionFrameLiteV1,
 )
 from service.admission_notice_lite_routes import (
     register_admission_notice_lite_routes,
@@ -25,8 +28,9 @@ from service.service_data_models.admission_notice_lite_config import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-L1_SOURCE_PATHS = (
+LITE_SOURCE_PATHS = (
     PROJECT_ROOT / "src" / "service" / "admission_notice_lite_contracts.py",
+    PROJECT_ROOT / "src" / "service" / "admission_notice_lite_ingestion.py",
     PROJECT_ROOT / "src" / "service" / "admission_notice_lite_routes.py",
     PROJECT_ROOT / "src" / "service" / "admission_notice_lite_service.py",
     PROJECT_ROOT
@@ -36,6 +40,16 @@ L1_SOURCE_PATHS = (
     / "admission_notice_lite_config.py",
 )
 ROUTE_BASE = "/api/v1/sessions/{session_id}/admission-notice/recognitions"
+_DIRECT_TEST_FRAMES = (
+    ValidatedAdmissionFrameLiteV1(
+        frame_index=1,
+        jpeg_bytes=b"\xff\xd8\xff\xd9",
+        encoded_size=4,
+        width=1,
+        height=1,
+        exif_orientation=1,
+    ),
+)
 
 
 class SessionStub:
@@ -73,8 +87,13 @@ class ControlPlaneProcessorFake:
         self.cancellation_observed = asyncio.Event()
         self.calls = 0
 
-    async def process(self, context: RecognitionJobContextLiteV1) -> None:
+    async def process(
+        self,
+        context: RecognitionJobContextLiteV1,
+        frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
+    ) -> None:
         del context
+        assert frames
         self.calls += 1
         self.started.set()
         if self.wait_for_release:
@@ -115,6 +134,27 @@ def _service(
         processor=processor,
         clock=clock or ManualClock(),
     )
+
+
+def _jpeg_bytes(width: int = 16, height: int = 12) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (width, height), "white").save(output, format="JPEG")
+    return output.getvalue()
+
+
+def _multipart_files() -> dict[str, tuple[str, bytes, str]]:
+    return {"frame_1": ("ignored.jpg", _jpeg_bytes(), "image/jpeg")}
+
+
+async def _create_recognition(
+    service: AdmissionNoticeLiteService,
+    session_id: str,
+):
+    permit = await service.begin_ingestion(session_id)
+    try:
+        return await service.create_recognition(permit, _DIRECT_TEST_FRAMES)
+    finally:
+        service.release_ingestion(permit)
 
 
 async def _wait_for_state(
@@ -220,7 +260,8 @@ async def test_enabled_default_processor_fails_closed_without_job() -> None:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/api/v1/sessions/owner/admission-notice/recognitions"
+            "/api/v1/sessions/owner/admission-notice/recognitions",
+            files={"frame_1": ("not-read.jpg", b"not-read", "image/jpeg")},
         )
 
     assert response.status_code == 503
@@ -237,7 +278,7 @@ async def test_create_uses_server_id_and_exact_session_owner() -> None:
     processor = ControlPlaneProcessorFake(wait_for_release=True)
     service = _service(sessions, processor)
 
-    job = await service.create_recognition("owner")
+    job = await _create_recognition(service, "owner")
     await processor.started.wait()
 
     assert re.fullmatch(r"arn1_[A-Za-z0-9_-]{24}", job.recognition_id)
@@ -263,8 +304,8 @@ async def test_simultaneous_create_claims_one_session_slot_atomically() -> None:
     service = _service(sessions, processor)
 
     results = await asyncio.gather(
-        service.create_recognition("owner"),
-        service.create_recognition("owner"),
+        _create_recognition(service, "owner"),
+        _create_recognition(service, "owner"),
         return_exceptions=True,
     )
 
@@ -288,9 +329,9 @@ async def test_global_limit_rejects_without_allocating_or_queueing() -> None:
     processor = ControlPlaneProcessorFake(wait_for_release=True)
     service = _service(sessions, processor, max_global_jobs=1)
 
-    first = await service.create_recognition("one")
+    first = await _create_recognition(service, "one")
     with pytest.raises(AdmissionNoticeLiteError) as error:
-        await service.create_recognition("two")
+        await _create_recognition(service, "two")
 
     _assert_reason(error, RecognitionErrorReasonLiteV1.SERVICE_BUSY)
     assert service.active_job_count == 1
@@ -308,8 +349,8 @@ async def test_configured_global_limit_is_used() -> None:
     service = _service(sessions, processor, max_global_jobs=2)
 
     first, second = await asyncio.gather(
-        service.create_recognition("one"),
-        service.create_recognition("two"),
+        _create_recognition(service, "one"),
+        _create_recognition(service, "two"),
     )
 
     assert first.recognition_id != second.recognition_id
@@ -337,7 +378,8 @@ async def test_owner_status_is_coarse_and_cross_session_is_not_found() -> None:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         created = await client.post(
-            "/api/v1/sessions/owner/admission-notice/recognitions"
+            "/api/v1/sessions/owner/admission-notice/recognitions",
+            files=_multipart_files(),
         )
         recognition_id = created.json()["recognition_id"]
         owner_status = await client.get(
@@ -405,8 +447,8 @@ async def test_control_route_rejects_body_query_and_client_owner_fields() -> Non
             "/api/v1/sessions/owner/admission-notice/recognitions?mock=true"
         )
 
-    assert body_response.status_code == 400
-    assert body_response.json() == {"reason": "INVALID_REQUEST"}
+    assert body_response.status_code == 415
+    assert body_response.json() == {"reason": "UNSUPPORTED_MEDIA_TYPE"}
     assert query_response.status_code == 400
     assert query_response.json() == {"reason": "INVALID_REQUEST"}
     assert processor.calls == 0
@@ -434,8 +476,8 @@ async def test_post_rejects_headerless_asgi_body_without_consuming_it() -> None:
         b'{"owner_session_id":"other"}',
     )
 
-    assert status == 400
-    assert response == {"reason": "INVALID_REQUEST"}
+    assert status == 415
+    assert response == {"reason": "UNSUPPORTED_MEDIA_TYPE"}
     assert processor.calls == 0
     assert service.retained_job_count == 0
     await service.shutdown()
@@ -447,13 +489,13 @@ async def test_completion_releases_capacity_and_never_resurrects() -> None:
     processor = ControlPlaneProcessorFake()
     service = _service(sessions, processor)
 
-    first = await service.create_recognition("owner")
+    first = await _create_recognition(service, "owner")
     await _wait_for_state(
         service, "owner", first.recognition_id, RecognitionStateLiteV1.COMPLETED
     )
     assert service.active_job_count == 0
 
-    second = await service.create_recognition("owner")
+    second = await _create_recognition(service, "owner")
     await _wait_for_state(
         service, "owner", second.recognition_id, RecognitionStateLiteV1.COMPLETED
     )
@@ -473,7 +515,7 @@ async def test_processor_exception_is_safe_failed_status_and_releases_slot() -> 
     messages: list[str] = []
     sink_id = logger.add(messages.append, format="{message}")
     try:
-        job = await service.create_recognition("owner")
+        job = await _create_recognition(service, "owner")
         await _wait_for_state(
             service, "owner", job.recognition_id, RecognitionStateLiteV1.FAILED
         )
@@ -494,7 +536,7 @@ async def test_owner_cancel_is_idempotent_and_releases_slot_once() -> None:
     sessions = {"owner": SessionStub()}
     processor = ControlPlaneProcessorFake(wait_for_release=True)
     service = _service(sessions, processor)
-    job = await service.create_recognition("owner")
+    job = await _create_recognition(service, "owner")
     await processor.started.wait()
 
     await service.cancel_recognition("owner", job.recognition_id)
@@ -506,7 +548,7 @@ async def test_owner_cancel_is_idempotent_and_releases_slot_once() -> None:
     assert service.active_job_count == 0
     await _wait_for_no_tasks(service)
 
-    replacement = await service.create_recognition("owner")
+    replacement = await _create_recognition(service, "owner")
     await service.cancel_recognition("owner", replacement.recognition_id)
     assert service.active_job_count == 0
     await _wait_for_no_tasks(service)
@@ -521,7 +563,7 @@ async def test_delayed_completion_after_cancel_is_discarded() -> None:
         ignore_cancellation=True,
     )
     service = _service(sessions, processor)
-    job = await service.create_recognition("owner")
+    job = await _create_recognition(service, "owner")
     await processor.started.wait()
 
     await service.cancel_recognition("owner", job.recognition_id)
@@ -544,7 +586,7 @@ async def test_ttl_expires_active_job_and_polling_does_not_slide() -> None:
         ignore_cancellation=True,
     )
     service = _service(sessions, processor, ttl=2, clock=clock)
-    job = await service.create_recognition("owner")
+    job = await _create_recognition(service, "owner")
     await processor.started.wait()
 
     clock.advance(1)
@@ -571,7 +613,7 @@ async def test_completion_observed_after_deadline_cannot_win_expiry_race() -> No
     sessions = {"owner": SessionStub()}
     processor = ControlPlaneProcessorFake(wait_for_release=True)
     service = _service(sessions, processor, ttl=1, clock=clock)
-    job = await service.create_recognition("owner")
+    job = await _create_recognition(service, "owner")
     await processor.started.wait()
 
     clock.advance(1.1)
@@ -596,7 +638,7 @@ async def test_supervisor_timeout_cancels_when_exact_owner_is_no_longer_live() -
         session_lookup=sessions.get,
         processor=processor,
     )
-    job = await service.create_recognition("owner")
+    job = await _create_recognition(service, "owner")
     await processor.started.wait()
 
     sessions["owner"] = SessionStub()
@@ -629,7 +671,7 @@ async def test_session_stop_cancels_exact_instance_and_id_reuse_cannot_claim_job
         processor=processor,
     )
     assert service is not None
-    job = await service.create_recognition("reused")
+    job = await _create_recognition(service, "reused")
     await processor.started.wait()
 
     engine.stop_session("reused")
@@ -667,7 +709,7 @@ async def test_session_stop_marker_beats_already_queued_processor_completion() -
         processor=processor,
     )
     assert service is not None
-    job = await service.create_recognition("owner")
+    job = await _create_recognition(service, "owner")
     await processor.started.wait()
 
     processor.release.set()
@@ -697,7 +739,7 @@ async def test_status_and_cancel_revalidate_session_after_waiting_for_lock(
         processor=processor,
     )
     assert service is not None
-    job = await service.create_recognition("reused")
+    job = await _create_recognition(service, "reused")
     await processor.started.wait()
 
     await service._lock.acquire()
@@ -739,7 +781,7 @@ async def test_shutdown_closes_admission_cancels_and_clears_registry_boundedly()
         ignore_cancellation=True,
     )
     service = _service(sessions, processor)
-    await service.create_recognition("owner")
+    await _create_recognition(service, "owner")
     await processor.started.wait()
 
     loop = asyncio.get_running_loop()
@@ -752,7 +794,7 @@ async def test_shutdown_closes_admission_cancels_and_clears_registry_boundedly()
     assert service.active_job_count == 0
     assert service.retained_job_count == 0
     with pytest.raises(AdmissionNoticeLiteError) as error:
-        await service.create_recognition("owner")
+        await _create_recognition(service, "owner")
     _assert_reason(error, RecognitionErrorReasonLiteV1.SERVICE_UNAVAILABLE)
 
     processor.release.set()
@@ -767,7 +809,7 @@ async def test_terminal_retention_has_a_hard_count_bound() -> None:
     service = _service(sessions, processor)
 
     for _ in range(70):
-        job = await service.create_recognition("owner")
+        job = await _create_recognition(service, "owner")
         await _wait_for_state(
             service,
             "owner",
@@ -793,7 +835,7 @@ async def test_terminal_retention_expires_while_service_is_idle(
         session_lookup=sessions.get,
         processor=processor,
     )
-    job = await service.create_recognition("owner")
+    job = await _create_recognition(service, "owner")
     await _wait_for_state(
         service, "owner", job.recognition_id, RecognitionStateLiteV1.COMPLETED
     )
@@ -840,7 +882,7 @@ def test_production_config_and_routes_cannot_select_test_processor() -> None:
     }
 
     production_text = "\n".join(
-        path.read_text(encoding="utf-8") for path in L1_SOURCE_PATHS
+        path.read_text(encoding="utf-8") for path in LITE_SOURCE_PATHS
     ).lower()
     for forbidden in (
         "?mock",
@@ -852,14 +894,11 @@ def test_production_config_and_routes_cannot_select_test_processor() -> None:
         assert forbidden not in production_text
 
 
-def test_l1_source_has_no_l2_or_hardened_dependencies() -> None:
+def test_lite_source_has_no_ocr_or_hardened_dependencies() -> None:
     source_text = "\n".join(
-        path.read_text(encoding="utf-8") for path in L1_SOURCE_PATHS
+        path.read_text(encoding="utf-8") for path in LITE_SOURCE_PATHS
     ).lower()
     for forbidden in (
-        "from pil",
-        "import pil",
-        "pillow",
         "paddle",
         "paddleocr",
         "ocrpage",

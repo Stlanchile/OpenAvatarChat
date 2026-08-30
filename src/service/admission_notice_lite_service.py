@@ -16,6 +16,7 @@ from service.admission_notice_lite_contracts import (
     RecognitionJobLiteV1,
     RecognitionProcessorLiteV1,
     RecognitionStateLiteV1,
+    ValidatedAdmissionFrameLiteV1,
 )
 from service.service_data_models.admission_notice_lite_config import (
     AdmissionNoticeLiteFeatureConfigV1,
@@ -30,6 +31,17 @@ _SHUTDOWN_WAIT_SECONDS = 1.0
 
 
 @dataclass(slots=True)
+class _RecognitionIngestionPermitLiteV1:
+    owning_session_id: str
+    owning_session: object = field(repr=False)
+    owner_key: int
+    ingestion_task: asyncio.Task[Any] | None = field(repr=False)
+    cancel_reason: RecognitionErrorReasonLiteV1 | None = None
+    transferred: bool = False
+    released: bool = False
+
+
+@dataclass(slots=True)
 class _RecognitionJobRuntimeLiteV1:
     recognition_id: str
     owning_session_id: str
@@ -39,6 +51,8 @@ class _RecognitionJobRuntimeLiteV1:
     created_at_monotonic: float
     expires_at_monotonic: float
     cancel_event: asyncio.Event = field(repr=False)
+    frames: tuple[ValidatedAdmissionFrameLiteV1, ...] = field(repr=False)
+    resource_permit: _RecognitionIngestionPermitLiteV1 | None = field(repr=False)
     reason: RecognitionErrorReasonLiteV1 | None = None
     terminal_at_monotonic: float | None = None
     retain_until_monotonic: float | None = None
@@ -79,6 +93,9 @@ class AdmissionNoticeLiteService:
         self._lock = asyncio.Lock()
         self._jobs: dict[str, _RecognitionJobRuntimeLiteV1] = {}
         self._active_by_owner: dict[int, str] = {}
+        self._resource_permits_by_owner: dict[
+            int, _RecognitionIngestionPermitLiteV1
+        ] = {}
         self._invalidated_owner_keys: set[int] = set()
         self._owned_tasks: set[asyncio.Task[Any]] = set()
         self._accepting = True
@@ -97,6 +114,21 @@ class AdmissionNoticeLiteService:
         return len(self._jobs)
 
     @property
+    def active_ingestion_count(self) -> int:
+        return sum(
+            not permit.transferred
+            for permit in self._resource_permits_by_owner.values()
+        )
+
+    @property
+    def resource_slot_count(self) -> int:
+        return len(self._resource_permits_by_owner)
+
+    @property
+    def retained_frame_count(self) -> int:
+        return sum(len(job.frames) for job in self._jobs.values())
+
+    @property
     def owned_task_count(self) -> int:
         return len(self._owned_tasks)
 
@@ -112,6 +144,16 @@ class AdmissionNoticeLiteService:
         self._owned_tasks.add(task)
         task.add_done_callback(self._on_task_done)
 
+    def _track_job_task(
+        self,
+        task: asyncio.Task[Any],
+        job: _RecognitionJobRuntimeLiteV1,
+    ) -> None:
+        self._track_task(task)
+        task.add_done_callback(
+            lambda finished_task: self._on_job_task_done(job, finished_task)
+        )
+
     def _on_task_done(self, task: asyncio.Task[Any]) -> None:
         self._owned_tasks.discard(task)
         if task.cancelled():
@@ -120,6 +162,48 @@ class AdmissionNoticeLiteService:
             task.exception()
         except asyncio.CancelledError:
             return
+
+    def _on_job_task_done(
+        self,
+        job: _RecognitionJobRuntimeLiteV1,
+        task: asyncio.Task[Any],
+    ) -> None:
+        del task
+        self._maybe_release_job_resources(job)
+
+    def _release_resource_permit(
+        self, permit: _RecognitionIngestionPermitLiteV1
+    ) -> None:
+        if permit.released:
+            return
+        if self._resource_permits_by_owner.get(permit.owner_key) is not permit:
+            raise RuntimeError("Admission Notice Lite resource permit mismatch")
+        self._resource_permits_by_owner.pop(permit.owner_key, None)
+        self._invalidated_owner_keys.discard(permit.owner_key)
+        permit.ingestion_task = None
+        permit.released = True
+
+    def _maybe_release_job_resources(
+        self,
+        job: _RecognitionJobRuntimeLiteV1,
+        *,
+        supervisor_unwinding: bool = False,
+    ) -> None:
+        supervisor = job.supervisor_task
+        processor = job.processor_task
+        if (
+            not supervisor_unwinding
+            and supervisor is not None
+            and not supervisor.done()
+        ):
+            return
+        if processor is not None and not processor.done():
+            return
+        job.frames = ()
+        permit = job.resource_permit
+        job.resource_permit = None
+        if permit is not None:
+            self._release_resource_permit(permit)
 
     def _discard_job_locked(self, job: _RecognitionJobRuntimeLiteV1) -> None:
         if self._jobs.get(job.recognition_id) is not job:
@@ -180,7 +264,6 @@ class AdmissionNoticeLiteService:
             return
         if self._active_by_owner.get(job.owner_key) == job.recognition_id:
             self._active_by_owner.pop(job.owner_key, None)
-        self._invalidated_owner_keys.discard(job.owner_key)
         job.active_slot_released = True
 
     def _owner_is_current_locked(self, job: _RecognitionJobRuntimeLiteV1) -> bool:
@@ -209,6 +292,7 @@ class AdmissionNoticeLiteService:
             _TERMINAL_RETENTION_SECONDS,
             float(self._config.recognition_ttl_seconds),
         )
+        job.frames = ()
         self._release_active_slot_locked(job)
         self._schedule_terminal_retention_locked(job)
         self._trim_terminal_jobs_locked()
@@ -289,13 +373,10 @@ class AdmissionNoticeLiteService:
             if task is not current and not task.done():
                 task.cancel()
 
-    async def create_recognition(self, owning_session_id: str) -> RecognitionJobLiteV1:
-        loop = self._bind_event_loop()
-        if self._processor is None:
-            raise AdmissionNoticeLiteError(
-                RecognitionErrorReasonLiteV1.SERVICE_UNAVAILABLE
-            )
-
+    async def begin_ingestion(
+        self, owning_session_id: str
+    ) -> _RecognitionIngestionPermitLiteV1:
+        self._bind_event_loop()
         owning_session = self._session_lookup(owning_session_id)
         if owning_session is None:
             raise AdmissionNoticeLiteError(
@@ -307,8 +388,7 @@ class AdmissionNoticeLiteService:
         async with self._lock:
             tasks_to_cancel = self._expire_due_jobs_locked(now)
             self._purge_terminal_jobs_locked(now)
-
-            if not self._accepting:
+            if not self._accepting or self._processor is None:
                 error = AdmissionNoticeLiteError(
                     RecognitionErrorReasonLiteV1.SERVICE_UNAVAILABLE
                 )
@@ -318,39 +398,128 @@ class AdmissionNoticeLiteService:
                 )
             else:
                 owner_key = id(owning_session)
-                if owner_key in self._active_by_owner:
+                if owner_key in self._resource_permits_by_owner:
                     error = AdmissionNoticeLiteError(
                         RecognitionErrorReasonLiteV1.RECOGNITION_ALREADY_ACTIVE
                     )
                 elif (
-                    len(self._active_by_owner)
+                    len(self._resource_permits_by_owner)
                     >= self._config.max_global_recognition_jobs
                 ):
                     error = AdmissionNoticeLiteError(
                         RecognitionErrorReasonLiteV1.SERVICE_BUSY
                     )
                 else:
-                    recognition_id = self._new_recognition_id_locked()
-                    job = _RecognitionJobRuntimeLiteV1(
-                        recognition_id=recognition_id,
+                    permit = _RecognitionIngestionPermitLiteV1(
                         owning_session_id=owning_session_id,
                         owning_session=owning_session,
                         owner_key=owner_key,
-                        state=RecognitionStateLiteV1.CREATED,
-                        created_at_monotonic=now,
-                        expires_at_monotonic=(
-                            now + self._config.recognition_ttl_seconds
-                        ),
-                        cancel_event=asyncio.Event(),
+                        ingestion_task=asyncio.current_task(),
                     )
-                    self._jobs[recognition_id] = job
-                    self._active_by_owner[owner_key] = recognition_id
+                    self._resource_permits_by_owner[owner_key] = permit
+                    error = None
+
+        self._cancel_tasks(tasks_to_cancel)
+        if error is not None:
+            raise error
+        return permit
+
+    def release_ingestion(self, permit: _RecognitionIngestionPermitLiteV1) -> None:
+        if not permit.transferred:
+            self._release_resource_permit(permit)
+
+    @staticmethod
+    def ingestion_cancel_reason(
+        permit: _RecognitionIngestionPermitLiteV1,
+    ) -> RecognitionErrorReasonLiteV1 | None:
+        return permit.cancel_reason
+
+    async def create_recognition(
+        self,
+        permit: _RecognitionIngestionPermitLiteV1,
+        frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
+    ) -> RecognitionJobLiteV1:
+        if (
+            type(frames) is not tuple
+            or not 1 <= len(frames) <= 3
+            or any(
+                not isinstance(frame, ValidatedAdmissionFrameLiteV1) for frame in frames
+            )
+            or tuple(frame.frame_index for frame in frames)
+            != tuple(range(1, len(frames) + 1))
+        ):
+            raise ValueError("frames must be a contiguous validated tuple")
+
+        loop = self._bind_event_loop()
+        now = self._clock()
+        tasks_to_cancel: list[asyncio.Task[Any]]
+        async with self._lock:
+            tasks_to_cancel = self._expire_due_jobs_locked(now)
+            self._purge_terminal_jobs_locked(now)
+
+            if (
+                permit.released
+                or permit.transferred
+                or self._resource_permits_by_owner.get(permit.owner_key) is not permit
+                or not self._accepting
+                or self._processor is None
+            ):
+                error = AdmissionNoticeLiteError(
+                    RecognitionErrorReasonLiteV1.SERVICE_UNAVAILABLE
+                )
+            elif (
+                permit.owner_key in self._invalidated_owner_keys
+                or self._session_lookup(permit.owning_session_id)
+                is not permit.owning_session
+            ):
+                error = AdmissionNoticeLiteError(
+                    RecognitionErrorReasonLiteV1.RECOGNITION_NOT_FOUND
+                )
+            elif permit.owner_key in self._active_by_owner:
+                error = AdmissionNoticeLiteError(
+                    RecognitionErrorReasonLiteV1.RECOGNITION_ALREADY_ACTIVE
+                )
+            elif len(self._active_by_owner) >= self._config.max_global_recognition_jobs:
+                error = AdmissionNoticeLiteError(
+                    RecognitionErrorReasonLiteV1.SERVICE_BUSY
+                )
+            else:
+                owning_session_id = permit.owning_session_id
+                owning_session = permit.owning_session
+                owner_key = permit.owner_key
+                recognition_id = self._new_recognition_id_locked()
+                job = _RecognitionJobRuntimeLiteV1(
+                    recognition_id=recognition_id,
+                    owning_session_id=owning_session_id,
+                    owning_session=owning_session,
+                    owner_key=owner_key,
+                    state=RecognitionStateLiteV1.CREATED,
+                    created_at_monotonic=now,
+                    expires_at_monotonic=(now + self._config.recognition_ttl_seconds),
+                    cancel_event=asyncio.Event(),
+                    frames=frames,
+                    resource_permit=permit,
+                )
+                self._jobs[recognition_id] = job
+                self._active_by_owner[owner_key] = recognition_id
+                job_coroutine = self._run_job(job)
+                try:
                     supervisor = loop.create_task(
-                        self._run_job(job),
+                        job_coroutine,
                         name=f"admission-lite-job-{recognition_id}",
                     )
+                except RuntimeError:
+                    job_coroutine.close()
+                    self._jobs.pop(recognition_id, None)
+                    self._active_by_owner.pop(owner_key, None)
+                    error = AdmissionNoticeLiteError(
+                        RecognitionErrorReasonLiteV1.INTERNAL_ERROR
+                    )
+                else:
+                    permit.transferred = True
+                    permit.ingestion_task = None
                     job.supervisor_task = supervisor
-                    self._track_task(supervisor)
+                    self._track_job_task(supervisor, job)
                     snapshot = job.snapshot()
                     error = None
 
@@ -362,6 +531,7 @@ class AdmissionNoticeLiteService:
     async def _run_job(self, job: _RecognitionJobRuntimeLiteV1) -> None:
         processor_task: asyncio.Task[None] | None = None
         cancel_waiter: asyncio.Task[bool] | None = None
+        frames: tuple[ValidatedAdmissionFrameLiteV1, ...] = ()
         try:
             async with self._lock:
                 now = self._clock()
@@ -395,6 +565,15 @@ class AdmissionNoticeLiteService:
                     job.cancel_event.set()
                     return
                 job.state = RecognitionStateLiteV1.PROCESSING
+                frames = job.frames
+                if not frames:
+                    self._transition_terminal_locked(
+                        job,
+                        state=RecognitionStateLiteV1.FAILED,
+                        reason=RecognitionErrorReasonLiteV1.INTERNAL_ERROR,
+                        now=now,
+                    )
+                    return
 
             context = RecognitionJobContextLiteV1(
                 recognition_id=job.recognition_id,
@@ -410,11 +589,11 @@ class AdmissionNoticeLiteService:
 
             loop = self._bind_event_loop()
             processor_task = loop.create_task(
-                processor.process(context),
+                processor.process(context, frames),
                 name=f"admission-lite-processor-{job.recognition_id}",
             )
             job.processor_task = processor_task
-            self._track_task(processor_task)
+            self._track_job_task(processor_task, job)
             cancel_waiter = loop.create_task(job.cancel_event.wait())
             self._track_task(cancel_waiter)
 
@@ -459,6 +638,11 @@ class AdmissionNoticeLiteService:
             for task in (cancel_waiter, processor_task):
                 if task is not None and not task.done():
                     task.cancel()
+            frames = ()
+            self._maybe_release_job_resources(
+                job,
+                supervisor_unwinding=True,
+            )
 
     async def _finish_completed(self, job: _RecognitionJobRuntimeLiteV1) -> None:
         async with self._lock:
@@ -593,9 +777,37 @@ class AdmissionNoticeLiteService:
 
         del owning_session_id
         owner_key = id(owning_session)
-        if owner_key not in self._active_by_owner:
+        permit = self._resource_permits_by_owner.get(owner_key)
+        if permit is None:
             return
         self._invalidated_owner_keys.add(owner_key)
+        if not permit.transferred:
+            permit.cancel_reason = RecognitionErrorReasonLiteV1.RECOGNITION_NOT_FOUND
+            ingestion_task = permit.ingestion_task
+            loop = self._event_loop
+            if (
+                ingestion_task is None
+                or ingestion_task.done()
+                or loop is None
+                or loop.is_closed()
+            ):
+                return
+
+            def cancel_ingestion() -> None:
+                if not ingestion_task.done():
+                    ingestion_task.cancel()
+
+            try:
+                if asyncio.get_running_loop() is loop:
+                    if asyncio.current_task() is not ingestion_task:
+                        cancel_ingestion()
+                else:
+                    loop.call_soon_threadsafe(cancel_ingestion)
+            except RuntimeError:
+                loop.call_soon_threadsafe(cancel_ingestion)
+            return
+        if owner_key not in self._active_by_owner:
+            return
 
         loop = self._event_loop
         if loop is None or loop.is_closed() or not self._accepting:
@@ -652,6 +864,13 @@ class AdmissionNoticeLiteService:
             tasks_to_cancel.extend(
                 task for task in self._owned_tasks if not task.done()
             )
+            tasks_to_cancel.extend(
+                permit.ingestion_task
+                for permit in self._resource_permits_by_owner.values()
+                if not permit.transferred
+                and permit.ingestion_task is not None
+                and not permit.ingestion_task.done()
+            )
 
         self._cancel_tasks(tasks_to_cancel)
         current = asyncio.current_task()
@@ -667,5 +886,12 @@ class AdmissionNoticeLiteService:
         async with self._lock:
             for job in tuple(self._jobs.values()):
                 self._discard_job_locked(job)
+                self._maybe_release_job_resources(job)
+            for permit in tuple(self._resource_permits_by_owner.values()):
+                task = permit.ingestion_task
+                if not permit.transferred and (task is None or task.done()):
+                    self._release_resource_permit(permit)
             self._active_by_owner.clear()
-            self._invalidated_owner_keys.clear()
+            self._invalidated_owner_keys.intersection_update(
+                self._resource_permits_by_owner
+            )
