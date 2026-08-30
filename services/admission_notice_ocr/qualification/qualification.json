@@ -11,16 +11,16 @@
     "runtime_model_download": false
   },
   "contention_notes": {
-    "backend_event_loop_max_lag_ms": 0.992,
+    "backend_event_loop_max_lag_ms": 0.622,
     "representative_avatar_workload": "not_available"
   },
   "device": "cpu",
   "font_source": "system-cjk",
   "gpu_observation": {
     "after_process_count": 0,
-    "available": true,
+    "available": false,
     "before_process_count": 0,
-    "live_inference_sample_count": 20,
+    "live_inference_sample_count": 0,
     "sidecar_allocations": []
   },
   "host": {
@@ -44,25 +44,25 @@
     "paddlex": "3.7.2"
   },
   "production_processor_path": {
-    "backend_event_loop_max_lag_ms": 0.992,
+    "backend_event_loop_max_lag_ms": 0.622,
     "builder_gate_enabled": false,
     "frame_count": 3,
     "passed": true,
-    "sidecar_model_init_ms": 1394.889,
-    "sidecar_startup_ms": 1476.9,
+    "sidecar_model_init_ms": 1336.589,
+    "sidecar_startup_ms": 1418.592,
     "span_count": 10,
     "terminal_state": "COMPLETED",
     "typed_batch_valid": true
   },
   "python_version": "3.11.16",
-  "qualification_source_sha256": "e4bea8fafc4e2e2499f2b2fa2c1c667abc15261cc6ea29c404f215841f3b0463",
+  "qualification_source_sha256": "b9c9ee00e78e0bcf318b47618145b052d4b29d9cd79ae1211688f683620d163f",
   "result": "PASS",
   "schema_version": 2,
   "selected": {
     "cache_environment_match": true,
-    "cold_startup_ms": 1739.498,
+    "cold_startup_ms": 1516.038,
     "compiled_with_cuda": false,
-    "cpu_percent": 201.122,
+    "cpu_percent": 201.156,
     "determinism": {
       "polygon_max_abs_delta": 0.0,
       "polygon_shape_stable": true,
@@ -73,7 +73,7 @@
     },
     "device": "cpu",
     "error_count": 0,
-    "first_inference_ms": 2757.384,
+    "first_inference_ms": 3017.602,
     "functional": {
       "chinese": true,
       "digits": true,
@@ -83,8 +83,8 @@
       "span_count": 3
     },
     "gpu_live_observation": {
-      "instrumentation_available": true,
-      "live_inference_samples": 4,
+      "instrumentation_available": false,
+      "live_inference_samples": 0,
       "sidecar_allocation_samples_mb": []
     },
     "isolated_cache_file_count": 0,
@@ -97,37 +97,38 @@
       ],
       "forbidden_loaded": []
     },
-    "model_init_ms": 1618.885,
+    "model_init_ms": 1389.067,
     "one_frame": {
-      "p50_ms": 2473.426,
-      "p95_ms": 2496.0,
+      "p50_ms": 2499.006,
+      "p95_ms": 2763.917,
       "samples": 8
     },
     "result": "PASS",
-    "rss_mb": 897.848,
+    "rss_mb": 889.332,
     "schema_version": 1,
+    "sidecar_source_sha256": "5fb96ca936d85c1ee1012cb5714df2d9cc2c38deb4637cc723f662256259f03d",
     "tcp_listener_count": 0,
     "thread_count": 2,
     "thread_environment_match": true,
     "three_frame": {
-      "p50_ms": 7427.84,
-      "p95_ms": 7594.802,
+      "p50_ms": 7372.383,
+      "p95_ms": 7538.487,
       "samples": 8
     },
     "two_frame": {
-      "p50_ms": 4938.255,
-      "p95_ms": 5206.592,
+      "p50_ms": 5082.903,
+      "p95_ms": 5251.855,
       "samples": 8
     }
   },
   "selected_thread_count": 2,
-  "sidecar_source_sha256": "f5ac3602a63e89ca106015f599ca4ad973dc06a1c0483db19e69f991dd5840aa",
+  "sidecar_source_sha256": "5fb96ca936d85c1ee1012cb5714df2d9cc2c38deb4637cc723f662256259f03d",
   "thread_candidates": [
     {
       "cache_environment_match": true,
-      "cold_startup_ms": 1463.968,
+      "cold_startup_ms": 2346.477,
       "compiled_with_cuda": false,
-      "cpu_percent": 100.635,
+      "cpu_percent": 100.694,
       "determinism": {
         "polygon_max_abs_delta": 0.0,
         "polygon_shape_stable": true,
@@ -138,7 +139,7 @@
       },
       "device": "cpu",
       "error_count": 0,
-      "first_inference_ms": 3283.91,
+      "first_inference_ms": 3233.549,
       "functional": {
         "chinese": true,
         "digits": true,
@@ -148,8 +149,8 @@
         "span_count": 3
       },
       "gpu_live_observation": {
-        "instrumentation_available": true,
-        "live_inference_samples": 4,
+        "instrumentation_available": false,
+        "live_inference_samples": 0,
         "sidecar_allocation_samples_mb": []
       },
       "isolated_cache_file_count": 0,
@@ -162,34 +163,35 @@
         ],
         "forbidden_loaded": []
       },
-      "model_init_ms": 1347.591,
+      "model_init_ms": 2225.794,
       "one_frame": {
-        "p50_ms": 3025.012,
-        "p95_ms": 3074.688,
+        "p50_ms": 3023.504,
+        "p95_ms": 3061.448,
         "samples": 8
       },
       "result": "PASS",
-      "rss_mb": 904.414,
+      "rss_mb": 907.551,
       "schema_version": 1,
+      "sidecar_source_sha256": "5fb96ca936d85c1ee1012cb5714df2d9cc2c38deb4637cc723f662256259f03d",
       "tcp_listener_count": 0,
       "thread_count": 1,
       "thread_environment_match": true,
       "three_frame": {
-        "p50_ms": 8979.237,
-        "p95_ms": 9395.721,
+        "p50_ms": 8988.185,
+        "p95_ms": 9157.23,
         "samples": 8
       },
       "two_frame": {
-        "p50_ms": 6164.481,
-        "p95_ms": 6259.071,
+        "p50_ms": 6368.877,
+        "p95_ms": 6540.071,
         "samples": 8
       }
     },
     {
       "cache_environment_match": true,
-      "cold_startup_ms": 1739.498,
+      "cold_startup_ms": 1516.038,
       "compiled_with_cuda": false,
-      "cpu_percent": 201.122,
+      "cpu_percent": 201.156,
       "determinism": {
         "polygon_max_abs_delta": 0.0,
         "polygon_shape_stable": true,
@@ -200,7 +202,7 @@
       },
       "device": "cpu",
       "error_count": 0,
-      "first_inference_ms": 2757.384,
+      "first_inference_ms": 3017.602,
       "functional": {
         "chinese": true,
         "digits": true,
@@ -210,8 +212,8 @@
         "span_count": 3
       },
       "gpu_live_observation": {
-        "instrumentation_available": true,
-        "live_inference_samples": 4,
+        "instrumentation_available": false,
+        "live_inference_samples": 0,
         "sidecar_allocation_samples_mb": []
       },
       "isolated_cache_file_count": 0,
@@ -224,34 +226,35 @@
         ],
         "forbidden_loaded": []
       },
-      "model_init_ms": 1618.885,
+      "model_init_ms": 1389.067,
       "one_frame": {
-        "p50_ms": 2473.426,
-        "p95_ms": 2496.0,
+        "p50_ms": 2499.006,
+        "p95_ms": 2763.917,
         "samples": 8
       },
       "result": "PASS",
-      "rss_mb": 897.848,
+      "rss_mb": 889.332,
       "schema_version": 1,
+      "sidecar_source_sha256": "5fb96ca936d85c1ee1012cb5714df2d9cc2c38deb4637cc723f662256259f03d",
       "tcp_listener_count": 0,
       "thread_count": 2,
       "thread_environment_match": true,
       "three_frame": {
-        "p50_ms": 7427.84,
-        "p95_ms": 7594.802,
+        "p50_ms": 7372.383,
+        "p95_ms": 7538.487,
         "samples": 8
       },
       "two_frame": {
-        "p50_ms": 4938.255,
-        "p95_ms": 5206.592,
+        "p50_ms": 5082.903,
+        "p95_ms": 5251.855,
         "samples": 8
       }
     },
     {
       "cache_environment_match": true,
-      "cold_startup_ms": 1492.469,
+      "cold_startup_ms": 1530.669,
       "compiled_with_cuda": false,
-      "cpu_percent": 401.209,
+      "cpu_percent": 401.2,
       "determinism": {
         "polygon_max_abs_delta": 0.0,
         "polygon_shape_stable": true,
@@ -262,7 +265,7 @@
       },
       "device": "cpu",
       "error_count": 0,
-      "first_inference_ms": 2432.056,
+      "first_inference_ms": 2248.056,
       "functional": {
         "chinese": true,
         "digits": true,
@@ -272,8 +275,8 @@
         "span_count": 3
       },
       "gpu_live_observation": {
-        "instrumentation_available": true,
-        "live_inference_samples": 4,
+        "instrumentation_available": false,
+        "live_inference_samples": 0,
         "sidecar_allocation_samples_mb": []
       },
       "isolated_cache_file_count": 0,
@@ -286,34 +289,35 @@
         ],
         "forbidden_loaded": []
       },
-      "model_init_ms": 1371.195,
+      "model_init_ms": 1380.836,
       "one_frame": {
-        "p50_ms": 2133.065,
-        "p95_ms": 2220.374,
+        "p50_ms": 2053.566,
+        "p95_ms": 2131.329,
         "samples": 8
       },
       "result": "PASS",
-      "rss_mb": 918.688,
+      "rss_mb": 904.621,
       "schema_version": 1,
+      "sidecar_source_sha256": "5fb96ca936d85c1ee1012cb5714df2d9cc2c38deb4637cc723f662256259f03d",
       "tcp_listener_count": 0,
       "thread_count": 4,
       "thread_environment_match": true,
       "three_frame": {
-        "p50_ms": 6425.669,
-        "p95_ms": 6559.214,
+        "p50_ms": 6230.718,
+        "p95_ms": 6622.443,
         "samples": 8
       },
       "two_frame": {
-        "p50_ms": 4368.999,
-        "p95_ms": 4515.249,
+        "p50_ms": 4262.814,
+        "p95_ms": 4348.771,
         "samples": 8
       }
     },
     {
       "cache_environment_match": true,
-      "cold_startup_ms": 1474.23,
+      "cold_startup_ms": 1498.747,
       "compiled_with_cuda": false,
-      "cpu_percent": 601.323,
+      "cpu_percent": 601.159,
       "determinism": {
         "polygon_max_abs_delta": 0.0,
         "polygon_shape_stable": true,
@@ -324,7 +328,7 @@
       },
       "device": "cpu",
       "error_count": 0,
-      "first_inference_ms": 2413.47,
+      "first_inference_ms": 2347.366,
       "functional": {
         "chinese": true,
         "digits": true,
@@ -334,8 +338,8 @@
         "span_count": 3
       },
       "gpu_live_observation": {
-        "instrumentation_available": true,
-        "live_inference_samples": 4,
+        "instrumentation_available": false,
+        "live_inference_samples": 0,
         "sidecar_allocation_samples_mb": []
       },
       "isolated_cache_file_count": 0,
@@ -348,34 +352,35 @@
         ],
         "forbidden_loaded": []
       },
-      "model_init_ms": 1363.347,
+      "model_init_ms": 1386.038,
       "one_frame": {
-        "p50_ms": 2146.534,
-        "p95_ms": 2214.897,
+        "p50_ms": 2222.58,
+        "p95_ms": 2276.283,
         "samples": 8
       },
       "result": "PASS",
-      "rss_mb": 905.754,
+      "rss_mb": 911.57,
       "schema_version": 1,
+      "sidecar_source_sha256": "5fb96ca936d85c1ee1012cb5714df2d9cc2c38deb4637cc723f662256259f03d",
       "tcp_listener_count": 0,
       "thread_count": 6,
       "thread_environment_match": true,
       "three_frame": {
-        "p50_ms": 6741.686,
-        "p95_ms": 7115.935,
+        "p50_ms": 6311.95,
+        "p95_ms": 6384.489,
         "samples": 8
       },
       "two_frame": {
-        "p50_ms": 4505.762,
-        "p95_ms": 4801.567,
+        "p50_ms": 4647.327,
+        "p95_ms": 4963.013,
         "samples": 8
       }
     },
     {
       "cache_environment_match": true,
-      "cold_startup_ms": 1453.507,
+      "cold_startup_ms": 1457.767,
       "compiled_with_cuda": false,
-      "cpu_percent": 801.452,
+      "cpu_percent": 801.304,
       "determinism": {
         "polygon_max_abs_delta": 0.0,
         "polygon_shape_stable": true,
@@ -386,7 +391,7 @@
       },
       "device": "cpu",
       "error_count": 0,
-      "first_inference_ms": 2406.72,
+      "first_inference_ms": 2402.057,
       "functional": {
         "chinese": true,
         "digits": true,
@@ -396,8 +401,8 @@
         "span_count": 3
       },
       "gpu_live_observation": {
-        "instrumentation_available": true,
-        "live_inference_samples": 4,
+        "instrumentation_available": false,
+        "live_inference_samples": 0,
         "sidecar_allocation_samples_mb": []
       },
       "isolated_cache_file_count": 0,
@@ -410,29 +415,30 @@
         ],
         "forbidden_loaded": []
       },
-      "model_init_ms": 1344.093,
+      "model_init_ms": 1352.109,
       "one_frame": {
-        "p50_ms": 2210.402,
-        "p95_ms": 2325.707,
+        "p50_ms": 2260.501,
+        "p95_ms": 2296.948,
         "samples": 8
       },
       "result": "PASS",
-      "rss_mb": 896.422,
+      "rss_mb": 913.68,
       "schema_version": 1,
+      "sidecar_source_sha256": "5fb96ca936d85c1ee1012cb5714df2d9cc2c38deb4637cc723f662256259f03d",
       "tcp_listener_count": 0,
       "thread_count": 8,
       "thread_environment_match": true,
       "three_frame": {
-        "p50_ms": 7249.996,
-        "p95_ms": 7520.312,
+        "p50_ms": 6579.308,
+        "p95_ms": 6648.769,
         "samples": 8
       },
       "two_frame": {
-        "p50_ms": 4813.794,
-        "p95_ms": 5014.263,
+        "p50_ms": 4519.415,
+        "p95_ms": 4664.478,
         "samples": 8
       }
     }
   ],
-  "timestamp": "2026-08-30T16:11:49.110050+00:00"
+  "timestamp": "2026-08-30T18:36:47.482728+00:00"
 }

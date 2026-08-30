@@ -71,10 +71,25 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError("non-finite JSON number")
 
 
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object member")
+        value[key] = item
+    return value
+
+
 def _decode_json_object(payload: bytes) -> dict[str, Any]:
     try:
         decoded = payload.decode("utf-8")
-        value = json.loads(decoded, parse_constant=_reject_json_constant)
+        value = json.loads(
+            decoded,
+            object_pairs_hook=_reject_duplicate_json_object,
+            parse_constant=_reject_json_constant,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise _error(OcrFailureCodeLiteV1.OCR_PROTOCOL_ERROR) from None
     if type(value) is not dict:

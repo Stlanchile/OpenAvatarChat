@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -23,6 +24,8 @@ from service.service_data_models.admission_notice_lite_config import (
 )
 
 _ROUTE_BASE = "/api/v1/sessions/{session_id}/admission-notice/recognitions"
+_CONTENT_LENGTH_HEADER_DIGIT_LIMIT = 16
+_CONTENT_LENGTH_PATTERN = re.compile(r"[0-9]+")
 _ERROR_STATUS = {
     RecognitionErrorReasonLiteV1.INVALID_REQUEST: 400,
     RecognitionErrorReasonLiteV1.INVALID_IMAGE: 422,
@@ -65,15 +68,19 @@ def _status_content(job: RecognitionJobLiteV1) -> dict[str, str]:
 def _has_unsupported_control_input(request: Request) -> bool:
     if request.query_params:
         return True
-    if request.headers.get("transfer-encoding") is not None:
+    if request.headers.getlist("transfer-encoding"):
         return True
-    content_length = request.headers.get("content-length")
-    if content_length is None:
+    content_lengths = request.headers.getlist("content-length")
+    if not content_lengths:
         return False
-    try:
-        return int(content_length) != 0
-    except ValueError:
+    if len(content_lengths) != 1:
         return True
+    content_length = content_lengths[0]
+    return (
+        len(content_length) > _CONTENT_LENGTH_HEADER_DIGIT_LIMIT
+        or _CONTENT_LENGTH_PATTERN.fullmatch(content_length) is None
+        or int(content_length) != 0
+    )
 
 
 def register_admission_notice_lite_routes(

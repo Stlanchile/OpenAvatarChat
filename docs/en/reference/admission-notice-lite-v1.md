@@ -641,7 +641,8 @@ the selected backend is `paddle_static`, the device is CPU, and the selected
 thread count is two. The report records successful real AF_UNIX integration,
 the real backend client and isolated sidecar, typed `OcrBatchLiteV1`, offline
 model use, and a production-shaped processor path reaching `COMPLETED`. GPU
-instrumentation collected live samples and observed no sidecar allocation.
+instrumentation was unavailable on the qualification host, so the report makes
+no live GPU-allocation claim; its available pre/post process counts were zero.
 The earlier schema-v1 `PASS` remains stale and is not accepted.
 
 Qualification has two explicit dependency lanes. The sidecar-only command runs
@@ -658,6 +659,12 @@ It verifies the exact hashed CPU wheel and installed RECORD files, model
 manifest, fresh offline cache roots, CPU device, loaded libraries, GPU
 observation where available, determinism, startup, model initialization,
 first/warmed latency, RSS, CPU, errors, and the `1, 2, 4, 6, 8` thread matrix.
+The v1 production thread count remains the manifest's frozen value during
+source requalification. Its candidate MUST remain deterministic, error-free,
+cache-isolated, and below the 30-second three-frame timeout; comparative matrix
+timings do not silently retune the immutable v1 runtime tuple. Every candidate
+reports the source identity it executed, and both qualification lanes require
+their regular-file source hashes to remain unchanged from start through PASS.
 Its ignored `qualification/sidecar-qualification.json` is intermediate
 evidence only. A sidecar-only `PASS` cannot produce a final qualification or
 enable production.
@@ -742,13 +749,21 @@ Prompts, tests, and output policy MUST prohibit claims such as `verified`,
 
 ## Privacy, Logging, and Authenticity
 
-Images, OCR text, polygons, scores, extracted fields, typed context, prompts,
-and session correlation values MUST NOT enter persistent storage, ordinary
-history, telemetry payloads, or TTS as separate data. Logs may contain an
-opaque recognition identifier, payload-free reason codes, counts, coarse
-states, and durations. Logs MUST NOT contain filenames, session identifiers,
-prompts, OCR, extracted personal fields, image content, request bodies, or raw
-exception text.
+Lite-owned code MUST NOT write images, OCR text, polygons, scores, extracted
+fields, typed context, prompts, or its session correlation values to persistent
+storage, ordinary history, telemetry payloads, or TTS as separate data.
+Lite-owned logs may contain an opaque recognition identifier, payload-free
+reason codes, counts, coarse states, and durations. They MUST NOT contain
+filenames, session identifiers, prompts, OCR, extracted personal fields, image
+content, request bodies, or raw exception text. This boundary does not
+retroactively redefine unrelated baseline handler lifecycle logs, which MUST
+NOT be augmented with any Lite event or payload.
+
+Because the Lite route path contains the session correlation value, request
+target access logging MUST be disabled or redacted anywhere the route is
+served. The bundled Uvicorn entry point disables its access log whenever Lite
+is enabled and suppresses informational Uvicorn WebSocket target logs. A
+deployment proxy MUST enforce the same boundary.
 
 All success, failure, cancellation, disconnect, replacement, and expiry paths
 MUST release transient references. Document-originated instructions MUST remain

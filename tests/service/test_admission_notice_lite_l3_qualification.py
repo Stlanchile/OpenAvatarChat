@@ -40,7 +40,7 @@ APPROVED_MODEL_MANIFEST_SHA256 = (
     "1de89743e56affd2a220ae90fa2ce383bc8856714400737a5e4828beb0cd012b"
 )
 PREAPPROVAL_QUALIFICATION_SOURCE_SHA256 = (
-    "e4bea8fafc4e2e2499f2b2fa2c1c667abc15261cc6ea29c404f215841f3b0463"
+    "b9c9ee00e78e0bcf318b47618145b052d4b29d9cd79ae1211688f683620d163f"
 )
 
 
@@ -51,6 +51,7 @@ def _pass_sidecar_evidence() -> dict:
     manifest_sha256 = (
         __import__("hashlib").sha256(manifest_path.read_bytes()).hexdigest()
     )
+    sidecar_source_sha256 = integration_qualify._sidecar_source_sha256()
     candidates = [
         {
             "cache_environment_match": True,
@@ -88,6 +89,7 @@ def _pass_sidecar_evidence() -> dict:
             "tcp_listener_count": 0,
             "thread_count": thread_count,
             "thread_environment_match": True,
+            "sidecar_source_sha256": sidecar_source_sha256,
             "three_frame": {
                 "p50_ms": 3000.0,
                 "p95_ms": 3300.0,
@@ -143,7 +145,7 @@ def _pass_sidecar_evidence() -> dict:
         "scope": "sidecar_only",
         "selected": candidates[1],
         "selected_thread_count": 2,
-        "sidecar_source_sha256": integration_qualify._sidecar_source_sha256(),
+        "sidecar_source_sha256": sidecar_source_sha256,
         "thread_candidates": candidates,
         "timestamp": "2026-08-30T00:00:00+00:00",
     }
@@ -266,6 +268,40 @@ def test_sidecar_pass_requires_live_samples_when_gpu_instrumentation_exists() ->
     evidence["gpu_observation"]["available"] = True
     evidence["gpu_observation"]["live_inference_sample_count"] = 0
     assert not integration_qualify._valid_pass_sidecar_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda selected: selected.update(first_inference_ms=30_000.0),
+        lambda selected: selected["three_frame"].update(p95_ms=30_000.0),
+        lambda selected: selected["determinism"].update(
+            polygon_max_abs_delta=0.000_000_001
+        ),
+        lambda selected: selected["determinism"].update(
+            score_max_abs_delta=0.000_000_001
+        ),
+        lambda selected: selected.update(sidecar_source_sha256="0" * 64),
+    ),
+)
+def test_sidecar_pass_requires_bounded_deterministic_production_candidate(
+    mutation,
+) -> None:
+    evidence = _pass_sidecar_evidence()
+    mutation(evidence["selected"])
+    assert not integration_qualify._valid_pass_sidecar_evidence(evidence)
+
+
+def test_qualification_provenance_includes_runtime_config_and_initializers() -> None:
+    assert {
+        "src/service/__init__.py",
+        "src/service/service_data_models/__init__.py",
+        "src/service/service_data_models/admission_notice_lite_config.py",
+    }.issubset(integration_qualify._MAIN_SOURCE_PATHS)
+    assert (
+        "services/admission_notice_ocr/src/admission_notice_ocr/__init__.py"
+        in integration_qualify._SIDECAR_SOURCE_PATHS
+    )
 
 
 def test_sidecar_command_and_environment_are_explicit_and_sanitized(
@@ -395,6 +431,67 @@ def test_sidecar_startup_timeout_is_bounded(
             offline_prefix=(),
         )
     assert process.terminated
+
+
+def test_sidecar_ready_evidence_requires_exact_pid_and_finite_timings(
+    tmp_path: Path,
+) -> None:
+    class Process:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    valid = {
+        "cache_environment_match": True,
+        "model_init_ms": 1.0,
+        "pid": Process.pid,
+        "startup_ms": 2.0,
+        "thread_environment_match": True,
+    }
+    ready_file = tmp_path / "ready.json"
+    _write_json(ready_file, valid)
+    assert integration_qualify._wait_ready(Process(), ready_file) == valid
+
+    for key, invalid_value in (
+        ("pid", Process.pid + 1),
+        ("model_init_ms", -1.0),
+        ("model_init_ms", "1.0"),
+        ("startup_ms", -1.0),
+        ("startup_ms", "2.0"),
+    ):
+        invalid = dict(valid)
+        invalid[key] = invalid_value
+        _write_json(ready_file, invalid)
+        with pytest.raises(
+            integration_qualify.QualificationFailed,
+            match="SIDECAR_READY_INVALID",
+        ):
+            integration_qualify._wait_ready(Process(), ready_file)
+
+
+def test_qualification_json_rejects_duplicate_members_and_source_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text('{"result":"PASS","result":"FAIL"}', encoding="utf-8")
+    with pytest.raises(
+        integration_qualify.QualificationBlocked,
+        match="SIDECAR_EVIDENCE_INVALID",
+    ):
+        integration_qualify._load_json_object(duplicate, maximum_bytes=1024)
+
+    source = tmp_path / "source.py"
+    source.write_text("trusted = True\n", encoding="utf-8")
+    symlink = tmp_path / "symlink.py"
+    symlink.symlink_to(source)
+    monkeypatch.setattr(integration_qualify, "PROJECT_ROOT", tmp_path)
+    with pytest.raises(
+        integration_qualify.QualificationBlocked,
+        match="QUALIFICATION_SOURCE_UNAVAILABLE",
+    ):
+        integration_qualify._hash_paths(("symlink.py",))
 
 
 @pytest.mark.asyncio
@@ -554,6 +651,26 @@ async def test_combined_pass_requires_integration_observation(
     assert report["result"] == "PASS"
     assert report["af_unix_integration"]["passed"] is True
     assert report["production_processor_path"]["terminal_state"] == "COMPLETED"
+
+    source_sha256 = integration_qualify._qualification_source_sha256()
+    source_hashes = iter((source_sha256, "0" * 64))
+    monkeypatch.setattr(
+        integration_qualify,
+        "_qualification_source_sha256",
+        lambda: next(source_hashes),
+    )
+    changed_report = await integration_qualify.qualify_full_integration(
+        sidecar_report_path=evidence_path,
+        manifest_path=(
+            PROJECT_ROOT / "services" / "admission_notice_ocr" / "model_manifest.json"
+        ),
+        model_root=PROJECT_ROOT / "services" / "admission_notice_ocr" / "models",
+        report_path=tmp_path / "changed.json",
+        sidecar_python=integration_qualify._sidecar_python_path(),
+        font_path=None,
+    )
+    assert changed_report["result"] == "FAIL"
+    assert changed_report["failure"] == "QUALIFICATION_SOURCE_CHANGED"
     assert QUALIFIED_MODEL_MANIFEST_SHA256_LITE_V1 == APPROVED_MODEL_MANIFEST_SHA256
 
 

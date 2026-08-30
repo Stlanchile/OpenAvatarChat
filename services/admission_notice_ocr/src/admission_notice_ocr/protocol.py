@@ -59,6 +59,17 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError("non-finite JSON number")
 
 
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object member")
+        value[key] = item
+    return value
+
+
 def _exact_keys(value: dict[str, Any], expected: set[str]) -> bool:
     return set(value) == expected and all(type(key) is str for key in value)
 
@@ -66,7 +77,11 @@ def _exact_keys(value: dict[str, Any], expected: set[str]) -> bool:
 def _decode_header(payload: bytes) -> dict[str, Any]:
     try:
         decoded = payload.decode("utf-8")
-        value = json.loads(decoded, parse_constant=_reject_json_constant)
+        value = json.loads(
+            decoded,
+            object_pairs_hook=_reject_duplicate_json_object,
+            parse_constant=_reject_json_constant,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise ProtocolError() from None
     if type(value) is not dict:

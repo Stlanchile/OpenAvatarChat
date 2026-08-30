@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -47,6 +48,7 @@ _SIDECAR_SOURCE_PATHS = (
     "model_manifest.json",
     "pyproject.toml",
     "uv.lock",
+    "src/admission_notice_ocr/__init__.py",
     "src/admission_notice_ocr/app.py",
     "src/admission_notice_ocr/manifest.py",
     "src/admission_notice_ocr/pipeline.py",
@@ -104,8 +106,51 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError
 
 
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError
+        value[key] = item
+    return value
+
+
 def _service_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _source_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_regular_source(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError
+        chunks = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _source_identity(before) != _source_identity(after):
+            raise OSError
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise OSError
+        return payload
+    finally:
+        os.close(descriptor)
 
 
 def _qualification_source_sha256() -> str:
@@ -115,9 +160,10 @@ def _qualification_source_sha256() -> str:
     service_root = _service_root()
     try:
         for relative_path in _SIDECAR_SOURCE_PATHS:
+            source_path = service_root / relative_path
             digest.update(relative_path.encode("utf-8"))
             digest.update(b"\0")
-            digest.update((service_root / relative_path).read_bytes())
+            digest.update(_read_regular_source(source_path))
             digest.update(b"\0")
     except OSError:
         raise QualificationBlocked("QUALIFICATION_SOURCE_UNAVAILABLE") from None
@@ -197,7 +243,13 @@ def _candidate_manifest(
     thread_count: int,
 ) -> None:
     try:
-        value = json.loads(production_manifest.read_text(encoding="utf-8"))
+        if production_manifest.is_symlink():
+            raise OSError
+        value = json.loads(
+            production_manifest.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
+            parse_constant=_reject_json_constant,
+        )
         value["thread_count"] = thread_count
         target.write_text(
             json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -427,7 +479,9 @@ def _functional_observation(batch: list[dict[str, Any]]) -> dict[str, bool | int
     return {
         "chinese": any("\u4e00" <= character <= "\u9fff" for character in joined),
         "digits": any(character.isdigit() for character in joined),
-        "latin": any("A" <= character <= "z" for character in joined),
+        "latin": any(
+            "A" <= character <= "Z" or "a" <= character <= "z" for character in joined
+        ),
         "polygon": all(len(span["polygon"]) == 4 for span in spans),
         "score": all(_finite_unit(span["score"]) for span in spans),
         "span_count": len(spans),
@@ -521,9 +575,11 @@ def _measure_candidate_worker(
     font_path: Path | None,
     samples: int,
 ) -> dict[str, Any]:
+    initial_source_sha256 = _qualification_source_sha256()
     report: dict[str, Any] = {
         "result": "FAIL",
         "schema_version": CANDIDATE_REPORT_SCHEMA_VERSION,
+        "sidecar_source_sha256": initial_source_sha256,
     }
     try:
         verified = load_and_verify_manifest(manifest_path, model_root)
@@ -647,6 +703,8 @@ def _measure_candidate_worker(
         )
         if report["tcp_listener_count"] not in (0, None):
             raise QualificationFailed("TCP_LISTENER_OBSERVED")
+        if _qualification_source_sha256() != initial_source_sha256:
+            raise QualificationFailed("QUALIFICATION_SOURCE_CHANGED")
     except QualificationBlocked as error:
         report["blocker"] = error.code
         report["result"] = "BLOCKED"
@@ -681,11 +739,14 @@ def _clean_worker_environment(temporary_root: Path) -> dict[str, str]:
 
 def _read_candidate_report(path: Path) -> dict[str, Any]:
     try:
+        if path.is_symlink():
+            raise OSError
         raw = path.read_bytes()
         if not 1 <= len(raw) <= MAX_CANDIDATE_REPORT_BYTES:
             raise ValueError
         value = json.loads(
             raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
             parse_constant=_reject_json_constant,
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
@@ -708,6 +769,7 @@ def _run_candidate(
     font_path: Path | None,
     samples: int,
 ) -> dict[str, Any]:
+    initial_source_sha256 = _qualification_source_sha256()
     with tempfile.TemporaryDirectory(
         prefix="admission-ocr-sidecar-qualification-"
     ) as temporary:
@@ -747,6 +809,11 @@ def _run_candidate(
         except OSError:
             raise QualificationBlocked("CANDIDATE_PROCESS_UNAVAILABLE") from None
         candidate = _read_candidate_report(candidate_report)
+        if (
+            candidate.get("sidecar_source_sha256") != initial_source_sha256
+            or _qualification_source_sha256() != initial_source_sha256
+        ):
+            raise QualificationFailed("QUALIFICATION_SOURCE_CHANGED")
         if candidate["result"] == "BLOCKED":
             raise QualificationBlocked(candidate.get("blocker", "CANDIDATE_BLOCKED"))
         if candidate["result"] == "FAIL" or completed.returncode != 0:
@@ -754,20 +821,38 @@ def _run_candidate(
         return candidate
 
 
-def _select_thread(candidate_reports: list[dict[str, Any]]) -> int:
-    fastest = min(report["one_frame"]["p50_ms"] for report in candidate_reports)
-    eligible = sorted(
-        report["thread_count"]
-        for report in candidate_reports
-        if report["error_count"] == 0
-        and report["one_frame"]["p50_ms"] <= fastest * 1.25
-        and report["cache_environment_match"]
-        and report["isolated_cache_model_file_count"] == 0
-        and report["thread_environment_match"]
-    )
-    if not eligible:
+def _select_thread(
+    candidate_reports: list[dict[str, Any]],
+    *,
+    production_thread_count: int,
+) -> int:
+    try:
+        candidate = next(
+            report
+            for report in candidate_reports
+            if report["thread_count"] == production_thread_count
+        )
+        determinism = candidate["determinism"]
+        production_candidate_is_stable = (
+            candidate["result"] == "PASS"
+            and candidate["error_count"] == 0
+            and candidate["cache_environment_match"] is True
+            and candidate["isolated_cache_model_file_count"] == 0
+            and candidate["thread_environment_match"] is True
+            and candidate["first_inference_ms"] < 30_000
+            and candidate["three_frame"]["p95_ms"] < 30_000
+            and determinism["polygon_max_abs_delta"] == 0.0
+            and determinism["polygon_shape_stable"] is True
+            and determinism["score_max_abs_delta"] == 0.0
+            and determinism["score_shape_stable"] is True
+            and determinism["span_count_stable"] is True
+            and determinism["span_text_stable"] is True
+        )
+    except (KeyError, StopIteration, TypeError):
+        production_candidate_is_stable = False
+    if not production_candidate_is_stable:
         raise QualificationFailed("NO_STABLE_THREAD_CANDIDATE")
-    return eligible[0]
+    return production_thread_count
 
 
 def _cpu_description() -> str:
@@ -788,11 +873,12 @@ def qualify_sidecar(
     font_path: Path | None,
     samples: int,
 ) -> dict[str, Any]:
+    initial_source_sha256 = _qualification_source_sha256()
     report: dict[str, Any] = {
         "result": "BLOCKED",
         "schema_version": SIDECAR_REPORT_SCHEMA_VERSION,
         "scope": "sidecar_only",
-        "sidecar_source_sha256": _qualification_source_sha256(),
+        "sidecar_source_sha256": initial_source_sha256,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     try:
@@ -840,7 +926,10 @@ def qualify_sidecar(
             and candidate["isolated_cache_model_file_count"] == 0
             for candidate in candidate_reports
         )
-        selected_thread_count = _select_thread(candidate_reports)
+        selected_thread_count = _select_thread(
+            candidate_reports,
+            production_thread_count=verified.thread_count,
+        )
         selected = next(
             candidate
             for candidate in candidate_reports
@@ -859,6 +948,8 @@ def qualify_sidecar(
             )
         ) and live_gpu_samples < 1:
             raise QualificationFailed("GPU_LIVE_OBSERVATION_FAILED")
+        if _qualification_source_sha256() != initial_source_sha256:
+            raise QualificationFailed("QUALIFICATION_SOURCE_CHANGED")
 
         report.update(
             {

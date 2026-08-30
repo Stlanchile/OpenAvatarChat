@@ -18,6 +18,7 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 DOCUMENT_PATH = (
     PROJECT_ROOT / "docs" / "en" / "reference" / "admission-notice-lite-v1.md"
 )
+DEMO_PATH = PROJECT_ROOT / "src" / "demo.py"
 PRODUCTION_CONFIG_PATHS = (
     PROJECT_ROOT
     / "src"
@@ -115,6 +116,41 @@ def test_feature_defaults_to_disabled() -> None:
     assert config.model_config["extra"] == "forbid"
     assert config.model_config["frozen"] is True
     assert config.model_config["hide_input_in_errors"] is True
+
+
+def test_lite_enabled_suppresses_session_bearing_uvicorn_request_logs() -> None:
+    tree = ast.parse(DEMO_PATH.read_text(encoding="utf-8"))
+    uvicorn_config_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "uvicorn"
+        and node.func.attr == "Config"
+    ]
+    assert len(uvicorn_config_calls) == 1
+    access_log_keywords = [
+        keyword
+        for keyword in uvicorn_config_calls[0].keywords
+        if keyword.arg == "access_log"
+    ]
+    assert len(access_log_keywords) == 1
+    assert ast.unparse(access_log_keywords[0].value) == (
+        "not service_config.admission_notice_lite.enabled"
+    )
+    log_level_keywords = [
+        keyword
+        for keyword in uvicorn_config_calls[0].keywords
+        if keyword.arg == "log_level"
+    ]
+    assert len(log_level_keywords) == 1
+    assert ast.unparse(log_level_keywords[0].value) == (
+        "'warning' if service_config.admission_notice_lite.enabled else 'info'"
+    )
+
+    document = DOCUMENT_PATH.read_text(encoding="utf-8")
+    assert "target access logging MUST be disabled or redacted" in document
 
 
 def test_explicit_false_is_accepted() -> None:

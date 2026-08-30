@@ -125,7 +125,16 @@ def main():
 
     ssl_context = create_ssl_context(args, service_config)
 
-    uvicorn_config = uvicorn.Config(demo_app, host=service_config.host, port=service_config.port, **ssl_context)
+    uvicorn_config = uvicorn.Config(
+        demo_app,
+        host=service_config.host,
+        port=service_config.port,
+        access_log=not service_config.admission_notice_lite.enabled,
+        log_level=(
+            "warning" if service_config.admission_notice_lite.enabled else "info"
+        ),
+        **ssl_context,
+    )
     server = OpenAvatarChatWebServer(
         chat_engine,
         uvicorn_config,

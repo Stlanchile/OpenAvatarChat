@@ -28,7 +28,12 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SIDECAR_SOURCE) not in sys.path:
     sys.path.insert(0, str(SIDECAR_SOURCE))
 
-from admission_notice_ocr.app import OcrSidecarServer, SidecarStartupError
+from admission_notice_ocr import provision_models, sidecar_qualify
+from admission_notice_ocr.app import (
+    OcrSidecarServer,
+    SidecarStartupError,
+    _write_ready_file,
+)
 from admission_notice_ocr.manifest import (
     BACKEND,
     DEVICE,
@@ -41,7 +46,6 @@ from admission_notice_ocr.manifest import (
 )
 from admission_notice_ocr.pipeline import PipelineError, _convert_result, decode_frame
 from admission_notice_ocr.protocol import (
-    ErrorCode,
     FRAME_PREFIX,
     MAX_HEADER_BYTES,
     MAX_JPEG_BYTES,
@@ -49,12 +53,16 @@ from admission_notice_ocr.protocol import (
     REQUEST_MAGIC,
     RESPONSE_MAGIC,
     SCHEMA_VERSION,
+    ErrorCode,
     FrameRequest,
+    ProtocolError,
+    _decode_header,
     encode_error,
     encode_ocr,
     encode_ping,
     read_request,
 )
+from scripts import admission_notice_lite_l3_qualify as integration_qualify
 from service.admission_notice_lite_contracts import (
     MAX_OCR_AGGREGATE_CHARACTERS_PER_FRAME_LITE_V1,
     MAX_OCR_CHARACTERS_PER_SPAN_LITE_V1,
@@ -75,16 +83,16 @@ from service.admission_notice_lite_ocr import (
     AdmissionNoticeOcrErrorLiteV1,
     AdmissionNoticeOcrProcessorLiteV1,
     OcrFailureCodeLiteV1,
+    _decode_json_object,
     _encode_ocr_request,
     _encode_ping_request,
     _parse_runtime_identity,
     build_qualified_admission_notice_ocr_processor_lite_v1,
 )
+from service.admission_notice_lite_service import AdmissionNoticeLiteService
 from service.service_data_models.admission_notice_lite_config import (
     AdmissionNoticeLiteFeatureConfigV1,
 )
-from service.admission_notice_lite_service import AdmissionNoticeLiteService
-from scripts import admission_notice_lite_l3_qualify as integration_qualify
 
 APPROVED_MODEL_MANIFEST_SHA256 = (
     "1de89743e56affd2a220ae90fa2ce383bc8856714400737a5e4828beb0cd012b"
@@ -389,6 +397,15 @@ def test_runtime_identity_is_small_fixed_cpu_diagnostic_summary() -> None:
             paddlex_version="3.7.2",
             model_manifest_sha256="a" * 64,
         )
+
+
+def test_protocol_json_rejects_duplicate_object_members() -> None:
+    with pytest.raises(ProtocolError):
+        _decode_header(b'{"schema_version":1,"operation":"ocr","operation":"ping"}')
+
+    with pytest.raises(AdmissionNoticeOcrErrorLiteV1) as backend_error:
+        _decode_json_object(b'{"schema_version":1,"status":"error","status":"ok"}')
+    assert backend_error.value.code is OcrFailureCodeLiteV1.OCR_PROTOCOL_ERROR
 
 
 @requires_af_unix
@@ -883,6 +900,48 @@ async def test_sidecar_replaces_only_its_owned_stale_socket(tmp_path: Path) -> N
     assert regular_path.read_text(encoding="utf-8") == "do not unlink"
 
 
+def test_ready_file_is_published_complete_exclusively_and_privately(
+    tmp_path: Path,
+) -> None:
+    ready_file = tmp_path / "ready.json"
+    runtime_cache = tmp_path / "runtime-cache"
+    _write_ready_file(
+        ready_file,
+        model_init_ms=1.0,
+        startup_ms=2.0,
+        thread_count=2,
+        runtime_cache=runtime_cache,
+    )
+    ready = json.loads(ready_file.read_text(encoding="utf-8"))
+    assert ready["pid"] == os.getpid()
+    assert ready["model_init_ms"] == 1.0
+    assert ready["startup_ms"] == 2.0
+    assert stat.S_IMODE(ready_file.stat().st_mode) == 0o600
+
+    with pytest.raises(SidecarStartupError):
+        _write_ready_file(
+            ready_file,
+            model_init_ms=1.0,
+            startup_ms=2.0,
+            thread_count=2,
+            runtime_cache=runtime_cache,
+        )
+
+    target = tmp_path / "target"
+    target.write_text("unchanged", encoding="utf-8")
+    symlink_ready = tmp_path / "symlink-ready.json"
+    symlink_ready.symlink_to(target)
+    with pytest.raises(SidecarStartupError):
+        _write_ready_file(
+            symlink_ready,
+            model_init_ms=1.0,
+            startup_ms=2.0,
+            thread_count=2,
+            runtime_cache=runtime_cache,
+        )
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
 @pytest.mark.parametrize("orientation", range(1, 9))
 def test_sidecar_applies_explicit_orientation_and_checks_logical_dimensions(
     orientation: int,
@@ -934,6 +993,96 @@ def test_sidecar_rejects_oversized_raw_paddle_candidates_before_iteration(
 
     with pytest.raises(PipelineError):
         _convert_result(Result(), frame_index=1, width=1, height=1)
+
+
+def test_qualification_latin_signal_requires_an_ascii_letter() -> None:
+    punctuation_only = [
+        {
+            "frame_index": 1,
+            "spans": [
+                {
+                    "polygon": [[0.0, 0.0]] * 4,
+                    "score": 0.5,
+                    "text": "[\\]^_`",
+                }
+            ],
+        }
+    ]
+    with_letter = copy.deepcopy(punctuation_only)
+    with_letter[0]["spans"][0]["text"] += "A"
+
+    assert sidecar_qualify._functional_observation(punctuation_only)["latin"] is False
+    assert sidecar_qualify._functional_observation(with_letter)["latin"] is True
+
+
+def test_sidecar_qualification_rejects_duplicate_candidate_members(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate.json"
+    candidate.write_text(
+        '{"schema_version":1,"result":"PASS","result":"FAIL"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        sidecar_qualify.QualificationBlocked,
+        match="CANDIDATE_REPORT_UNAVAILABLE",
+    ):
+        sidecar_qualify._read_candidate_report(candidate)
+
+
+def test_qualification_validates_the_frozen_production_thread_not_noisy_rank() -> None:
+    production_candidate = {
+        "cache_environment_match": True,
+        "determinism": {
+            "polygon_max_abs_delta": 0.0,
+            "polygon_shape_stable": True,
+            "score_max_abs_delta": 0.0,
+            "score_shape_stable": True,
+            "span_count_stable": True,
+            "span_text_stable": True,
+        },
+        "error_count": 0,
+        "first_inference_ms": 2_800.0,
+        "isolated_cache_model_file_count": 0,
+        "one_frame": {"p50_ms": 2_700.0},
+        "result": "PASS",
+        "three_frame": {"p95_ms": 8_500.0},
+        "thread_count": 2,
+        "thread_environment_match": True,
+    }
+    faster_candidate = {
+        "one_frame": {"p50_ms": 2_100.0},
+        "thread_count": 4,
+    }
+
+    assert (
+        sidecar_qualify._select_thread(
+            [production_candidate, faster_candidate],
+            production_thread_count=2,
+        )
+        == 2
+    )
+
+    production_candidate["three_frame"]["p95_ms"] = 30_000.0
+    with pytest.raises(
+        sidecar_qualify.QualificationFailed,
+        match="NO_STABLE_THREAD_CANDIDATE",
+    ):
+        sidecar_qualify._select_thread(
+            [production_candidate, faster_candidate],
+            production_thread_count=2,
+        )
+
+    production_candidate["three_frame"]["p95_ms"] = 8_500.0
+    production_candidate["determinism"]["score_max_abs_delta"] = 0.000_000_001
+    with pytest.raises(
+        sidecar_qualify.QualificationFailed,
+        match="NO_STABLE_THREAD_CANDIDATE",
+    ):
+        sidecar_qualify._select_thread(
+            [production_candidate, faster_candidate],
+            production_thread_count=2,
+        )
 
 
 def _write_test_manifest(root: Path, *, mutation=None) -> tuple[Path, Path]:
@@ -1012,6 +1161,37 @@ def test_manifest_verifies_schema_files_hashes_and_fixed_cpu_tuple(
             model_root,
             verify_package_versions=False,
         )
+
+
+def test_manifest_rejects_duplicate_json_members(tmp_path: Path) -> None:
+    manifest_path, model_root = _write_test_manifest(tmp_path)
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    manifest_path.write_text(
+        manifest_text.replace(
+            '"thread_count": 4',
+            '"thread_count": 2,\n  "thread_count": 4',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestError):
+        load_and_verify_manifest(
+            manifest_path,
+            model_root,
+            verify_package_versions=False,
+        )
+
+
+def test_model_provisioner_defaults_to_approved_thread_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["admission-notice-ocr-provision"])
+    args = provision_models._parse_args()
+
+    assert provision_models.PRODUCTION_THREAD_COUNT == 2
+    assert args.thread_count == 2
+    assert provision_models._manifest_value(args.thread_count)["thread_count"] == 2
 
 
 @pytest.mark.parametrize(
@@ -1838,6 +2018,7 @@ def test_l3_documentation_freezes_only_ocr_meaning_and_operations() -> None:
     for required in (
         "uv sync",
         "provision_models",
+        "--thread-count 2",
         "--verify-only",
         "admission_notice_ocr_integration",
         "admission_notice_ocr.qualify",

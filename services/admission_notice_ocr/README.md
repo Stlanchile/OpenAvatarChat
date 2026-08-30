@@ -64,7 +64,8 @@ uv run \
   --frozen \
   --project services/admission_notice_ocr \
   --no-dev \
-  python -m admission_notice_ocr.provision_models
+  python -m admission_notice_ocr.provision_models \
+  --thread-count 2
 ```
 
 The provisioner fetches only `inference.json`, `inference.pdiparams`, and
@@ -169,7 +170,11 @@ Sidecar-only qualification runs entirely in this locked environment. It imports
 only `admission_notice_ocr`, stdlib, and locked sidecar dependencies. It
 generates sidecar-native synthetic JPEG frames, launches each `1, 2, 4, 6, 8`
 candidate in a fresh user/network namespace and cache tree, and directly
-measures real Paddle inference:
+measures real Paddle inference. Requalification validates the frozen manifest
+thread count against determinism, isolation, errors, and the production
+three-frame timeout; comparative timings do not retune the v1 tuple. Candidate
+workers report their exact source identity, and the sidecar lane rejects any
+source change observed between launch and final evidence:
 
 ```bash
 cd /home/xs/projects/OpenAvatarChat-admission-lite/services/admission_notice_ocr

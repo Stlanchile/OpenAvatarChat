@@ -392,9 +392,8 @@ def _write_ready_file(
 ) -> None:
     if ready_file is None:
         return
+    temporary = ready_file.with_name(f".{ready_file.name}.{os.getpid()}.tmp")
     try:
-        if ready_file.exists() or ready_file.is_symlink():
-            raise SidecarStartupError()
         payload = json.dumps(
             {
                 "model_init_ms": round(model_init_ms, 3),
@@ -418,9 +417,22 @@ def _write_ready_file(
             separators=(",", ":"),
             sort_keys=True,
         )
-        ready_file.write_text(payload + "\n", encoding="utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+            destination.write(payload + "\n")
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.link(temporary, ready_file, follow_symlinks=False)
     except (OSError, TypeError, ValueError):
         raise SidecarStartupError() from None
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def _run(

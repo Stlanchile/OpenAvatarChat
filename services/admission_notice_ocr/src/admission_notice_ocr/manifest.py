@@ -106,6 +106,17 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError
 
 
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError
+        value[key] = item
+    return value
+
+
 def _exact_keys(value: dict[str, Any], expected: set[str]) -> bool:
     return set(value) == expected and all(type(key) is str for key in value)
 
@@ -119,6 +130,7 @@ def _load_json(path: Path) -> tuple[dict[str, Any], bytes]:
             raise ManifestError()
         value = json.loads(
             raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
             parse_constant=_reject_json_constant,
         )
     except ManifestError:

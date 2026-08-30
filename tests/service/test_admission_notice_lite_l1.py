@@ -457,6 +457,54 @@ async def test_control_route_rejects_body_query_and_client_owner_fields() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ("GET", "DELETE"))
+@pytest.mark.parametrize(
+    "headers",
+    (
+        [("content-length", "0"), ("content-length", "1")],
+        [("content-length", "0"), ("content-length", "0")],
+        [("content-length", "+0")],
+        [("content-length", "0" * 17)],
+    ),
+    ids=(
+        "conflicting-content-length",
+        "duplicate-zero-content-length",
+        "non-decimal-zero-content-length",
+        "overlong-zero-content-length",
+    ),
+)
+async def test_control_routes_reject_ambiguous_empty_body_framing(
+    method: str,
+    headers: list[tuple[str, str]],
+) -> None:
+    app = FastAPI()
+    engine = ChatEngine()
+    engine.sessions["owner"] = SessionStub()
+    processor = ControlPlaneProcessorFake()
+    service = register_admission_notice_lite_routes(
+        app=app,
+        chat_engine=engine,
+        config=_config(),
+        processor=processor,
+    )
+    assert service is not None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.request(
+            method,
+            "/api/v1/sessions/owner/admission-notice/recognitions/arn1_unknown",
+            headers=headers,
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"reason": "INVALID_REQUEST"}
+    assert processor.calls == 0
+    assert service.retained_job_count == 0
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_post_rejects_headerless_asgi_body_without_consuming_it() -> None:
     app = FastAPI()
     engine = ChatEngine()

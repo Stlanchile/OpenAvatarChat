@@ -64,6 +64,7 @@ _SIDECAR_SOURCE_PATHS = (
     "services/admission_notice_ocr/model_manifest.json",
     "services/admission_notice_ocr/pyproject.toml",
     "services/admission_notice_ocr/uv.lock",
+    "services/admission_notice_ocr/src/admission_notice_ocr/__init__.py",
     "services/admission_notice_ocr/src/admission_notice_ocr/app.py",
     "services/admission_notice_ocr/src/admission_notice_ocr/manifest.py",
     "services/admission_notice_ocr/src/admission_notice_ocr/pipeline.py",
@@ -73,11 +74,14 @@ _SIDECAR_SOURCE_PATHS = (
 )
 _MAIN_SOURCE_PATHS = (
     "scripts/admission_notice_lite_l3_qualify.py",
+    "src/service/__init__.py",
     "src/service/admission_notice_lite_contracts.py",
     "src/service/admission_notice_lite_ingestion.py",
     "src/service/admission_notice_lite_ocr.py",
     "src/service/admission_notice_lite_ocr_qualification.py",
     "src/service/admission_notice_lite_service.py",
+    "src/service/service_data_models/__init__.py",
+    "src/service/service_data_models/admission_notice_lite_config.py",
 )
 _SYNTHETIC_FIXTURE_LINES = (
     (
@@ -117,13 +121,45 @@ class RunningSidecar:
     ready: dict[str, Any]
 
 
+def _read_regular_source(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError
+        chunks = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _source_identity(before) != _source_identity(after):
+            raise OSError
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise OSError
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _source_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
 def _hash_paths(relative_paths: tuple[str, ...]) -> str:
     digest = hashlib.sha256()
     try:
         for relative_path in relative_paths:
             digest.update(relative_path.encode("utf-8"))
             digest.update(b"\0")
-            digest.update((PROJECT_ROOT / relative_path).read_bytes())
+            digest.update(_read_regular_source(PROJECT_ROOT / relative_path))
             digest.update(b"\0")
     except OSError:
         raise QualificationBlocked("QUALIFICATION_SOURCE_UNAVAILABLE") from None
@@ -141,7 +177,7 @@ def _sidecar_source_sha256() -> str:
         for relative_path in relative_to_service:
             digest.update(relative_path.encode("utf-8"))
             digest.update(b"\0")
-            digest.update((service_root / relative_path).read_bytes())
+            digest.update(_read_regular_source(service_root / relative_path))
             digest.update(b"\0")
     except OSError:
         raise QualificationBlocked("QUALIFICATION_SOURCE_UNAVAILABLE") from None
@@ -157,8 +193,21 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError
 
 
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError
+        value[key] = item
+    return value
+
+
 def _load_json_object(path: Path, *, maximum_bytes: int) -> dict[str, Any]:
     try:
+        if path.is_symlink():
+            raise OSError
         raw = path.read_bytes()
     except OSError:
         raise QualificationBlocked("SIDECAR_EVIDENCE_UNAVAILABLE") from None
@@ -167,6 +216,7 @@ def _load_json_object(path: Path, *, maximum_bytes: int) -> dict[str, Any]:
             raise ValueError
         value = json.loads(
             raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
             parse_constant=_reject_json_constant,
         )
     except (UnicodeError, json.JSONDecodeError, ValueError):
@@ -271,6 +321,10 @@ def _valid_pass_sidecar_evidence(value: dict[str, Any]) -> bool:
         or {candidate.get("thread_count") for candidate in candidates}
         != {1, 2, 4, 6, 8}
         or any(not _valid_candidate(candidate) for candidate in candidates)
+        or any(
+            candidate.get("sidecar_source_sha256") != value.get("sidecar_source_sha256")
+            for candidate in candidates
+        )
         or value.get("selected_thread_count") not in {1, 2, 4, 6, 8}
         or value.get("manifest_thread_count") not in {1, 2, 4, 6, 8}
         or type(value.get("selected")) is not dict
@@ -280,6 +334,10 @@ def _valid_pass_sidecar_evidence(value: dict[str, Any]) -> bool:
             for candidate in candidates
             if candidate["thread_count"] == value["selected_thread_count"]
         )
+        or value["selected"]["first_inference_ms"] >= 30_000
+        or value["selected"]["three_frame"]["p95_ms"] >= 30_000
+        or value["selected"]["determinism"]["polygon_max_abs_delta"] != 0.0
+        or value["selected"]["determinism"]["score_max_abs_delta"] != 0.0
         or package_versions
         != {
             "paddleocr": "3.7.0",
@@ -477,6 +535,8 @@ def _wait_ready(
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise QualificationFailed("SIDECAR_STARTUP_FAILED")
+        if ready_file.is_symlink():
+            raise QualificationFailed("SIDECAR_READY_INVALID")
         if ready_file.is_file():
             try:
                 raw = ready_file.read_bytes()
@@ -484,6 +544,7 @@ def _wait_ready(
                     raise ValueError
                 value = json.loads(
                     raw.decode("utf-8"),
+                    object_pairs_hook=_reject_duplicate_json_object,
                     parse_constant=_reject_json_constant,
                 )
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
@@ -499,6 +560,9 @@ def _wait_ready(
                     "thread_environment_match",
                 }
                 or type(value["pid"]) is not int
+                or value["pid"] != process.pid
+                or not _finite_nonnegative(value["model_init_ms"])
+                or not _finite_nonnegative(value["startup_ms"])
                 or type(value["cache_environment_match"]) is not bool
                 or type(value["thread_environment_match"]) is not bool
             ):
@@ -724,8 +788,9 @@ async def qualify_full_integration(
     sidecar_python: Path,
     font_path: Path | None,
 ) -> dict[str, Any]:
+    initial_source_sha256 = _qualification_source_sha256()
     report: dict[str, Any] = {
-        "qualification_source_sha256": _qualification_source_sha256(),
+        "qualification_source_sha256": initial_source_sha256,
         "result": "BLOCKED",
         "schema_version": FINAL_REPORT_SCHEMA_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -779,6 +844,8 @@ async def qualify_full_integration(
             finally:
                 _stop_process(sidecar.process)
 
+        if _qualification_source_sha256() != initial_source_sha256:
+            raise QualificationFailed("QUALIFICATION_SOURCE_CHANGED")
         report.update(
             {
                 "af_unix_integration": {

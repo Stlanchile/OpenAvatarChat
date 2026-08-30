@@ -29,6 +29,9 @@ class ProvisioningError(Exception):
         super().__init__("MODEL_PROVISIONING_FAILED")
 
 
+PRODUCTION_THREAD_COUNT = 2
+
+
 @dataclass(frozen=True, slots=True)
 class SourceFile:
     name: str
@@ -292,7 +295,11 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=project_root / "model_manifest.json",
     )
-    parser.add_argument("--thread-count", type=int, default=4)
+    parser.add_argument(
+        "--thread-count",
+        type=int,
+        default=PRODUCTION_THREAD_COUNT,
+    )
     parser.add_argument("--verify-only", action="store_true")
     return parser.parse_args()
 
