@@ -558,6 +558,21 @@ class _OcrClientStub:
         return batch
 
 
+class _NoopPersonalizer:
+    async def personalize(self, context, result) -> bool:
+        del context, result
+        return True
+
+
+def _semantic_processor(
+    client: _OcrClientStub,
+) -> AdmissionNoticeSemanticProcessorLiteV1:
+    return AdmissionNoticeSemanticProcessorLiteV1(
+        AdmissionNoticeOcrProcessorLiteV1(client),
+        _NoopPersonalizer(),
+    )
+
+
 def _validated_frame(index: int = 1) -> ValidatedAdmissionFrameLiteV1:
     return ValidatedAdmissionFrameLiteV1(
         frame_index=index,
@@ -572,9 +587,7 @@ def _validated_frame(index: int = 1) -> ValidatedAdmissionFrameLiteV1:
 @pytest.mark.asyncio
 async def test_processor_composes_real_l3_contract_and_discards_l4_result() -> None:
     client = _OcrClientStub(_batch(_frame()))
-    processor = AdmissionNoticeSemanticProcessorLiteV1(
-        AdmissionNoticeOcrProcessorLiteV1(client)
-    )
+    processor = _semantic_processor(client)
     context = RecognitionJobContextLiteV1(
         recognition_id="arn1_l4",
         expires_at_monotonic=time.monotonic() + 10,
@@ -588,10 +601,8 @@ async def test_processor_composes_real_l3_contract_and_discards_l4_result() -> N
 @pytest.mark.asyncio
 async def test_processor_semantic_failure_reaches_stable_terminal_reason() -> None:
     owner = object()
-    processor = AdmissionNoticeSemanticProcessorLiteV1(
-        AdmissionNoticeOcrProcessorLiteV1(
-            _OcrClientStub(_batch(_frame(college="汽车工程学院")))
-        )
+    processor = _semantic_processor(
+        _OcrClientStub(_batch(_frame(college="汽车工程学院")))
     )
     service = AdmissionNoticeLiteService(
         config=AdmissionNoticeLiteFeatureConfigV1(enabled=True),
@@ -637,9 +648,7 @@ async def test_ocr_and_semantic_values_never_enter_l4_logs() -> None:
     canary_name = "隐私姓名甲"
     canary_major = "智能交通技术(专本联合培养)"
     batch = _batch(_frame(name=canary_name, major=canary_major))
-    processor = AdmissionNoticeSemanticProcessorLiteV1(
-        AdmissionNoticeOcrProcessorLiteV1(_OcrClientStub(batch))
-    )
+    processor = _semantic_processor(_OcrClientStub(batch))
     context = RecognitionJobContextLiteV1(
         recognition_id="arn1_privacy",
         expires_at_monotonic=time.monotonic() + 10,
@@ -665,18 +674,16 @@ async def test_retained_semantic_failure_task_has_no_ocr_or_jpeg_traceback_data(
     canary_name = "隐私姓名乙"
     canary_major = "计算机网络技术(3+2)"
     jpeg_canary = b"\xff\xd8private-jpeg-canary\xff\xd9"
-    processor = AdmissionNoticeSemanticProcessorLiteV1(
-        AdmissionNoticeOcrProcessorLiteV1(
-            _OcrClientStub(
-                _batch(
-                    _frame(
-                        name=canary_name,
-                        major=canary_major,
-                        college="汽车工程学院",
-                    )
-                ),
-                transient=True,
-            )
+    processor = _semantic_processor(
+        _OcrClientStub(
+            _batch(
+                _frame(
+                    name=canary_name,
+                    major=canary_major,
+                    college="汽车工程学院",
+                )
+            ),
+            transient=True,
         )
     )
     owner = object()
@@ -750,10 +757,8 @@ async def test_unexpected_semantic_failure_traceback_is_also_sanitized(
         "recognize_admission_notice_semantics",
         fail_after_receiving_batch,
     )
-    processor = AdmissionNoticeSemanticProcessorLiteV1(
-        AdmissionNoticeOcrProcessorLiteV1(
-            _OcrClientStub(batch, transient=True),
-        )
+    processor = _semantic_processor(
+        _OcrClientStub(batch, transient=True),
     )
     owner = object()
     service = AdmissionNoticeLiteService(
@@ -802,7 +807,6 @@ def test_l4_source_has_no_forbidden_architecture_or_scope() -> None:
     l4_paths = (
         PROJECT_ROOT / "src/service/admission_notice_lite_semantics.py",
         PROJECT_ROOT / "src/service/admission_notice_lite_major_catalog.py",
-        PROJECT_ROOT / "src/service/admission_notice_lite_processor.py",
     )
     source = "\n".join(path.read_text(encoding="utf-8") for path in l4_paths).lower()
     for forbidden in (

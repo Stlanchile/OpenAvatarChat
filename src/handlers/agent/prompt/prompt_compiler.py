@@ -22,6 +22,11 @@ from typing import Dict, List, Optional
 
 from loguru import logger
 
+from service.admission_notice_lite_chat_context import (
+    AdmissionNoticeContextLiteV1,
+    render_admission_notice_prompt_lite_v1,
+)
+
 # ── Layer 常量 ──
 
 LAYER_STABLE_CORE = "stable_core"
@@ -49,6 +54,18 @@ class PromptInput:
     environment_state: str = ""         # L3 持续性环境状态
     perception_events: List[Dict] = field(default_factory=list)
     dialogue_history: List[Dict] = field(default_factory=list)
+    admission_notice: AdmissionNoticeContextLiteV1 | None = None
+
+    def __post_init__(self) -> None:
+        if self.admission_notice is not None and (
+            type(self.admission_notice) is not AdmissionNoticeContextLiteV1
+            or self.trigger_type != "admission_notice"
+            or self.user_message
+            or self.response_hint
+            or self.environment_state
+            or self.perception_events
+        ):
+            raise ValueError("invalid admission-notice prompt attachment")
 
 
 @dataclass
@@ -225,6 +242,11 @@ class PromptCompiler:
         # L2 Persona Snapshot — 优先使用 pi 中 OC 传来的，否则用本地默认
         snapshot = pi.persona_snapshot or self._persona_snapshot
         self._append_layer(system_parts, LAYER_PERSONA_SNAPSHOT, snapshot)
+
+        if pi.admission_notice is not None:
+            system_parts.append(
+                render_admission_notice_prompt_lite_v1(pi.admission_notice)
+            )
 
         # L3 Environment State — <environment-state> 包裹，尾部注入
         env_state = self._build_environment_state(pi)

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -49,6 +51,17 @@ class RecognitionJobContextLiteV1:
     recognition_id: str
     expires_at_monotonic: float
     cancel_event: asyncio.Event = field(repr=False, compare=False)
+    publication_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+        compare=False,
+    )
+    owning_session: object | None = field(default=None, repr=False, compare=False)
+    session_is_current: Callable[[], bool] = field(
+        default=lambda: True,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -59,6 +60,7 @@ class _RecognitionJobRuntimeLiteV1:
     created_at_monotonic: float
     expires_at_monotonic: float
     cancel_event: asyncio.Event = field(repr=False)
+    publication_lock: threading.Lock = field(repr=False)
     frames: tuple[ValidatedAdmissionFrameLiteV1, ...] = field(repr=False)
     resource_permit: _RecognitionIngestionPermitLiteV1 | None = field(repr=False)
     reason: RecognitionErrorReasonLiteV1 | None = None
@@ -288,23 +290,29 @@ class AdmissionNoticeLiteService:
         reason: RecognitionErrorReasonLiteV1 | None,
         now: float,
     ) -> bool:
-        if self._jobs.get(job.recognition_id) is not job:
-            return False
-        if job.state not in _ACTIVE_STATES:
-            return False
+        with job.publication_lock:
+            if self._jobs.get(job.recognition_id) is not job:
+                return False
+            if job.state not in _ACTIVE_STATES:
+                return False
 
-        job.state = state
-        job.reason = reason
-        job.terminal_at_monotonic = now
-        job.retain_until_monotonic = now + min(
-            _TERMINAL_RETENTION_SECONDS,
-            float(self._config.recognition_ttl_seconds),
-        )
-        job.frames = ()
-        self._release_active_slot_locked(job)
-        self._schedule_terminal_retention_locked(job)
-        self._trim_terminal_jobs_locked()
-        return True
+            job.state = state
+            job.reason = reason
+            job.terminal_at_monotonic = now
+            job.retain_until_monotonic = now + min(
+                _TERMINAL_RETENTION_SECONDS,
+                float(self._config.recognition_ttl_seconds),
+            )
+            job.frames = ()
+            if state in {
+                RecognitionStateLiteV1.CANCELLED,
+                RecognitionStateLiteV1.EXPIRED,
+            }:
+                job.cancel_event.set()
+            self._release_active_slot_locked(job)
+            self._schedule_terminal_retention_locked(job)
+            self._trim_terminal_jobs_locked()
+            return True
 
     def _trim_terminal_jobs_locked(self) -> None:
         terminal_jobs = [
@@ -523,6 +531,7 @@ class AdmissionNoticeLiteService:
                     created_at_monotonic=now,
                     expires_at_monotonic=(now + self._config.recognition_ttl_seconds),
                     cancel_event=asyncio.Event(),
+                    publication_lock=threading.Lock(),
                     frames=frames,
                     resource_permit=permit,
                 )
@@ -604,7 +613,13 @@ class AdmissionNoticeLiteService:
             context = RecognitionJobContextLiteV1(
                 recognition_id=job.recognition_id,
                 expires_at_monotonic=job.expires_at_monotonic,
+                owning_session=job.owning_session,
+                session_is_current=lambda: (
+                    self._session_lookup(job.owning_session_id) is job.owning_session
+                    and id(job.owning_session) not in self._invalidated_owner_keys
+                ),
                 cancel_event=job.cancel_event,
+                publication_lock=job.publication_lock,
             )
             processor = self._processor
             if processor is None:

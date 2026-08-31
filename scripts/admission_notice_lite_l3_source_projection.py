@@ -52,6 +52,13 @@ L4_DOWNSTREAM_SOURCE_PATHS = (
     "src/service/admission_notice_lite_processor.py",
     "src/service/admission_notice_lite_semantics.py",
 )
+L5_DOWNSTREAM_SOURCE_PATHS = (
+    "src/demo.py",
+    "src/handlers/agent/chat_agent_handler.py",
+    "src/handlers/agent/prompt/prompt_compiler.py",
+    "src/service/admission_notice_lite_chat_context.py",
+    "src/service/admission_notice_lite_personalization.py",
+)
 
 _HISTORICAL_DISABLED_GATE_SOURCE = (
     b'"""Reviewed real-runtime qualification gate for Admission Notice Lite L3."""\n'
@@ -354,8 +361,41 @@ def _project_contracts(
     if tuple(definitions) != _CONTRACT_CLASSES:
         raise L3SourceProjectionError("contracts definition inventory changed")
 
+    projected_imports = [copy.deepcopy(node) for node in imports]
+    threading_imports = [
+        node
+        for node in projected_imports
+        if isinstance(node, ast.Import)
+        and tuple(alias.name for alias in node.names) == ("threading",)
+    ]
+    if len(threading_imports) not in {0, 1}:
+        raise L3SourceProjectionError("contracts L5 threading import changed")
+    projected_imports = [
+        node for node in projected_imports if node not in threading_imports
+    ]
+    callable_imports = [
+        node
+        for node in projected_imports
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "collections.abc"
+        and tuple(alias.name for alias in node.names) == ("Callable",)
+    ]
+    if len(callable_imports) not in {0, 1}:
+        raise L3SourceProjectionError("contracts L5 callable import changed")
+    projected_imports = [
+        node for node in projected_imports if node not in callable_imports
+    ]
+    typing_imports = [
+        node
+        for node in projected_imports
+        if isinstance(node, ast.ImportFrom) and node.module == "typing"
+    ]
+    if len(typing_imports) != 1 or tuple(
+        alias.name for alias in typing_imports[0].names
+    ) != ("Protocol",):
+        raise L3SourceProjectionError("contracts L5 typing import changed")
     entries: list[tuple[str, str]] = [
-        (f"import:{index}", _dump(node)) for index, node in enumerate(imports)
+        (f"import:{index}", _dump(node)) for index, node in enumerate(projected_imports)
     ]
     entries.extend(
         (f"assignment:{name}", _dump(assignments[name]))
@@ -365,6 +405,23 @@ def _project_contracts(
         node = definitions[name]
         if not isinstance(node, ast.ClassDef):
             raise L3SourceProjectionError(f"contracts definition {name} is not a class")
+        if name == "RecognitionJobContextLiteV1":
+            projected = copy.deepcopy(node)
+            l5_fields = [
+                item
+                for item in projected.body
+                if isinstance(item, ast.AnnAssign)
+                and isinstance(item.target, ast.Name)
+                and item.target.id
+                in {"publication_lock", "owning_session", "session_is_current"}
+            ]
+            if len(l5_fields) not in {0, 3}:
+                raise L3SourceProjectionError(
+                    "contracts L5 recognition context fields changed"
+                )
+            projected.body = [item for item in projected.body if item not in l5_fields]
+            entries.append((f"class:{name}", _dump(projected)))
+            continue
         if name != "RecognitionErrorReasonLiteV1":
             entries.append((f"class:{name}", _dump(node)))
             continue
@@ -556,6 +613,149 @@ def _remove_reviewed_semantic_handler(
     del parent.handlers[index]
 
 
+def _remove_l5_job_context_attachment(service: ast.ClassDef) -> None:
+    calls = [
+        node
+        for node in ast.walk(service)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "RecognitionJobContextLiteV1"
+    ]
+    if len(calls) != 1:
+        raise L3SourceProjectionError(
+            "service L5 recognition context attachment changed"
+        )
+    call = calls[0]
+    l5_keywords = {
+        keyword.arg: keyword
+        for keyword in call.keywords
+        if keyword.arg in {"owning_session", "session_is_current", "publication_lock"}
+    }
+    if not l5_keywords:
+        return
+    if set(l5_keywords) != {
+        "owning_session",
+        "session_is_current",
+        "publication_lock",
+    }:
+        raise L3SourceProjectionError("service L5 recognition context keywords changed")
+    if ast.unparse(l5_keywords["owning_session"].value) != "job.owning_session":
+        raise L3SourceProjectionError(
+            "service L5 exact owning session attachment changed"
+        )
+    session_is_current = ast.unparse(l5_keywords["session_is_current"].value)
+    if session_is_current != (
+        "lambda: self._session_lookup(job.owning_session_id) is "
+        "job.owning_session and id(job.owning_session) not in "
+        "self._invalidated_owner_keys"
+    ):
+        raise L3SourceProjectionError("service L5 current-session check changed")
+    if ast.unparse(l5_keywords["publication_lock"].value) != "job.publication_lock":
+        raise L3SourceProjectionError("service L5 publication fence changed")
+    call.keywords = [
+        keyword for keyword in call.keywords if keyword.arg not in l5_keywords
+    ]
+
+
+def _remove_l5_publication_fence(
+    runtime: ast.ClassDef,
+    service: ast.ClassDef,
+) -> None:
+    fields = [
+        item
+        for item in runtime.body
+        if isinstance(item, ast.AnnAssign)
+        and isinstance(item.target, ast.Name)
+        and item.target.id == "publication_lock"
+    ]
+    if not fields:
+        if any(
+            isinstance(node, ast.keyword) and node.arg == "publication_lock"
+            for node in ast.walk(service)
+        ):
+            raise L3SourceProjectionError(
+                "historical service has a partial L5 publication fence"
+            )
+        transition = next(
+            (
+                item
+                for item in service.body
+                if isinstance(item, ast.FunctionDef)
+                and item.name == "_transition_terminal_locked"
+            ),
+            None,
+        )
+        if transition is None or any(
+            isinstance(node, ast.With)
+            and any(
+                ast.unparse(item.context_expr) == "job.publication_lock"
+                for item in node.items
+            )
+            for node in ast.walk(transition)
+        ):
+            raise L3SourceProjectionError(
+                "historical service has a partial L5 terminal fence"
+            )
+        return
+    if len(fields) != 1:
+        raise L3SourceProjectionError("service L5 runtime publication lock changed")
+    runtime.body.remove(fields[0])
+
+    runtime_calls = [
+        node
+        for node in ast.walk(service)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_RecognitionJobRuntimeLiteV1"
+    ]
+    if len(runtime_calls) != 1:
+        raise L3SourceProjectionError("service L5 runtime construction changed")
+    runtime_call = runtime_calls[0]
+    keywords = [
+        keyword
+        for keyword in runtime_call.keywords
+        if keyword.arg == "publication_lock"
+    ]
+    if len(keywords) != 1 or ast.unparse(keywords[0].value) != "threading.Lock()":
+        raise L3SourceProjectionError("service L5 runtime lock construction changed")
+    runtime_call.keywords.remove(keywords[0])
+
+    transition = next(
+        (
+            item
+            for item in service.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "_transition_terminal_locked"
+        ),
+        None,
+    )
+    if (
+        transition is None
+        or len(transition.body) != 1
+        or not isinstance(transition.body[0], ast.With)
+        or len(transition.body[0].items) != 1
+        or ast.unparse(transition.body[0].items[0].context_expr)
+        != "job.publication_lock"
+    ):
+        raise L3SourceProjectionError("service L5 terminal publication fence changed")
+    body = transition.body[0].body
+    cancel_sets = [
+        item
+        for item in body
+        if isinstance(item, ast.If)
+        and ast.unparse(item.test)
+        == "state in {RecognitionStateLiteV1.CANCELLED, RecognitionStateLiteV1.EXPIRED}"
+    ]
+    if (
+        len(cancel_sets) != 1
+        or tuple(ast.unparse(item) for item in cancel_sets[0].body)
+        != ("job.cancel_event.set()",)
+        or cancel_sets[0].orelse
+    ):
+        raise L3SourceProjectionError("service L5 terminal cancellation fence changed")
+    transition.body = [item for item in body if item not in cancel_sets]
+
+
 def _project_service(
     source: bytes,
     semantic_failure_names: frozenset[str],
@@ -575,15 +775,33 @@ def _project_service(
     if _class_method_inventory(service) != _SERVICE_METHODS:
         raise L3SourceProjectionError("service method inventory changed")
 
+    projected_imports = [copy.deepcopy(node) for node in imports]
+    threading_imports = [
+        node
+        for node in projected_imports
+        if isinstance(node, ast.Import)
+        and tuple(alias.name for alias in node.names) == ("threading",)
+    ]
+    if len(threading_imports) not in {0, 1}:
+        raise L3SourceProjectionError("service L5 threading import changed")
+    projected_imports = [
+        node for node in projected_imports if node not in threading_imports
+    ]
+    projected_runtime = copy.deepcopy(definitions["_RecognitionJobRuntimeLiteV1"])
+    if not isinstance(projected_runtime, ast.ClassDef):
+        raise L3SourceProjectionError("service runtime changed kind")
     projected_service = copy.deepcopy(service)
     _remove_reviewed_semantic_handler(
         projected_service,
         expected=bool(semantic_failure_names),
     )
+    _remove_l5_job_context_attachment(projected_service)
+    _remove_l5_publication_fence(projected_runtime, projected_service)
     ast.fix_missing_locations(projected_service)
+    ast.fix_missing_locations(projected_runtime)
 
     entries: list[tuple[str, str]] = [
-        (f"import:{index}", _dump(node)) for index, node in enumerate(imports)
+        (f"import:{index}", _dump(node)) for index, node in enumerate(projected_imports)
     ]
     entries.extend(
         (f"assignment:{name}", _dump(assignments[name]))
@@ -594,6 +812,8 @@ def _project_service(
             f"class:{name}",
             _dump(projected_service)
             if name == "AdmissionNoticeLiteService"
+            else _dump(projected_runtime)
+            if name == "_RecognitionJobRuntimeLiteV1"
             else _dump(definitions[name]),
         )
         for name in _SERVICE_CLASSES
@@ -704,6 +924,7 @@ __all__ = [
     "L3_QUALIFICATION_SOURCE_PATHS",
     "L3_SIDECAR_SOURCE_PATHS",
     "L4_DOWNSTREAM_SOURCE_PATHS",
+    "L5_DOWNSTREAM_SOURCE_PATHS",
     "L3SourceProjectionError",
     "L3SourceProjectionMismatch",
     "historical_l3_qualification_source_sha256",

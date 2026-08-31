@@ -12,9 +12,13 @@ passed and its exact manifest is production-approved. L4 now consumes the
 validated `OcrBatchLiteV1`, reconstructs geometric reading order, checks the
 one fixed institution and college, extracts the three supported semantic
 fields, and requires exact membership in the seven-major catalog. The L4
-result is transient and discarded in the same processor call. ChatAgent
-generation and WebUI behavior remain requirements for later milestones, not
-claims about current runtime behavior.
+result is transient. L5 now validates that exact result again, converts it to
+one typed prompt-only context, and performs one tool-free generation through
+the owning session's existing ChatAgent and `AVATAR_TEXT` pipeline. The typed
+context is discarded when that attempt unwinds. L6 now provides the existing
+WebUI with one explicit camera action, memory-only 1–3-frame review, the narrow
+Lite POST/GET/DELETE lifecycle, and overlay-only completion. Deployment
+qualification and pilot acceptance remain L7 work.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
 **SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **MAY**, and **OPTIONAL** are to be
@@ -248,7 +252,7 @@ All personal input and intermediate recognition data are memory-only:
 | JPEG validation | Immutable encoded bytes plus transient decoded pixels | Decoded pixels released immediately after validation; source bytes released when processor work unwinds |
 | OCR | One bounded 1–3-frame UDS request | Request buffers released after the response or disconnect |
 | OCR spans | `OcrBatchLiteV1` | Validated, consumed by L4, and discarded when the processor returns |
-| Extracted fields | `AdmissionNoticeResultLiteV1` local value | Discarded when the L4 processor returns |
+| Extracted fields | `AdmissionNoticeResultLiteV1` local value | Consumed in the same processor call and discarded after L5 personalization unwinds |
 | Typed context | `AdmissionNoticeContextLiteV1` | Exactly one ChatAgent turn |
 | Job record | Identifier, owner, state, times, cancellation handle | In-memory TTL only |
 | Assistant response | Existing `AVATAR_TEXT` and normal history | Existing OpenAvatarChat behavior |
@@ -794,15 +798,16 @@ OCR completely omits visually present qualifier text, however, the semantic
 layer cannot prove that the omitted text existed. Lite is a recognition
 system, not a high-assurance credential verifier.
 
-After L4, a successful processor return and job `COMPLETED` mean:
+L4 semantic success by itself means:
 
 > A supported 湖北交通职业技术学院交通信息学院 admission-notice content/layout
 > family was recognized and one exact supported major was extracted.
 
-It does not mean authenticity, issuer validation, enrollment confirmation,
-student lookup, or assistant-response generation. Semantic failures leave the
-public API coarse: POST remains `202`; later GET returns HTTP `200`, status
-`failed`, and exactly one stable category:
+It does not mean authenticity, issuer validation, enrollment confirmation, or
+student lookup. L5 now requires the subsequent personalization turn before the
+processor returns successfully. Semantic failures leave the public API coarse:
+POST remains `202`; later GET returns HTTP `200`, status `failed`, and exactly
+one stable category:
 
 | Stable reason | Meaning |
 |---|---|
@@ -813,12 +818,12 @@ public API coarse: POST remains `202`; later GET returns HTTP `200`, status
 | `INTERNAL_ERROR` | An unexpected implementation or OCR boundary fault |
 
 The status API never returns institution, college, name, province, major, OCR
-text, polygons, or scores. The semantic result is neither retained in the job
-record nor cached for L5.
+text, polygons, scores, the typed context, prompt, or assistant response. The
+semantic result is neither retained in the job record nor cached.
 
 ## ChatAgent Turn Boundary
 
-The future one-turn context is:
+The implemented one-turn context is:
 
 ```text
 AdmissionNoticeContextLiteV1 {
@@ -830,15 +835,49 @@ AdmissionNoticeContextLiteV1 {
 }
 ```
 
-`major` is mandatory and exact-catalog validated. Institution and college are
-server-owned constants. The context is frozen, server-owned, and redacted in
-representations. Document values MUST be represented explicitly as untrusted
-data. The context is not `HUMAN_TEXT`, synthetic history, WorkingMemory
-writeback, or manager state.
+`AdmissionNoticeContextLiteV1.from_result()` accepts only the exact
+`AdmissionNoticeResultLiteV1` type and revalidates the fixed institution,
+fixed college, optional-string bounds/control rules, and exact seven-major
+catalog. It does not reinterpret or normalize any field. `institution_name`
+and `college` remain trusted application constants; `name`,
+`source_province`, and `major` remain OCR-derived, with `major` additionally
+closed-catalog validated.
 
-The Lite entry method MUST omit tools and run exactly one generation round.
-Subsequent ordinary turns restore normal tool behavior. Final output follows
-the existing `AVATAR_TEXT`, history, Avatar, WebSocket/RTC, and TTS paths.
+The context is frozen and server-owned. Its only fields are the five shown
+above. Deterministic compact JSON preserves Unicode, uses the fixed order
+`institution_name`, `college`, optional `name`, optional `source_province`,
+then `major`, and omits absent optionals. A fixed system instruction identifies
+the JSON as untrusted image-derived data, prohibits following instructions in
+field values or calling tools, prohibits inventing missing values, and
+prohibits authenticity, official-verification, enrollment, or eligibility
+claims. JSON control syntax is server-owned; structural tag characters in
+field values are escaped.
+
+The attachment enters `PromptInput` only through the dedicated
+`ChatAgentHandler.personalize_admission_notice_lite_v1()` entry. It is not
+`ChatData(HUMAN_TEXT, ...)`, a fake transcript, an ordinary user-memory turn,
+an environment event, generic metadata, or a public arbitrary-context API. The
+entry includes the configured stable system policy, persona, and allowed
+dialogue history, but does not drain background notifications or record the
+admission fields in `SessionMemoryManager`, `WorkingMemory`, SessionHistory,
+writeback, compaction input, manager state, the recognition job, or a database.
+
+For this invocation only, `_agent_loop` computes `use_tools = false`,
+passes no `tools` parameter, and fixes `max_rounds = 1`. An unsolicited
+tool-call-shaped model delta is ignored and never reaches
+`ToolRegistry.execute`. No handler registry, tool registry, session
+configuration, or model configuration is mutated. The next ordinary turn and
+an unrelated concurrent session recompute normal tool availability from their
+existing configuration. L5 also skips immediate auto-compaction after the
+assistant response, so the admission operation performs exactly one model
+generation.
+
+The generated assistant text follows the existing ChatAgent streamer as
+`AVATAR_TEXT`; the existing history, Avatar, WebSocket/RTC, and TTS consumers
+remain unchanged. L5 never calls TTS directly and creates no alternate output
+event or response endpoint. The normal assistant response is recorded by the
+existing assistant-history policy and may intentionally contain the
+personalized fields. Only the typed admission input remains ephemeral.
 
 Lite MUST reuse the clean baseline `ChatAgentContext._generate_lock` through a
 narrow ChatAgent entry method:
@@ -847,15 +886,134 @@ narrow ChatAgent entry method:
 - it MUST NOT use the baseline ordinary-turn force-continue behavior after a
   lock timeout;
 - if the lock cannot be acquired within the remaining recognition deadline,
-  the job fails before the typed context is constructed;
+  no model-facing prompt is constructed or generated and the local typed
+  context is discarded;
 - while Lite owns the lock, no ordinary or proactive generation starts;
-- cancellation or expiry becomes terminal only after locked generation has
-  stopped and context references have been dropped; and
+- cancellation or expiry prevents later text publication, cancels the normal
+  text stream, and drops context references as the locked invocation unwinds;
+  and
 - this ordering remains per-session and MUST NOT suspend ChatAgent globally.
+
+The processor carries the exact owning `ChatSession` object from the L1 job
+context and rechecks that the same object is still current immediately before
+personalization. It never retargets a replacement session by correlation ID.
+Cancellation, expiry, or session teardown sets the existing recognition
+cancellation event; the ChatAgent stream loop closes/cancels its normal text
+stream before publishing later chunks. The synchronous ChatAgent invocation is
+an owned worker: its model request receives the remaining recognition deadline,
+the worker is drained and joined on cancellation, and context destruction
+serializes behind the same generation lock. A per-job publication lock makes
+terminal cancellation atomic with text publication and normal assistant-history
+acceptance. Failure text, prompt text, field values, and model exception details
+are not copied into public status or Lite logs. Prompt and generated-text
+content logging is suppressed for this invocation; ordinary ChatAgent logging
+policy is otherwise unchanged.
+
+`COMPLETED` now means that a supported notice and exact supported major were
+recognized and the associated one-turn ChatAgent generation produced and
+finished publication of normal assistant text into the existing
+`AVATAR_TEXT` stream. It does not wait for downstream TTS synthesis, audio
+playback, avatar rendering, WebSocket delivery acknowledgement, or RTC
+playback. If semantic recognition succeeds but no assistant text is produced,
+the model call fails, or the normal text stream is not successfully completed,
+the job does not become `COMPLETED`; the coarse public result is `FAILED` with
+`INTERNAL_ERROR`, or `CANCELLED`/`EXPIRED` when the existing lifecycle owns the
+termination.
 
 Prompts, tests, and output policy MUST prohibit claims such as `verified`,
 `authentic`, `official verification passed`, `genuine admission notice`,
 `enrollment confirmed`, `已验证`, `真伪核验通过`, and `录取资格已确认`.
+
+### L6 WebUI Capture Lifecycle
+
+The normal Chat/Avatar action area contains one entry,
+`识别录取通知书`. It opens `AdmissionNoticeCaptureDialog` as a sibling overlay
+after the persistent normal Chat view. The overlay MUST NOT destroy or recreate
+the `ChatSession`, WebSocket, RTC connection, Avatar renderer, Chat history, or
+ordinary assistant-output listeners. Closing the overlay after recognition
+therefore cannot intercept or reset the L5 `AVATAR_TEXT` response.
+
+Opening the dialog is permission-neutral. Only the explicit `打开摄像头` action
+calls `navigator.mediaDevices.getUserMedia()`, with `audio: false`, an ideal
+environment-facing camera, and ideal 1,920 by 1,080 capture constraints. The
+deployment remains responsible for a secure HTTPS context; L6 adds no insecure
+camera workaround and never requests microphone permission. Desktop webcams,
+laptop cameras, and mobile rear cameras use the browser's normal capability
+negotiation. Permission denial, missing hardware, camera contention, and an
+unsupported camera API map to stable localized messages rather than raw browser
+exceptions.
+
+Direct capture-camera acquisition is attempted first. If a single-camera device
+reports camera contention, L6 may transactionally detach only the ordinary
+video sender and stop its physical video track, while preserving audio,
+ChatSession, WebSocket, and RTC ownership. Cleanup reacquires the preferred
+ordinary video device, reinserts its track into the existing stream, replaces
+the existing RTC sender track where present, and reconnects the existing local
+preview. No microphone track is suspended.
+
+The L6 UX state machine is deliberately smaller than the historical hardened
+capture protocol:
+
+```text
+IDLE -> OPENING -> REQUESTING_CAMERA -> CAMERA_READY
+CAMERA_READY -> CAPTURING -> REVIEWING
+REVIEWING -> CAMERA_READY
+REVIEWING -> SUBMITTING -> PROCESSING -> COMPLETED
+any active state -> CLOSING -> IDLE
+request, preparation, API, polling, or device failure -> ERROR
+```
+
+There is one owned camera request, capture encode, POST, serial poll loop, and
+deduplicated cancellation path. There are no Begin, per-frame Upload, Seal,
+End, capability, replay, or control-sequence states.
+
+The user captures one, two, or three photos without auto-burst. Review supports
+retake, removal, and an optional additional photo. Each browser frame is drawn
+to a transient canvas and encoded as JPEG. Aspect ratio is preserved while
+bounding the long edge to 1,920 pixels, short edge to 1,080 pixels, total pixels
+to 2,073,600, and encoded size to 2 MiB. Encoding uses fixed quality attempts
+`0.90`, `0.84`, and `0.78` at fixed dimension factors `1.00`, `0.85`, and
+`0.70`, for at most nine attempts. Canvas encoding intentionally carries no
+source EXIF, GPS, camera-model, or comment metadata.
+
+Images, previews, the recognition identifier, and the UX state are browser
+memory-only. Admission capture code MUST NOT write them to `localStorage`,
+`sessionStorage`, IndexedDB, Cache Storage, a service worker, a download,
+filesystem API, analytics payload, or new telemetry. Every preview Object URL
+is revoked on retake, removal, submission cleanup, error reset, completion,
+cancel, dialog close, and component teardown. Blob references are dropped once
+the POST request has returned and no longer owns the `FormData`.
+
+Submission constructs exactly one `multipart/form-data` POST with contiguous
+`frame_1`, `frame_2`, and `frame_3` JPEG parts as applicable. It includes no
+session ID in the body, semantic metadata, profile or template identifier,
+student fields, or client-selected recognition identifier. After `202`, L6
+keeps only the opaque recognition identifier and polls the existing GET route
+serially every 750 milliseconds. `created` and `processing` both map to the
+single `PROCESSING` UX state. Polling has one outstanding GET, an
+`AbortController`, a 120-second bounded UX lifetime, and immediate teardown on
+terminal state, close, unmount, or current-session change.
+
+`completed` carries no result fields. L6 stops polling, drops image state,
+stops the capture camera, restores ordinary video if handed off, clears the
+recognition identifier, and closes only the overlay. The personalized result
+continues through the existing normal Avatar/TTS pipeline; the browser makes no
+admission-specific TTS or other network request. `failed`, `cancelled`, and
+`expired` use only allowlisted stable public reasons. Unknown status, reason,
+body, or raw diagnostics fail closed to one generic localized error and are
+never rendered.
+
+Closing before POST acceptance aborts local work and needs no DELETE. After a
+known `recognition_id`, close, session change, or teardown issues at most one
+best-effort DELETE while local camera, Blob, Object URL, and polling cleanup
+continues without waiting indefinitely. If the POST may have been accepted but
+its response is lost before an identifier arrives, L6 does not invent
+idempotency, replay, or discovery. The unknown job remains bounded by backend
+TTL or exact-session teardown.
+
+L6 performs recognition only. It displays no OCR, extracted field, confidence,
+template, major, authenticity, enrollment, roster, student-ID, barcode, or QR
+result UI.
 
 ## Privacy, Logging, and Authenticity
 
@@ -899,13 +1057,14 @@ cherry-picked into Lite. Reuse is manual and focused:
 | Reading order | Port algorithm | Remove hardened imports and provenance |
 | Institution, college, name, province, and major matching | Rewrite | One fixed HBTC/交通信息学院 extractor and the closed seven-major catalog |
 | Typed context and one-turn generation | Rewrite narrowly | Reuse only the baseline per-session generation lock; no release authority or declassification envelope |
-| Browser image preparation and camera handoff | Manual later port | Rewrite protocol vocabulary and cleanup for Lite in L6 |
-| Hardened frontend API and state machine | Drop | Build the asynchronous Lite API/composable in L6 |
+| Browser image preparation and camera handoff | Manually ported in L6 | Fixed image bounds plus direct-first, video-only fallback handoff |
+| Hardened frontend API and state machine | Dropped | L6 uses only the three Lite endpoints and the small UX FSM above |
 | Authentication, lineage, fencing, coordination, encrypted evidence, and release authority | Drop | No OIDC/JWKS, security envelopes, `WorkFence`, `CaptureCoordinator`, private store, or declassification framework |
 | Generic profiles, Q&A, certificates, and TTS concepts | Drop | Fixed product contract only |
 
-The frontend remains at its clean pre-certificate gitlink until L6. L0 MUST NOT
-create a nested frontend branch or change the gitlink.
+The frontend remained at its clean pre-certificate gitlink through L5. L6
+records only the reviewed signed frontend commit in the parent gitlink and does
+not alter other recursive submodule pointers.
 
 ## Milestone Sequence
 
@@ -999,7 +1158,13 @@ adds no extractor, ChatAgent, TTS, or frontend behavior. L4 adds only semantic
 recognition and changes the meaning of `COMPLETED`; it adds no ChatAgent,
 prompt, tools, TTS, WebUI, frontend, roster, or authenticity behavior.
 
-L3 qualification does not qualify an HBTC template, field extraction, a
-remote-capable preset, TTS deployment, Avatar/RTC contention, horizontal
-scaling, or end-to-end personalization. Those claims require their assigned
-later milestones.
+L5 composes the transient L4 result with exactly one existing ChatAgent
+invocation. It adds no frontend/WebUI or camera behavior, admission-specific
+TTS, model, OCR/sidecar, matcher, catalog, roster, authenticity/enrollment
+verification, persistence, generic context framework, or hardened certificate
+authority. L6 adds only the WebUI camera, review, Lite API polling, and cleanup
+lifecycle described above. It changes no backend OCR, sidecar, semantic
+matching, major catalog, ChatAgent, tool, TTS, authenticity, enrollment, or
+roster behavior. Historical L3 qualification does not qualify browser/device
+behavior, TTS deployment, horizontal scaling, or final end-to-end deployment.
+Those remain L7 work.

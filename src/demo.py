@@ -20,6 +20,9 @@ from service.admission_notice_lite_ocr import (
 from service.admission_notice_lite_processor import (
     compose_admission_notice_semantic_processor_lite_v1,
 )
+from service.admission_notice_lite_personalization import (
+    AdmissionNoticeChatPersonalizerLiteV1,
+)
 from service.admission_notice_lite_service import AdmissionNoticeLiteService
 from service.service_utils.logger_utils import config_loggers
 from service.service_utils.service_config_loader import load_configs
@@ -117,7 +120,8 @@ def main():
     admission_notice_processor = compose_admission_notice_semantic_processor_lite_v1(
         build_qualified_admission_notice_ocr_processor_lite_v1(
             service_config.admission_notice_lite
-        )
+        ),
+        AdmissionNoticeChatPersonalizerLiteV1(),
     )
     admission_notice_lite_service = register_admission_notice_lite_routes(
         app=demo_app,
