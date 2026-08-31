@@ -54,6 +54,7 @@ REQUIRED_DOCUMENT_HEADINGS = (
     "Session and Recognition Ownership",
     "L1 Recognition API and Control Plane",
     "OCR Process Boundary",
+    "L4 Semantic Recognition",
     "ChatAgent Turn Boundary",
     "Privacy, Logging, and Authenticity",
     "Migration and Reuse Boundaries",

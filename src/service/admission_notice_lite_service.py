@@ -25,6 +25,14 @@ from service.service_data_models.admission_notice_lite_config import (
 _ACTIVE_STATES = frozenset(
     (RecognitionStateLiteV1.CREATED, RecognitionStateLiteV1.PROCESSING)
 )
+_SEMANTIC_FAILURE_REASONS = frozenset(
+    {
+        RecognitionErrorReasonLiteV1.UNSUPPORTED_NOTICE,
+        RecognitionErrorReasonLiteV1.INSUFFICIENT_NOTICE,
+        RecognitionErrorReasonLiteV1.MAJOR_NOT_RECOGNIZED,
+        RecognitionErrorReasonLiteV1.AMBIGUOUS_NOTICE,
+    }
+)
 _TERMINAL_RETENTION_SECONDS = 30.0
 _MAX_RETAINED_TERMINAL_JOBS = 64
 _SHUTDOWN_WAIT_SECONDS = 1.0
@@ -627,6 +635,19 @@ class AdmissionNoticeLiteService:
                     processor_task.result()
                 except asyncio.CancelledError:
                     await self._cancel_if_active(job)
+                except AdmissionNoticeLiteError as error:
+                    reason = (
+                        error.reason
+                        if error.reason in _SEMANTIC_FAILURE_REASONS
+                        else RecognitionErrorReasonLiteV1.INTERNAL_ERROR
+                    )
+                    logger.info(
+                        "Admission Notice Lite processor failed "
+                        "recognition_id={} reason={}",
+                        job.recognition_id,
+                        reason.value,
+                    )
+                    await self._finish_failed(job, reason)
                 except Exception:  # noqa: BLE001 - sanitize the processor boundary
                     logger.warning(
                         "Admission Notice Lite processor failed "

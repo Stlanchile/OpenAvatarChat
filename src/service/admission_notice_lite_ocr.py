@@ -483,6 +483,16 @@ class AdmissionNoticeOcrProcessorLiteV1:
         context: RecognitionJobContextLiteV1,
         frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
     ) -> None:
+        batch = await self.recognize_batch(context, frames)
+        del batch
+
+    async def recognize_batch(
+        self,
+        context: RecognitionJobContextLiteV1,
+        frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
+    ) -> OcrBatchLiteV1:
+        """Return one validated transient batch for immediate in-call consumption."""
+
         if context.cancel_event.is_set():
             raise asyncio.CancelledError
         remaining = context.expires_at_monotonic - time.monotonic()
@@ -514,7 +524,6 @@ class AdmissionNoticeOcrProcessorLiteV1:
         ):
             del batch
             raise asyncio.CancelledError
-        del batch
         logger.info(
             "Admission Notice Lite OCR completed recognition_id={} "
             "frame_count={} duration_ms={:.1f}",
@@ -522,6 +531,7 @@ class AdmissionNoticeOcrProcessorLiteV1:
             len(frames),
             (time.monotonic() - started_at) * 1000.0,
         )
+        return batch
 
 
 def _identity_is_qualified(identity: OcrRuntimeIdentityLiteV1) -> bool:

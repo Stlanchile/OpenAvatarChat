@@ -11,6 +11,7 @@ import math
 import os
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -63,6 +64,14 @@ from admission_notice_ocr.protocol import (
     read_request,
 )
 from scripts import admission_notice_lite_l3_qualify as integration_qualify
+from scripts.admission_notice_lite_l3_source_projection import (
+    HISTORICAL_L3_COMMIT,
+    L3_MAIN_SOURCE_PATHS,
+    L3_QUALIFICATION_SOURCE_PATHS,
+    L3_SIDECAR_SOURCE_PATHS,
+    historical_l3_qualification_source_sha256,
+    reconstruct_historical_l3_qualified_sources,
+)
 from service.admission_notice_lite_contracts import (
     MAX_OCR_AGGREGATE_CHARACTERS_PER_FRAME_LITE_V1,
     MAX_OCR_CHARACTERS_PER_SPAN_LITE_V1,
@@ -97,13 +106,6 @@ from service.service_data_models.admission_notice_lite_config import (
 APPROVED_MODEL_MANIFEST_SHA256 = (
     "1de89743e56affd2a220ae90fa2ce383bc8856714400737a5e4828beb0cd012b"
 )
-_DISABLED_QUALIFICATION_GATE_SOURCE = (
-    '"""Reviewed real-runtime qualification gate for Admission Notice Lite L3."""\n'
-    "\n"
-    "QUALIFIED_MODEL_MANIFEST_SHA256_LITE_V1: str | None = None\n"
-).encode()
-
-
 def _af_unix_blocker(directory: Path) -> str | None:
     socket_path = directory / "capability.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1852,20 +1854,28 @@ def _qualification_approval_matches(
 
 
 def _preapproval_qualification_source_sha256() -> str:
-    digest = hashlib.sha256()
-    gate_path = "src/service/admission_notice_lite_ocr_qualification.py"
-    for relative_path in (
-        integration_qualify._SIDECAR_SOURCE_PATHS
-        + integration_qualify._MAIN_SOURCE_PATHS
-    ):
-        digest.update(relative_path.encode("utf-8"))
-        digest.update(b"\0")
-        if relative_path == gate_path:
-            digest.update(_DISABLED_QUALIFICATION_GATE_SOURCE)
-        else:
-            digest.update((PROJECT_ROOT / relative_path).read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
+    assert L3_SIDECAR_SOURCE_PATHS == integration_qualify._SIDECAR_SOURCE_PATHS
+    assert L3_MAIN_SOURCE_PATHS == integration_qualify._MAIN_SOURCE_PATHS
+    current_sources = {
+        relative_path: (PROJECT_ROOT / relative_path).read_bytes()
+        for relative_path in L3_QUALIFICATION_SOURCE_PATHS
+    }
+    historical_sources = {
+        relative_path: subprocess.check_output(
+            (
+                "git",
+                "show",
+                f"{HISTORICAL_L3_COMMIT}:{relative_path}",
+            ),
+            cwd=PROJECT_ROOT,
+        )
+        for relative_path in L3_QUALIFICATION_SOURCE_PATHS
+    }
+    reconstructed = reconstruct_historical_l3_qualified_sources(
+        current_sources=current_sources,
+        historical_sources=historical_sources,
+    )
+    return historical_l3_qualification_source_sha256(reconstructed)
 
 
 def test_manifest_qualification_artifact_and_approval_gate_are_consistent() -> None:

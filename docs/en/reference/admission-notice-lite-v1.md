@@ -8,11 +8,12 @@ L0–L7. L0 provided the disabled configuration surface, L1 provided the
 process-local recognition control plane, L2 provided bounded memory-only
 multipart JPEG ingress, and L3 now implements a separately locked local CPU
 PaddleOCR sidecar over AF_UNIX. The current schema-v2 real-host qualification
-passed and its exact manifest is production-approved. When the matching
-sidecar is reachable, L3 performs bounded OCR and discards the validated
-result. It does not recognize an admission notice semantically.
-Template/college matching, field extraction, major handling, ChatAgent
-generation, and WebUI behavior remain requirements for later milestones, not
+passed and its exact manifest is production-approved. L4 now consumes the
+validated `OcrBatchLiteV1`, reconstructs geometric reading order, checks the
+one fixed institution and college, extracts the three supported semantic
+fields, and requires exact membership in the seven-major catalog. The L4
+result is transient and discarded in the same processor call. ChatAgent
+generation and WebUI behavior remain requirements for later milestones, not
 claims about current runtime behavior.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -246,8 +247,8 @@ All personal input and intermediate recognition data are memory-only:
 | HTTP | Bounded bytearrays | Until validation; never `UploadFile`, `request.form()`, or temporary-file spooling |
 | JPEG validation | Immutable encoded bytes plus transient decoded pixels | Decoded pixels released immediately after validation; source bytes released when processor work unwinds |
 | OCR | One bounded 1–3-frame UDS request | Request buffers released after the response or disconnect |
-| OCR spans | `OcrBatchLiteV1` | Validated and discarded when the L3 processor returns |
-| Extracted fields | Local values | Until typed context is built or the job fails |
+| OCR spans | `OcrBatchLiteV1` | Validated, consumed by L4, and discarded when the processor returns |
+| Extracted fields | `AdmissionNoticeResultLiteV1` local value | Discarded when the L4 processor returns |
 | Typed context | `AdmissionNoticeContextLiteV1` | Exactly one ChatAgent turn |
 | Job record | Identifier, owner, state, times, cancellation handle | In-memory TTL only |
 | Assistant response | Existing `AVATAR_TEXT` and normal history | Existing OpenAvatarChat behavior |
@@ -640,10 +641,25 @@ model manifest SHA-256 is
 the selected backend is `paddle_static`, the device is CPU, and the selected
 thread count is two. The report records successful real AF_UNIX integration,
 the real backend client and isolated sidecar, typed `OcrBatchLiteV1`, offline
-model use, and a production-shaped processor path reaching `COMPLETED`. GPU
-instrumentation was unavailable on the qualification host, so the report makes
-no live GPU-allocation claim; its available pre/post process counts were zero.
+model use, and a production-shaped processor path reaching `COMPLETED`. The
+production-approved L3 observation additionally recorded 20 live GPU samples
+with zero sidecar allocations. L4 does not alter or requalify this OCR tuple.
 The earlier schema-v1 `PASS` remains stale and is not accepted.
+No template/college matcher or field recognition participated in the L3
+qualified OCR data path.
+
+The source-identity regression uses a positive, explicitly enumerated L3
+projection tied to the exact historical L3 commit. L3 qualification covers the
+OCR runtime/protocol/typed OCR boundary. Later deterministic semantic layers
+may share source files but are not part of the OCR runtime qualification
+identity. Shared-file projection retains the OCR contracts, protocol/client,
+typed-batch validation, cancellation, timeouts, readiness, runtime identity,
+OCR-stage processor behavior, OCR failure paths, service lifecycle, and gate.
+Only the separately validated semantic error members, the typed-batch handoff
+to L4, and the narrow downstream semantic-failure handler are outside that
+view. The projection must equal the historical projection before the exact
+historical byte representation is accepted, and that representation must
+still hash to the source identity recorded in `qualification.json`.
 
 Qualification has two explicit dependency lanes. The sidecar-only command runs
 inside `services/admission_notice_ocr/.venv`, imports no FastAPI or
@@ -696,15 +712,109 @@ available during qualification.
 Operational commands and all six model artifact hashes are documented in the
 [`sidecar README`](../../../services/admission_notice_ocr/README.md).
 
-In L3, a successful processor return and job `COMPLETED` mean only:
+## L4 Semantic Recognition
 
-> The configured local OCR pipeline successfully processed the submitted
-> frames.
+L4 is a pure deterministic semantic layer over `OcrBatchLiteV1`. It has no
+HTTP, Paddle, sidecar, ChatSession, ChatAgent, storage, roster, or frontend
+dependency. Spans with raw Paddle recognition scores below `0.50` do not
+contribute evidence. This fixed threshold is only a conservative engine-score
+filter; it is not calibrated field confidence or a probability of document
+correctness.
 
-It does not mean the document is an HBTC admission notice, the college is
-交通信息学院, any name/province/major was extracted, any major is supported, or
-personalization occurred. No template/college matcher or field recognition
-exists in production L3.
+Each frame is evaluated independently. Geometry reconstructs visual lines,
+orders spans left-to-right, orders lines top-to-bottom, and permits only
+bounded related-line paths. Input span order does not choose the result.
+`MATCHED`, `NOT_MATCHED`, and `INSUFFICIENT` mean respectively compatible,
+affirmatively contradictory, and lacking enough reliable evidence. They do
+not express authenticity.
+
+A matched frame requires:
+
+- exact `湖北交通职业技术学院` evidence in a plausible upper title region;
+- exact `交通信息学院` evidence structurally associated with
+  `你被录取到我校`;
+- a conservative in-order combination of at least three of `同学`,
+  `高等学校招生委员会`, `你被录取到我校`, and `专业学习`; and
+- body evidence on at least two visual lines.
+
+A notice-like frame with a conflicting upper institution or a different
+plausible `...学院` after the admission anchor is `NOT_MATCHED`. Footer,
+unrelated-column, and explanatory/instruction-like mentions cannot substitute
+for the required geometric relationships. Across one to three frames, any
+`NOT_MATCHED` frame dominates; otherwise at least one individually `MATCHED`
+frame is required. The matcher never constructs a match by distributing the
+institution, college, and body grammar across different frames.
+
+For each matched frame, L4 extracts:
+
+- `name`, only immediately before `同学` on the same bounded visual run;
+- `source_province`, only from the sentence beginning with `经` and ending
+  through `高等学校招生委员会批准`, using a static province-level allowlist and
+  compact output such as `湖北` or `北京`; and
+- `major`, only from the complete bounded region ending at `专业学习`.
+
+Name and source province are optional. Conflicting found values across matched
+frames become ambiguous and are omitted. Major is required. Per-field merging
+is set-based and order-independent: equal found values agree, found plus
+missing keeps the found value, and different found values are ambiguous. There
+is no probability averaging or majority vote. A major conflict, including a
+base/qualified prefix pair, fails with `AMBIGUOUS_NOTICE`.
+
+The complete result is:
+
+```text
+AdmissionNoticeResultLiteV1 {
+    institution_name = "湖北交通职业技术学院"
+    college = "交通信息学院"
+    name: str | None
+    source_province: str | None
+    major: SupportedTrafficInformationMajorLiteV1
+}
+```
+
+`institution_name` and `college` are trusted application constants. `name`
+and `source_province` are OCR-derived. `major` is OCR-derived and then
+closed-catalog validated. Raw OCR, polygons, scores, identifiers, provenance,
+confidence, and generic metadata are not part of this result.
+
+Major normalization maps only `（`/`）` to `(`/`)`, `３`/`２` to `3`/`2`,
+and `＋` to `+`; trims outer whitespace; and removes whitespace directly
+adjacent to parentheses, plus signs, or the structural digits `3` and `2`.
+Every other character and whitespace occurrence is preserved. The complete
+normalized candidate must equal one of the seven catalog values. There is no
+edit distance, nearest-major selection, pinyin, confusion map, dictionary
+correction, embedding, LLM, or VLM correction.
+
+The parser reads through the complete region ending at `专业学习`; it never
+accepts the first valid catalog prefix. In particular,
+`计算机网络技术(3+2)` cannot collapse to `计算机网络技术`, and
+`智能交通技术(专本联合培养)` cannot collapse to `智能交通技术`. If qualifier
+content is present but incomplete or unsupported, recognition abstains. If
+OCR completely omits visually present qualifier text, however, the semantic
+layer cannot prove that the omitted text existed. Lite is a recognition
+system, not a high-assurance credential verifier.
+
+After L4, a successful processor return and job `COMPLETED` mean:
+
+> A supported 湖北交通职业技术学院交通信息学院 admission-notice content/layout
+> family was recognized and one exact supported major was extracted.
+
+It does not mean authenticity, issuer validation, enrollment confirmation,
+student lookup, or assistant-response generation. Semantic failures leave the
+public API coarse: POST remains `202`; later GET returns HTTP `200`, status
+`failed`, and exactly one stable category:
+
+| Stable reason | Meaning |
+|---|---|
+| `UNSUPPORTED_NOTICE` | A notice-like frame affirmatively conflicts on institution or college |
+| `INSUFFICIENT_NOTICE` | No individual frame establishes enough compatible template evidence |
+| `MAJOR_NOT_RECOGNIZED` | The template matches but the complete major candidate is not in the catalog |
+| `AMBIGUOUS_NOTICE` | Matched frames or candidates contain conflicting material semantic values |
+| `INTERNAL_ERROR` | An unexpected implementation or OCR boundary fault |
+
+The status API never returns institution, college, name, province, major, OCR
+text, polygons, or scores. The semantic result is neither retained in the job
+record nor cached for L5.
 
 ## ChatAgent Turn Boundary
 
@@ -824,8 +934,9 @@ L2 replaces only the POST's historical empty body with the bounded multipart
 contract above, adds `ValidatedAdmissionFrameLiteV1`, and passes its frame tuple
 through the processor seam. L3 adds only the qualified CPU OCR sidecar,
 protocol, typed transient OCR batch, client, and real processor described
-above. Admission Notice Lite can now perform real local CPU OCR, but it cannot
-understand the admission notice semantically.
+above. L4 composes that unchanged OCR tuple with the fixed pure semantic layer,
+transient result contract, four stable semantic failure categories, and
+seven-major catalog. It does not call ChatAgent or persist the result.
 
 Later regression suites MUST permanently cover prefix collisions, cross-session
 isolation, stale identifiers, admission before body reads, global and
@@ -884,7 +995,9 @@ ChatAgent behavior, TTS behavior, frontend change, dependency, listener,
 firewall manifest, PKI, or runtime integration. L1 added only the control-plane
 items described above. L2 adds only the memory-only multipart/JPEG ingress and
 processor-frame seam described above. L3 adds only the local CPU OCR layer; it
-adds no extractor, ChatAgent, TTS, or frontend behavior.
+adds no extractor, ChatAgent, TTS, or frontend behavior. L4 adds only semantic
+recognition and changes the meaning of `COMPLETED`; it adds no ChatAgent,
+prompt, tools, TTS, WebUI, frontend, roster, or authenticity behavior.
 
 L3 qualification does not qualify an HBTC template, field extraction, a
 remote-capable preset, TTS deployment, Avatar/RTC contention, horizontal
