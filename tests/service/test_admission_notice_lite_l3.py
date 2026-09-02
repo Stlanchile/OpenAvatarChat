@@ -64,6 +64,7 @@ from admission_notice_ocr.protocol import (
     encode_ping,
     read_request,
 )
+from chat_engine.core.chat_session import ChatSession
 from scripts import admission_notice_lite_l3_qualify as integration_qualify
 from scripts.admission_notice_lite_l3_source_projection import (
     HISTORICAL_L3_COMMIT,
@@ -1312,7 +1313,8 @@ async def _create_service_job(
     client: AdmissionNoticeOcrClientLiteV1,
     frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
 ):
-    owner = object()
+    owner = object.__new__(ChatSession)
+    owner._initialize_admission_context_state()
     ocr_processor = AdmissionNoticeOcrProcessorLiteV1(client)
 
     class _QualifiedOcrServiceProjection:

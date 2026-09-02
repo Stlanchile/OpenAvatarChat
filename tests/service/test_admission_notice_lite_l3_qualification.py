@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(MAIN_SOURCE) not in sys.path:
     sys.path.insert(0, str(MAIN_SOURCE))
 
+from chat_engine.core.chat_session import ChatSession
 from scripts import admission_notice_lite_l3_qualify as integration_qualify
 from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_ocr import (
@@ -751,7 +752,9 @@ async def test_real_production_builder_multipart_sidecar_integration(
 
         class Engine:
             def __init__(self) -> None:
-                self.sessions = {"owner": object()}
+                session = object.__new__(ChatSession)
+                session._initialize_admission_context_state()
+                self.sessions = {"owner": session}
                 self.observers = []
 
             def add_session_stop_observer(self, observer) -> None:
@@ -805,12 +808,7 @@ async def test_real_production_builder_multipart_sidecar_integration(
         assert status == {
             "recognition_id": recognition_id,
             "status": "completed",
-            "admission_context": {
-                "schema_version": "admission_context_v1",
-                "institution_name": "湖北交通职业技术学院",
-                "college": "交通信息学院",
-                "major": "智能交通技术",
-            },
+            "admission_context_active": True,
         }
         assert service.retained_frame_count == 0
     finally:

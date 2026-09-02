@@ -12,6 +12,7 @@ from PIL import Image
 
 import service.admission_notice_lite_service as lite_service_module
 from chat_engine.chat_engine import ChatEngine
+from chat_engine.core.chat_session import ChatSession
 from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     AdmissionNoticeLiteError,
@@ -61,9 +62,10 @@ _TEST_ADMISSION_CONTEXT = AdmissionContextV1(
 )
 
 
-class SessionStub:
+class SessionStub(ChatSession):
     def __init__(self) -> None:
         self.stopped = False
+        self._initialize_admission_context_state()
 
     def stop(self) -> None:
         self.stopped = True
@@ -176,6 +178,11 @@ async def _wait_for_state(
     for _ in range(200):
         snapshot = await service.get_recognition(session_id, recognition_id)
         if snapshot.state is expected:
+            if expected is RecognitionStateLiteV1.COMPLETED:
+                session = service._session_lookup(session_id)
+                context = session.active_admission_context
+                if context is not None:
+                    session.rollback_admission_context_install(context)
             return
         await asyncio.sleep(0)
     pytest.fail(f"recognition did not reach {expected.value}")

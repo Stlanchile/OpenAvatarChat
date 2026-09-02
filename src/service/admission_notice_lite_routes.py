@@ -8,7 +8,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from loguru import logger
 
-from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     AdmissionNoticeLiteError,
     RecognitionErrorReasonLiteV1,
@@ -21,6 +20,9 @@ from service.admission_notice_lite_ingestion import (
     parse_admission_multipart_request_spec,
 )
 from service.admission_notice_lite_service import AdmissionNoticeLiteService
+from service.admission_notice_lite_session_service import (
+    AdmissionNoticeSessionServiceLiteV1,
+)
 from service.service_data_models.admission_notice_lite_config import (
     AdmissionNoticeLiteFeatureConfigV1,
 )
@@ -57,10 +59,7 @@ def _internal_error_response() -> JSONResponse:
     )
 
 
-def _status_content(
-    job: RecognitionJobLiteV1,
-    admission_context: AdmissionContextV1 | None = None,
-) -> dict[str, object]:
+def _status_content(job: RecognitionJobLiteV1) -> dict[str, object]:
     content: dict[str, object] = {
         "recognition_id": job.recognition_id,
         "status": job.state.value.lower(),
@@ -68,11 +67,7 @@ def _status_content(
     if job.reason is not None:
         content["reason"] = job.reason.value
     if job.state is RecognitionStateLiteV1.COMPLETED:
-        if type(admission_context) is not AdmissionContextV1:
-            raise ValueError("completed recognition requires AdmissionContextV1")
-        content["admission_context"] = admission_context.to_public_dict()
-    elif admission_context is not None:
-        raise ValueError("only completed recognition may expose admission context")
+        content["admission_context_active"] = True
     return content
 
 
@@ -106,7 +101,7 @@ def register_admission_notice_lite_routes(
     if not config.enabled:
         return None
 
-    service = AdmissionNoticeLiteService(
+    service = AdmissionNoticeSessionServiceLiteV1(
         config=config,
         session_lookup=chat_engine.sessions.get,
         processor=processor,
@@ -154,19 +149,12 @@ def register_admission_notice_lite_routes(
                 AdmissionNoticeLiteError(RecognitionErrorReasonLiteV1.INVALID_REQUEST)
             )
         try:
-            job, admission_context = await service.get_recognition_with_context(
-                session_id,
-                recognition_id,
-            )
+            job = await service.get_recognition(session_id, recognition_id)
         except AdmissionNoticeLiteError as error:
             return _error_response(error)
         except Exception:  # noqa: BLE001 - sanitize the public route boundary
             return _internal_error_response()
-        try:
-            content = _status_content(job, admission_context)
-        except ValueError:
-            return _internal_error_response()
-        return JSONResponse(status_code=200, content=content)
+        return JSONResponse(status_code=200, content=_status_content(job))
 
     @app.delete(f"{_ROUTE_BASE}/{{recognition_id}}")
     async def cancel_recognition(

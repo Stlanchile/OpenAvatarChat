@@ -13,6 +13,7 @@ from loguru import logger
 from PIL import Image
 
 import service.admission_notice_lite_ingestion as ingestion_module
+from chat_engine.core.chat_session import ChatSession
 from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     RecognitionJobContextLiteV1,
@@ -44,9 +45,10 @@ _TEST_ADMISSION_CONTEXT = AdmissionContextV1(
 )
 
 
-class SessionStub:
+class SessionStub(ChatSession):
     def __init__(self) -> None:
         self.stopped = False
+        self._initialize_admission_context_state()
 
     def stop(self) -> None:
         self.stopped = True

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from loguru import logger
 
+from chat_engine.core.chat_session import ChatSession
 from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     AdmissionNoticeLiteError,
@@ -43,6 +44,12 @@ from service.service_data_models.admission_notice_lite_config import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APPROVED_MANIFEST = "1de89743e56affd2a220ae90fa2ce383bc8856714400737a5e4828beb0cd012b"
+
+
+def _session() -> ChatSession:
+    session = object.__new__(ChatSession)
+    session._initialize_admission_context_state()
+    return session
 
 
 def _span(
@@ -603,7 +610,7 @@ async def test_processor_composes_real_l3_contract_and_discards_l4_result() -> N
 
 @pytest.mark.asyncio
 async def test_processor_semantic_failure_reaches_stable_terminal_reason() -> None:
-    owner = object()
+    owner = _session()
     processor = _semantic_processor(
         _OcrClientStub(_batch(_frame(college="汽车工程学院")))
     )
@@ -689,7 +696,7 @@ async def test_retained_semantic_failure_task_has_no_ocr_or_jpeg_traceback_data(
             transient=True,
         )
     )
-    owner = object()
+    owner = _session()
     service = AdmissionNoticeLiteService(
         config=AdmissionNoticeLiteFeatureConfigV1(enabled=True),
         session_lookup=lambda value: owner if value == "owner" else None,
@@ -763,7 +770,7 @@ async def test_unexpected_semantic_failure_traceback_is_also_sanitized(
     processor = _semantic_processor(
         _OcrClientStub(batch, transient=True),
     )
-    owner = object()
+    owner = _session()
     service = AdmissionNoticeLiteService(
         config=AdmissionNoticeLiteFeatureConfigV1(enabled=True),
         session_lookup=lambda value: owner if value == "owner" else None,

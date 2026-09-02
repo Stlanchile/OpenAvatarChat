@@ -4,7 +4,7 @@
 
 This document is the normative architecture, privacy boundary, and threat model
 for Admission Notice Lite v1. It freezes the implemented behavior through
-L6R and stops before L7 deployment. L0 provided the configuration surface, L1 provided the
+L6V and stops before L7 deployment. L0 provided the configuration surface, L1 provided the
 process-local recognition control plane, L2 provided bounded memory-only
 multipart JPEG ingress, and L3 now implements a separately locked local CPU
 PaddleOCR sidecar over AF_UNIX. The current schema-v2 real-host qualification
@@ -13,12 +13,13 @@ validated `OcrBatchLiteV1`, reconstructs geometric reading order, checks the
 one fixed institution and college, extracts the three supported semantic
 fields, and requires exact membership in the seven-major catalog. The L4
 result is projected into one immutable sanitized `AdmissionContextV1`. L6
-provides the existing WebUI camera flow. L6R returns the sanitized context to
-the trusted frontend, keeps it only in frontend memory, prepends it to later
-ordinary frontend text requests, and resets conversation state when the user
-ends use. Recognition itself invokes no ChatAgent, emits no assistant text,
-and triggers no TTS or Avatar speech. Deployment qualification and pilot
-acceptance remain L7 work.
+provides the existing WebUI camera flow. L6V binds the sanitized context to the
+exact live backend `ChatSession`, injects it once at the shared ordinary
+`HUMAN_TEXT` workflow boundary for both typed text and backend ASR transcripts,
+and atomically clears context plus conversation state when the user ends use.
+The frontend keeps only a coarse active indicator. Recognition itself invokes
+no ChatAgent, emits no assistant text, and triggers no TTS or Avatar speech.
+Deployment qualification and pilot acceptance remain L7 work.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
 **SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **MAY**, and **OPTIONAL** are to be
@@ -222,13 +223,15 @@ Fixed HBTC + 交通信息学院 matcher
 name? / source_province? / exact supported major
           │
           ▼
-AdmissionContextV1 retained on the bounded terminal record
+AdmissionContextV1 installed on the exact live ChatSession
           │
           ▼
-Owner GET -> trusted frontend memory-only active context
+Owner GET -> coarse admission_context_active signal
           │
-          ▼
-Deterministic prefix on each later frontend TEXT request
+          ├── frontend typed text ──┐
+          └── backend ASR text ─────┤
+                                   ▼
+One backend serializer at the shared ordinary HUMAN_TEXT workflow boundary
           │
           ▼
 Ordinary HUMAN_TEXT / workflow / tools / history / Avatar / WS / RTC
@@ -255,9 +258,9 @@ All personal input and intermediate recognition data are memory-only:
 | OCR | One bounded 1–3-frame UDS request | Request buffers released after the response or disconnect |
 | OCR spans | `OcrBatchLiteV1` | Validated, consumed by L4, and discarded when the processor returns |
 | Extracted fields | `AdmissionNoticeResultLiteV1` local value | Projected immediately and discarded in the same processor call |
-| Sanitized context | `AdmissionContextV1` | Existing bounded completed-record retention only |
-| Frontend active context | `AdmissionContextV1 \| null` | Memory only; cleared on end use, session replacement, unmount, or refresh |
-| Job record | Identifier, owner, state, times, cancellation handle, optional completed context | In-memory TTL and terminal-capacity bound only |
+| Sanitized context | `AdmissionContextV1 \| None` on the exact `ChatSession` | From successful activation until end use, exact-session teardown/replacement, or process restart |
+| Frontend active state | `admissionContextActive: boolean` plus current session correlation | Memory only; cleared on acknowledged end use, session replacement/loss, unmount, or refresh |
+| Job record | Identifier, owner, state, times, and cancellation handle | In-memory TTL and terminal-capacity bound only; no active-lifetime DTO copy |
 | Ordinary conversation | Repeated augmented `HUMAN_TEXT` while active | Existing backend history lifetime; reset when the user ends use |
 
 The following v1 bounds are frozen:
@@ -397,7 +400,7 @@ student data, or timestamp. With a trusted injected processor, POST returns
 ```
 
 GET returns the identifier and lowercase state, an allowlisted reason when one
-applies, and the sanitized context only for `completed`:
+applies, and only a coarse activation signal for `completed`:
 
 ```json
 {"recognition_id": "<opaque server-generated id>", "status": "processing"}
@@ -407,14 +410,7 @@ applies, and the sanitized context only for `completed`:
 {
   "recognition_id": "<opaque server-generated id>",
   "status": "completed",
-  "admission_context": {
-    "schema_version": "admission_context_v1",
-    "institution_name": "湖北交通职业技术学院",
-    "college": "交通信息学院",
-    "name": "李明",
-    "source_province": "湖北",
-    "major": "智能交通技术(专本联合培养)"
-  }
+  "admission_context_active": true
 }
 ```
 
@@ -665,7 +661,7 @@ thread count is two. The report records successful real AF_UNIX integration,
 the real backend client and isolated sidecar, typed `OcrBatchLiteV1`, offline
 model use, and the historical L3 processor path reaching its then-current
 `COMPLETED` state. This is qualification evidence for OCR execution, not the
-current L6R public completion contract. The
+current L6V public completion contract. The
 production-approved L3 observation additionally recorded 20 live GPU samples
 with zero sidecar allocations. L4 does not alter or requalify this OCR tuple.
 The earlier schema-v1 `PASS` remains stale and is not accepted.
@@ -824,8 +820,9 @@ L4 semantic success by itself means:
 > family was recognized and one exact supported major was extracted.
 
 It does not mean authenticity, issuer validation, enrollment confirmation, or
-student lookup. L6R projects semantic success into the sanitized public context
-before the processor returns. Semantic failures leave the public API coarse:
+student lookup. L6V projects semantic success into the sanitized DTO, installs
+it on the exact still-current `ChatSession`, and only then publishes completed
+ACTIVE semantics. Semantic failures leave the public API coarse:
 POST remains `202`; later GET returns HTTP `200`, status `failed`, and exactly
 one stable category:
 
@@ -837,12 +834,13 @@ one stable category:
 | `AMBIGUOUS_NOTICE` | Matched frames or candidates contain conflicting material semantic values |
 | `INTERNAL_ERROR` | An unexpected implementation or OCR boundary fault |
 
-Only a `completed` status returns the sanitized structured context described
-below. Failed, cancelled, and expired states return no context. No response
+Only a `completed` status returns `admission_context_active: true`; the
+structured values remain backend-owned. Failed, cancelled, and expired states
+return no context signal. No response
 returns OCR text, spans, polygons, scores, frames, candidates, reading order,
 provenance, model identity, prompt text, or assistant text.
 
-## Structured Result and Persistent Frontend Context
+## Structured Result and Session-Scoped Backend Context
 
 The immutable server-produced DTO is exactly:
 
@@ -864,12 +862,14 @@ trusted constants, optional-field bounds, and exact seven-major catalog. It
 contains no recognition ID, confidence, verification bit, OCR value,
 provenance, diagnostic, or model identity.
 
-The recognition job retains only this DTO on a successful terminal record. It
-uses the existing maximum-64 terminal-record capacity and
-`min(30 seconds, recognition_ttl_seconds)` retention. The owner GET response
-includes `admission_context` only for `completed`. Purging that terminal record
-also drops the backend context; there is no session-level admission store,
-database, independent TTL, or admission context endpoint.
+The L6V session service installs this DTO on the exact `ChatSession` and
+transitions the recognition job to `COMPLETED` in one narrow session-lock
+critical section. A job that was already cancelled, expired, replaced, or
+otherwise no longer processing never reaches installation. The terminal job
+does not retain another DTO copy. The owner GET
+response includes only `admission_context_active: true`. There is no database,
+filesystem persistence, independent TTL, process-level context registry, or
+admission-context endpoint.
 
 `COMPLETED` means that a supported 湖北交通职业技术学院交通信息学院 admission notice
 was recognized, an exact supported major was extracted, and a sanitized
@@ -877,14 +877,30 @@ was recognized, an exact supported major was extracted, and a sanitized
 completed, the Avatar spoke, or authenticity, enrollment, or eligibility was
 verified.
 
-After owner GET, the frontend stores the DTO in
-`activeAdmissionContext: AdmissionContextV1 | null`. This state is memory-only;
-it is never written to localStorage, sessionStorage, IndexedDB, Cache Storage,
-cookies, a service worker, or the filesystem. It is cleared on successful end
-use, session replacement/loss, unmount, or page refresh.
+After owner GET, the frontend stores only
+`admissionContextActive: boolean` and the current session correlation. It does
+not retain name, province, major, or the complete DTO for conversation
+augmentation. This coarse state is memory-only; it is never written to
+localStorage, sessionStorage, IndexedDB, Cache Storage, cookies, a service
+worker, or the filesystem. It is cleared only after acknowledged end use,
+session replacement/loss, unmount, or page refresh.
 
-Every later frontend-originated normal text request is transformed once, at
-the final WS or RTC send boundary:
+There is no active-context recovery endpoint. A refresh starts the frontend in
+normal IDLE mode; when existing transport behavior destroys the exact
+`ChatSession`, backend teardown drops the context as well. If a transport were
+to preserve that exact backend object while the page reloads, this milestone
+still performs no frontend recovery query. Process restart also clears the
+memory-only context naturally.
+
+While an exact session has active context, another recognition POST for that
+session returns the existing stable `409 RECOGNITION_ALREADY_ACTIVE` conflict.
+The current context is not replaced or cleared. After acknowledged end use, a
+new recognition may reserve and install a new context.
+
+The frontend sends the user's original visible text through the ordinary WS or
+RTC transport. Typed text and backend ASR transcripts converge as ordinary
+`HUMAN_TEXT`. Immediately before the response-producing workflow consumer, the
+backend makes a per-consumer copy and transforms it once:
 
 ```text
 <admission-context schema="admission_context_v1">
@@ -900,40 +916,51 @@ the final WS or RTC send boundary:
 </user-message>
 ```
 
-One canonical serializer uses `JSON.stringify`, deterministic context field
-order, omitted undefined optionals, and `\u003c`, `\u003e`, and `\u0026`
-transport escaping. User text is a JSON value inside its wrapper, so text such
-as `</user-message>` cannot terminate the structure. The frontend associates
-the transport request/stream key with the original visible message and renders
-only that original value when the ordinary human-text echo returns.
+One canonical Python serializer uses `json.dumps`, deterministic context field
+order, omitted unavailable optionals, preserved Unicode, and `\u003c`,
+`\u003e`, and `\u0026` wrapper escaping. User text is a JSON value inside its
+wrapper, so text such as `</user-message>` cannot terminate the structure. The
+shared input object used by client echo remains unmodified, so visible history
+continues to show only the user's original text.
 
-The backend receives the augmented value through the unchanged normal
-`HUMAN_TEXT` path. Ordinary workflow, ChatAgent, tools, history, TTS, Avatar,
-WS, and RTC behavior remains configured normally. No tool suppression,
+The augmented copy enters the unchanged normal workflow input. Ordinary
+workflow, ChatAgent, tools, history, TTS, Avatar, WS, and RTC behavior remains
+configured normally. No tool suppression,
 one-round limit, admission-specific workflow route, or admission reply
 implementation exists. Recognition completion alone produces no assistant
 message, `AVATAR_TEXT`, TTS call, or Avatar speech.
 
-Because this is a frontend-only injection design, the repeated structured
-context intentionally enters ordinary backend dialogue/history and may be
-observed by existing ordinary conversation logging. Admission-specific code
-does not log the context or augmented request. Ending use therefore sends a
-reset command over the exact bound primary WS/RTC control transport. The
-backend acquires the existing per-ChatAgent generation lock, then clears
+While ACTIVE, the repeated structured context intentionally enters ordinary
+backend dialogue/history for every typed or ASR turn and may be observed by
+existing ordinary conversation logging. Admission-specific code does not log
+the context or augmented request. Ending use sends the existing reset command
+over the exact bound primary WS/RTC control transport. The backend acquires the
+exact session admission lock and, for ChatAgent, its existing generation lock,
+then clears
 WorkingMemory dialogue/intent/mode/task summary/compaction summary and pending
 confirmations, the session summary, pending writeback items, input buffer,
 pending/responded events, task notifications, SessionHistory events and stream
 accumulators, and playback history links. It leaves the `ChatSession`, handler
 registry, WebSocket, RTC peer/data channel, Avatar renderer, tool
-configuration, and transport alive. The frontend clears active context and
-visible history only after the bound transport acknowledges success. While
+configuration, and transport alive. The same successful critical section
+discards pending `MIC_AUDIO`, `HUMAN_AUDIO`, and `HUMAN_TEXT` work from the
+session handler queues, clears the exact session's active
+`AdmissionContextV1`, and prevents in-flight VAD, ASR, or workflow text
+processing from crossing the reset boundary. The frontend clears its coarse
+active indicator and visible history only after the bound transport
+acknowledges success. While
 that acknowledgement is pending, frontend text sends and microphone transport
 are gated; the RTC receiver also rejects text/audio ingress during its reset
 boundary. A failed reset retains active context and exposes retry state.
+Reservation plus installation use the same narrow session lock: if reset wins,
+it revokes the pending activation; if recognition installs first, reset clears
+it. Teardown closes the session-owned state, so replacement with the same
+superficial ID inherits nothing.
 
 Microphone/audio-originated turns are transcribed only on the backend in both
-the WS and RTC modes and bypass every frontend text-send seam. Persistent
-admission context currently applies to frontend-originated text requests only.
+WS and RTC modes. The order is audio, ASR, plain transcript, backend admission
+augmentation, then normal workflow. Voice and keyboard turns therefore receive
+the same active context without changing speech recognition.
 
 ### L6 WebUI Capture Lifecycle
 
@@ -1005,14 +1032,14 @@ single `PROCESSING` UX state. Polling has one outstanding GET, an
 `AbortController`, a 120-second bounded UX lifetime, and immediate teardown on
 terminal state, close, unmount, or current-session change.
 
-`completed` must carry one valid `admission_context_v1`. L6R stores it in
-frontend memory, stops polling, drops image state, stops the capture camera,
-restores ordinary video if handed off, clears the recognition identifier,
-closes the overlay, and enters the persistent active state. Missing, malformed,
-extra-field, or unsupported-major context fails closed and never activates the
-mode. `failed`, `cancelled`, and `expired` carry no context and use only
-allowlisted stable public reasons. Recognition completion creates no assistant
-message or Avatar/TTS output.
+`completed` must carry `admission_context_active: true`, which is emitted only
+after exact-session installation. L6V stores that coarse state in frontend
+memory, stops polling, drops image state, stops the capture camera, restores
+ordinary video if handed off, clears the recognition identifier, closes the
+overlay, and enters ACTIVE mode. Missing, false, extra-field, or structured
+context-value responses fail closed. `failed`, `cancelled`, and `expired`
+carry no context signal and use only allowlisted stable public reasons.
+Recognition completion creates no assistant message or Avatar/TTS output.
 
 Closing before POST acceptance aborts local work and needs no DELETE. After a
 known `recognition_id`, close, session change, or teardown issues at most one
@@ -1044,12 +1071,12 @@ served. The bundled Uvicorn entry point disables its access log whenever Lite
 is enabled and suppresses informational Uvicorn WebSocket target logs. A
 deployment proxy MUST enforce the same boundary.
 
-While active, the fixed frontend preamble and sanitized context intentionally
+While active, the fixed backend preamble and sanitized context intentionally
 become part of ordinary backend `HUMAN_TEXT`, history, workflow processing, and
-any existing ordinary conversation logging. This is an explicit tradeoff of
-the frontend-only design and replaces the obsolete L5 invariant that admission
-context stayed outside SessionHistory. End use resets that server-side
-conversation state before the frontend claims a clean idle mode.
+any existing ordinary conversation logging for both typed and ASR turns. This
+replaces the obsolete L5 invariant that admission context stayed outside
+SessionHistory. End use atomically resets that server-side conversation state
+and active context before the frontend claims a clean idle mode.
 
 All success, failure, cancellation, disconnect, replacement, and expiry paths
 MUST release transient references. Document-originated instructions MUST remain
@@ -1074,7 +1101,7 @@ cherry-picked into Lite. Reuse is manual and focused:
 | OCR contracts and UDS | Rewrite | Bounded page spans and sequential CPU-only requests; no epochs, identities, receipts, or authority |
 | Reading order | Port algorithm | Remove hardened imports and provenance |
 | Institution, college, name, province, and major matching | Rewrite | One fixed HBTC/交通信息学院 extractor and the closed seven-major catalog |
-| Structured result and active context | Rewrite narrowly | Sanitized terminal DTO, frontend memory, deterministic ordinary-text prefix, and bound-transport conversation reset |
+| Structured result and active context | Rewrite narrowly | Exact-session backend DTO, shared typed/ASR `HUMAN_TEXT` augmentation, coarse frontend state, and atomic bound-transport reset |
 | Browser image preparation and camera handoff | Manually ported in L6 | Fixed image bounds plus direct-first, video-only fallback handoff |
 | Hardened frontend API and state machine | Dropped | L6 uses only the three Lite endpoints and the small UX FSM above |
 | Authentication, lineage, fencing, coordination, encrypted evidence, and release authority | Drop | No OIDC/JWKS, security envelopes, `WorkFence`, `CaptureCoordinator`, private store, or declassification framework |
@@ -1098,6 +1125,7 @@ Implementation is divided into these hard boundaries:
 | L5 | Historical automatic personalization implementation, removed by L6R |
 | L6 | Manual WebUI camera/recognition port |
 | L6R | Structured result handoff, persistent frontend context mode, ordinary-text augmentation, and end-use reset |
+| L6V | Exact-session backend context, unified typed/ASR augmentation, coarse frontend state, and atomic context/history reset |
 | L7 | Fixtures, end-to-end tests, and deployment qualification |
 
 L1 is limited to `RecognitionJobLiteV1`, server-generated recognition
@@ -1119,9 +1147,9 @@ seven-major catalog. It does not call ChatAgent or persist the result.
 Later regression suites MUST permanently cover prefix collisions, cross-session
 isolation, stale identifiers, admission before body reads, global and
 per-session capacity, sequential OCR, resource bounds, strict result parsing,
-single-prefix transport augmentation, visible-message isolation, reset
-failure, session replacement, cleanup/privacy, and prohibited authenticity
-wording.
+one backend prefix for typed and ASR turns, unchanged visible messages,
+reset/recognition races, reset failure, session replacement, cleanup/privacy,
+and prohibited authenticity wording.
 
 ## L0 and L1 Configuration
 
@@ -1259,12 +1287,14 @@ recognition and changes the meaning of `COMPLETED`; it adds no ChatAgent,
 prompt, tools, TTS, WebUI, frontend, roster, or authenticity behavior.
 
 The historical L5 automatic ChatAgent bridge is removed. L6 adds only the WebUI
-camera, review, Lite API polling, and cleanup lifecycle. L6R adds only the
-sanitized completed-result handoff, frontend in-memory active state,
-deterministic ordinary-text augmentation, bound-transport generic conversation
-reset, and associated UI/tests. It adds no backend persistent admission
-context, workflow schema/parser, admission-specific reply, special tool
-policy, database, middleware, `SecurityEnvelope`, `WorkFence`, or new
-authentication/capability system. Historical L3 qualification does not qualify
-browser/device behavior, TTS deployment, horizontal scaling, or final
-end-to-end deployment. Those remain L7 work.
+camera, review, Lite API polling, and cleanup lifecycle. L6R introduced the
+sanitized result handoff and end-use reset. L6V moves active context ownership
+to the exact backend session, narrows the frontend to a coarse indicator,
+removes the frontend serializer, and augments typed plus backend-ASR
+`HUMAN_TEXT` at one shared boundary. It adds no persistent context, workflow
+schema/parser, admission-specific reply, special tool policy, database,
+middleware, `SecurityEnvelope`, `WorkFence`, or new authentication/capability
+system. Session/process restart naturally discards context; reconnect recovery
+is not added. Historical L3 qualification does not qualify browser/device
+behavior, TTS deployment, horizontal scaling, or final end-to-end deployment.
+Those remain L7 work.
