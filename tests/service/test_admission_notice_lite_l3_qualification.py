@@ -22,6 +22,7 @@ if str(MAIN_SOURCE) not in sys.path:
     sys.path.insert(0, str(MAIN_SOURCE))
 
 from scripts import admission_notice_lite_l3_qualify as integration_qualify
+from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_ocr import (
     AdmissionNoticeOcrProcessorLiteV1,
     build_qualified_admission_notice_ocr_processor_lite_v1,
@@ -733,6 +734,21 @@ async def test_real_production_builder_multipart_sidecar_integration(
         processor = build_qualified_admission_notice_ocr_processor_lite_v1(config)
         assert isinstance(processor, AdmissionNoticeOcrProcessorLiteV1)
 
+        class QualifiedOcrRouteProjection:
+            async def prepare_for_ingestion(self) -> bool:
+                return await processor.prepare_for_ingestion()
+
+            async def process(self, context, frames) -> AdmissionContextV1:
+                await processor.process(context, frames)
+                return AdmissionContextV1(
+                    schema_version="admission_context_v1",
+                    institution_name="湖北交通职业技术学院",
+                    college="交通信息学院",
+                    name=None,
+                    source_province=None,
+                    major="智能交通技术",
+                )
+
         class Engine:
             def __init__(self) -> None:
                 self.sessions = {"owner": object()}
@@ -746,7 +762,7 @@ async def test_real_production_builder_multipart_sidecar_integration(
             app=app,
             chat_engine=Engine(),
             config=config,
-            processor=processor,
+            processor=QualifiedOcrRouteProjection(),
         )
         assert service is not None
         frames = integration_qualify._validated_frames(
@@ -789,6 +805,12 @@ async def test_real_production_builder_multipart_sidecar_integration(
         assert status == {
             "recognition_id": recognition_id,
             "status": "completed",
+            "admission_context": {
+                "schema_version": "admission_context_v1",
+                "institution_name": "湖北交通职业技术学院",
+                "college": "交通信息学院",
+                "major": "智能交通技术",
+            },
         }
         assert service.retained_frame_count == 0
     finally:

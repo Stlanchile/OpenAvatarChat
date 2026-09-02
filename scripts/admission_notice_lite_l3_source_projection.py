@@ -415,11 +415,37 @@ def _project_contracts(
                 and item.target.id
                 in {"publication_lock", "owning_session", "session_is_current"}
             ]
-            if len(l5_fields) not in {0, 3}:
+            if len(l5_fields) not in {0, 1, 3}:
                 raise L3SourceProjectionError(
                     "contracts L5 recognition context fields changed"
                 )
+            if len(l5_fields) == 1 and (
+                not isinstance(l5_fields[0].target, ast.Name)
+                or l5_fields[0].target.id != "session_is_current"
+            ):
+                raise L3SourceProjectionError(
+                    "contracts L6R current-session guard changed"
+                )
             projected.body = [item for item in projected.body if item not in l5_fields]
+            entries.append((f"class:{name}", _dump(projected)))
+            continue
+        if name == "RecognitionProcessorLiteV1":
+            projected = copy.deepcopy(node)
+            methods = [
+                item
+                for item in projected.body
+                if isinstance(item, ast.AsyncFunctionDef) and item.name == "process"
+            ]
+            if len(methods) != 1 or not (
+                isinstance(methods[0].returns, ast.Constant)
+                and methods[0].returns.value is None
+                or isinstance(methods[0].returns, ast.Name)
+                and methods[0].returns.id == "object"
+            ):
+                raise L3SourceProjectionError(
+                    "contracts processor result boundary changed"
+                )
+            methods[0].returns = ast.Constant(value=None)
             entries.append((f"class:{name}", _dump(projected)))
             continue
         if name != "RecognitionErrorReasonLiteV1":
@@ -633,6 +659,18 @@ def _remove_l5_job_context_attachment(service: ast.ClassDef) -> None:
     }
     if not l5_keywords:
         return
+    if set(l5_keywords) == {"session_is_current"}:
+        session_is_current = ast.unparse(l5_keywords["session_is_current"].value)
+        if session_is_current != (
+            "lambda: self._session_lookup(job.owning_session_id) is "
+            "job.owning_session and id(job.owning_session) not in "
+            "self._invalidated_owner_keys"
+        ):
+            raise L3SourceProjectionError(
+                "service L6R current-session check changed"
+            )
+        call.keywords.remove(l5_keywords["session_is_current"])
+        return
     if set(l5_keywords) != {
         "owning_session",
         "session_is_current",
@@ -756,6 +794,158 @@ def _remove_l5_publication_fence(
     transition.body = [item for item in body if item not in cancel_sets]
 
 
+def _remove_l6r_result_handoff(
+    runtime: ast.ClassDef,
+    service: ast.ClassDef,
+) -> None:
+    context_fields = [
+        item
+        for item in runtime.body
+        if isinstance(item, ast.AnnAssign)
+        and isinstance(item.target, ast.Name)
+        and item.target.id == "admission_context"
+    ]
+    if not context_fields:
+        return
+    if len(context_fields) != 1:
+        raise L3SourceProjectionError("service L6R retained context field changed")
+    runtime.body.remove(context_fields[0])
+
+    extra_methods = [
+        item
+        for item in service.body
+        if isinstance(item, ast.AsyncFunctionDef)
+        and item.name == "get_recognition_with_context"
+    ]
+    if len(extra_methods) != 1:
+        raise L3SourceProjectionError("service L6R owner GET handoff changed")
+    service.body.remove(extra_methods[0])
+
+    transition = next(
+        item
+        for item in service.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "_transition_terminal_locked"
+    )
+    context_clears = [
+        item
+        for item in transition.body
+        if isinstance(item, ast.If)
+        and ast.unparse(item.test)
+        == "state is not RecognitionStateLiteV1.COMPLETED"
+    ]
+    if len(context_clears) != 1 or tuple(
+        ast.unparse(item) for item in context_clears[0].body
+    ) != ("job.admission_context = None",):
+        raise L3SourceProjectionError("service L6R terminal context clearing changed")
+    transition.body.remove(context_clears[0])
+
+    run_job = next(
+        item
+        for item in service.body
+        if isinstance(item, ast.AsyncFunctionDef) and item.name == "_run_job"
+    )
+    processor_task_fields = [
+        item
+        for item in run_job.body
+        if isinstance(item, ast.AnnAssign)
+        and isinstance(item.target, ast.Name)
+        and item.target.id == "processor_task"
+    ]
+    if len(processor_task_fields) != 1 or ast.unparse(
+        processor_task_fields[0].annotation
+    ) != "asyncio.Task[object] | None":
+        raise L3SourceProjectionError("service L6R processor result type changed")
+    processor_task_fields[0].annotation = ast.parse(
+        "asyncio.Task[None] | None",
+        mode="eval",
+    ).body
+
+    result_handlers = [
+        node
+        for node in ast.walk(run_job)
+        if isinstance(node, ast.Try)
+        and node.body
+        and isinstance(node.body[0], ast.Assign)
+        and ast.unparse(node.body[0]) == "admission_context = processor_task.result()"
+    ]
+    if len(result_handlers) != 1:
+        raise L3SourceProjectionError("service L6R processor handoff changed")
+    result_handler = result_handlers[0]
+    if len(result_handler.orelse) != 1 or ast.unparse(result_handler.orelse[0]) != (
+        "if type(admission_context) is not AdmissionContextV1:\n"
+        "    await self._finish_failed(job, RecognitionErrorReasonLiteV1.INTERNAL_ERROR)\n"
+        "else:\n"
+        "    await self._finish_completed(job, admission_context)"
+    ):
+        raise L3SourceProjectionError("service L6R result validation changed")
+    result_handler.body[0] = ast.Expr(
+        value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="processor_task", ctx=ast.Load()),
+                attr="result",
+                ctx=ast.Load(),
+            ),
+            args=[],
+            keywords=[],
+        )
+    )
+    result_handler.orelse = [
+        ast.Expr(
+            value=ast.Await(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="self", ctx=ast.Load()),
+                        attr="_finish_completed",
+                        ctx=ast.Load(),
+                    ),
+                    args=[ast.Name(id="job", ctx=ast.Load())],
+                    keywords=[],
+                )
+            )
+        )
+    ]
+
+    finish = next(
+        item
+        for item in service.body
+        if isinstance(item, ast.AsyncFunctionDef) and item.name == "_finish_completed"
+    )
+    if (
+        len(finish.args.args) != 3
+        or finish.args.args[-1].arg != "admission_context"
+        or len(finish.body) < 2
+        or ast.unparse(finish.body[0])
+        != (
+            "if type(admission_context) is not AdmissionContextV1:\n"
+            "    raise TypeError('expected exact AdmissionContextV1')"
+        )
+    ):
+        raise L3SourceProjectionError("service L6R completion handoff changed")
+    finish.args.args.pop()
+    finish.body.pop(0)
+    lock = finish.body[0]
+    if not isinstance(lock, ast.AsyncWith):
+        raise L3SourceProjectionError("service L6R completion lock changed")
+    retained = [
+        item
+        for item in lock.body
+        if ast.unparse(item) == "job.admission_context = admission_context"
+    ]
+    rollback = [
+        item
+        for item in lock.body
+        if isinstance(item, ast.If)
+        and ast.unparse(item)
+        == "if not transitioned:\n    job.admission_context = None"
+    ]
+    if len(retained) != 1 or len(rollback) != 1:
+        raise L3SourceProjectionError("service L6R completion retention changed")
+    lock.body = [
+        item for item in lock.body if item not in {*retained, *rollback}
+    ]
+
+
 def _project_service(
     source: bytes,
     semantic_failure_names: frozenset[str],
@@ -772,10 +962,28 @@ def _project_service(
     service = definitions["AdmissionNoticeLiteService"]
     if not isinstance(service, ast.ClassDef):
         raise L3SourceProjectionError("AdmissionNoticeLiteService changed kind")
-    if _class_method_inventory(service) != _SERVICE_METHODS:
+    method_inventory = _class_method_inventory(service)
+    current_methods = list(_SERVICE_METHODS)
+    current_methods.insert(
+        current_methods.index("cancel_recognition"),
+        "get_recognition_with_context",
+    )
+    if method_inventory not in {_SERVICE_METHODS, tuple(current_methods)}:
         raise L3SourceProjectionError("service method inventory changed")
 
     projected_imports = [copy.deepcopy(node) for node in imports]
+    context_imports = [
+        node
+        for node in projected_imports
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "service.admission_notice_lite_chat_context"
+        and tuple(alias.name for alias in node.names) == ("AdmissionContextV1",)
+    ]
+    if len(context_imports) not in {0, 1}:
+        raise L3SourceProjectionError("service L6R context import changed")
+    projected_imports = [
+        node for node in projected_imports if node not in context_imports
+    ]
     threading_imports = [
         node
         for node in projected_imports
@@ -791,6 +999,7 @@ def _project_service(
     if not isinstance(projected_runtime, ast.ClassDef):
         raise L3SourceProjectionError("service runtime changed kind")
     projected_service = copy.deepcopy(service)
+    _remove_l6r_result_handoff(projected_runtime, projected_service)
     _remove_reviewed_semantic_handler(
         projected_service,
         expected=bool(semantic_failure_names),

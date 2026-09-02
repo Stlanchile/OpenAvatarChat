@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from loguru import logger
+from service.admission_notice_lite_chat_context import AdmissionContextV1
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -1312,7 +1313,24 @@ async def _create_service_job(
     frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
 ):
     owner = object()
-    processor = AdmissionNoticeOcrProcessorLiteV1(client)
+    ocr_processor = AdmissionNoticeOcrProcessorLiteV1(client)
+
+    class _QualifiedOcrServiceProjection:
+        async def prepare_for_ingestion(self) -> bool:
+            return await ocr_processor.prepare_for_ingestion()
+
+        async def process(self, context, service_frames) -> AdmissionContextV1:
+            await ocr_processor.process(context, service_frames)
+            return AdmissionContextV1(
+                schema_version="admission_context_v1",
+                institution_name="湖北交通职业技术学院",
+                college="交通信息学院",
+                name=None,
+                source_province=None,
+                major="智能交通技术",
+            )
+
+    processor = _QualifiedOcrServiceProjection()
     service = AdmissionNoticeLiteService(
         config=AdmissionNoticeLiteFeatureConfigV1(enabled=True),
         session_lookup=lambda session_id: owner if session_id == "owner" else None,

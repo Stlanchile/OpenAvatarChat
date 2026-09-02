@@ -46,12 +46,6 @@ from handlers.agent.prompt.prompt_compiler import (
     LAYER_PERSONA_SNAPSHOT,
     LAYER_ENVIRONMENT_STATE,
 )
-from service.admission_notice_lite_chat_context import (
-    AdmissionNoticeContextLiteV1,
-    ChatAgentTurnContextLiteV1,
-)
-
-
 # ── 主动消息触发配置 ──
 
 class EventTriggerConfig(BaseModel):
@@ -268,7 +262,6 @@ class ChatAgentContext(HandlerContext):
         # 输入缓冲
         self.input_buffer: str = ""
         self.is_generating: bool = False
-        self._admission_turn_active: bool = False
 
         # 事件响应追踪
         self.responded_events: Dict[str, float] = {}
@@ -437,60 +430,41 @@ class ChatAgentHandler(HandlerBase, ABC):
             self._handle_human_text(context, inputs, output_definitions)
             return
 
-    def personalize_admission_notice_lite_v1(
+    def reset_conversation(
         self,
         context: ChatAgentContext,
-        admission_notice: AdmissionNoticeContextLiteV1,
-        output_definitions: Dict[ChatDataType, HandlerDataInfo],
         *,
-        cancel_check: Callable[[], bool],
-        publication_lock: object,
-        request_deadline_monotonic: float,
+        timeout_seconds: float = 10.0,
+        clear_session_history: Callable[[], None] | None = None,
     ) -> bool:
-        """Run one typed, tool-free admission turn on the existing output path."""
+        """Clear conversation semantics without destroying the live handler."""
         if not isinstance(context, ChatAgentContext):
-            raise TypeError("expected exact ChatAgentContext")
-        if type(admission_notice) is not AdmissionNoticeContextLiteV1:
-            raise TypeError("expected exact AdmissionNoticeContextLiteV1")
-        if not callable(cancel_check):
-            raise TypeError("cancel_check must be callable")
-        if request_deadline_monotonic <= 0:
-            raise ValueError("request_deadline_monotonic must be positive")
-
-        acquired = False
-        while not cancel_check():
-            acquired = context._generate_lock.acquire(timeout=0.05)
-            if acquired:
-                break
+            raise TypeError("expected ChatAgentContext")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        acquired = context._generate_lock.acquire(timeout=timeout_seconds)
         if not acquired:
             return False
-
         try:
-            if cancel_check():
+            if context.is_generating:
                 return False
-            context._admission_turn_active = True
-            context.is_generating = True
-            context.last_interaction_time = time.time()
+            if context.memory is not None:
+                context.memory.reset_conversation()
+            context.input_buffer = ""
+            context.pending_events.clear()
+            context.responded_events.clear()
+            context.active_stream_keys.clear()
+            if context.task_queue is not None:
+                context.task_queue.drain()
+            if context.pending_confirmations is not None:
+                context.pending_confirmations.clear()
+            if clear_session_history is not None:
+                clear_session_history()
             context._idle_triggered = False
-            context.output_definitions = output_definitions
-            turn_context = ChatAgentTurnContextLiteV1(admission_notice)
-            prompt_input = self._build_admission_notice_prompt_input_lite_v1(
-                context,
-                admission_notice,
-            )
-            return self._generate_response(
-                context,
-                prompt_input,
-                output_definitions,
-                turn_context=turn_context,
-                cancel_check=cancel_check,
-                publication_lock=publication_lock,
-                request_deadline_monotonic=request_deadline_monotonic,
-            )
+            context.last_interaction_time = time.time()
+            return True
         finally:
-            context.is_generating = False
             context._generate_lock.release()
-            context._admission_turn_active = False
 
     # ── PERCEPTION_CONTEXT ──
 
@@ -666,20 +640,10 @@ class ChatAgentHandler(HandlerBase, ABC):
         # input takes priority, but we must not overlap _generate_response).
         acquired = context._generate_lock.acquire(timeout=10.0)
         if not acquired:
-            admission_wait = context._admission_turn_active
-            if admission_wait:
-                logger.info(
-                    "[ChatAgent] User input remains serialized behind the "
-                    "admission turn"
-                )
-                while not acquired and not context._idle_stop.is_set():
-                    acquired = context._generate_lock.acquire(timeout=0.05)
             logger.warning(
-                "[ChatAgent] User input generation-lock wait completed "
-                f"acquired={acquired}"
+                f"[ChatAgent] 用户输入 '{full_text[:40]}' 等待生成锁超时，已跳过本轮"
             )
-            if admission_wait and not acquired:
-                return
+            return
         try:
             logger.info("[ChatAgent] ══════════════════════════════════════════")
             logger.info(f"[ChatAgent] 开始处理用户输入: '{full_text}'")
@@ -762,28 +726,6 @@ class ChatAgentHandler(HandlerBase, ABC):
             ),
         )
 
-    def _build_admission_notice_prompt_input_lite_v1(
-        self,
-        context: ChatAgentContext,
-        admission_notice: AdmissionNoticeContextLiteV1,
-    ) -> PromptInput:
-        """Build the prompt-only attachment without recording or draining memory."""
-        persona_snapshot = ""
-        if context.persona_mgr:
-            persona_snapshot = context.persona_mgr.get_snapshot()
-        return PromptInput(
-            trigger_type="admission_notice",
-            persona_snapshot=persona_snapshot,
-            dialogue_history=(
-                context.memory.get_dialogue_for_llm(
-                    context.config.max_dialogue_turns
-                )
-                if context.memory
-                else []
-            ),
-            admission_notice=admission_notice,
-        )
-
     # ── LLM 调用 + 流式输出 + Agent Loop ──
 
     def _generate_response(
@@ -791,22 +733,15 @@ class ChatAgentHandler(HandlerBase, ABC):
         context: ChatAgentContext,
         prompt_input: PromptInput,
         output_definitions: Dict[ChatDataType, HandlerDataInfo],
-        *,
-        turn_context: ChatAgentTurnContextLiteV1 | None = None,
-        cancel_check: Callable[[], bool] | None = None,
-        publication_lock: object | None = None,
-        request_deadline_monotonic: float | None = None,
     ) -> bool:
         output_definition = output_definitions.get(ChatDataType.AVATAR_TEXT).definition
         streamer = context.data_submitter.get_streamer(ChatDataType.AVATAR_TEXT)
-        is_admission_turn = turn_context is not None
 
         if context.llm_client is None:
             logger.error("[ChatAgent] LLM client unavailable")
-            if not is_admission_turn:
-                output = DataBundle(output_definition)
-                output.set_main_data("抱歉，我暂时无法处理您的请求，请稍后再试。")
-                streamer.stream_data(output, finish_stream=True)
+            output = DataBundle(output_definition)
+            output.set_main_data("抱歉，我暂时无法处理您的请求，请稍后再试。")
+            streamer.stream_data(output, finish_stream=True)
             context.is_generating = False
             return False
 
@@ -826,13 +761,8 @@ class ChatAgentHandler(HandlerBase, ABC):
             f"messages={compiled.message_count}"
         )
 
-        if is_admission_turn:
-            logger.debug(
-                "[ChatAgent] Admission Notice Lite prompt logging suppressed"
-            )
-        else:
-            self._log_incomplete_work_summary(context)
-            self._debug_log_prompt(context, compiled)
+        self._log_incomplete_work_summary(context)
+        self._debug_log_prompt(context, compiled)
 
         if stream_key:
             context.active_stream_keys.add(stream_key)
@@ -843,62 +773,31 @@ class ChatAgentHandler(HandlerBase, ABC):
         try:
             full_response = self._agent_loop(
                 context, messages, output_definition, streamer, stream_key,
-                turn_context=turn_context,
-                cancel_check=cancel_check,
-                publication_lock=publication_lock,
-                request_deadline_monotonic=request_deadline_monotonic,
             )
 
             if full_response is None:
                 cancelled = True
                 return False
 
-            if is_admission_turn:
-                logger.info(
-                    "[ChatAgent] Admission Notice Lite response generated"
-                )
-                if publication_lock is None:
-                    raise RuntimeError("admission publication lock is required")
-                with publication_lock:
-                    if cancel_check is not None and cancel_check():
-                        cancelled = True
-                        return False
-                    if not full_response:
-                        cancelled = True
-                        return False
-                    if context.memory:
-                        context.memory.record_assistant_response(full_response)
-                    succeeded = True
-                    end_output = DataBundle(output_definition)
-                    end_output.set_main_data("")
-                    streamer.stream_data(end_output, finish_stream=True)
-                    stream_terminal = True
-            else:
-                logger.info(f"[ChatAgent] 回复: '{full_response[:80]}...'")
-                if full_response and context.memory:
-                    context.memory.record_assistant_response(full_response)
-                    self._check_compact(context)
-                succeeded = bool(full_response)
+            logger.info(f"[ChatAgent] 回复: '{full_response[:80]}...'")
+            if full_response and context.memory:
+                context.memory.record_assistant_response(full_response)
+                self._check_compact(context)
+            succeeded = bool(full_response)
 
         except Exception as e:
-            if is_admission_turn:
-                logger.error(
-                    "[ChatAgent] Admission Notice Lite generation failed"
-                )
-            else:
-                logger.error(f"[ChatAgent] LLM 调用失败: {e}")
-                output = DataBundle(output_definition)
-                output.set_main_data("抱歉，我暂时无法处理您的请求，请稍后再试。")
-                streamer.stream_data(output, finish_stream=True)
-                stream_terminal = True
-            cancelled = is_admission_turn
+            logger.error(f"[ChatAgent] LLM 调用失败: {e}")
+            output = DataBundle(output_definition)
+            output.set_main_data("抱歉，我暂时无法处理您的请求，请稍后再试。")
+            streamer.stream_data(output, finish_stream=True)
+            stream_terminal = True
             return False
         finally:
             if stream_key:
                 context.active_stream_keys.discard(stream_key)
             if stream_terminal:
                 pass
-            elif cancelled or (cancel_check is not None and cancel_check()):
+            elif cancelled:
                 streamer.cancel_current()
             else:
                 end_output = DataBundle(output_definition)
@@ -925,31 +824,20 @@ class ChatAgentHandler(HandlerBase, ABC):
         output_definition,
         streamer,
         stream_key: Optional[str],
-        *,
-        turn_context: ChatAgentTurnContextLiteV1 | None = None,
-        cancel_check: Callable[[], bool] | None = None,
-        publication_lock: object | None = None,
-        request_deadline_monotonic: float | None = None,
     ) -> Optional[str]:
         """Multi-step agent loop: LLM call → tool_use → feedback → repeat.
 
         Returns the final text response, or None if cancelled.
         """
         registry = context.tool_registry
-        if turn_context is not None:
-            use_tools = False
-            max_rounds = 1
-        else:
-            use_tools = (
-                registry is not None
-                and registry.has_tools()
-                and context.config.tool_use.enabled
-            )
-            max_rounds = context.config.tool_use.max_tool_rounds
+        use_tools = (
+            registry is not None
+            and registry.has_tools()
+            and context.config.tool_use.enabled
+        )
+        max_rounds = context.config.tool_use.max_tool_rounds
 
         for round_idx in range(max_rounds):
-            if cancel_check is not None and cancel_check():
-                return None
             tools_param = registry.get_schemas() if use_tools else None
 
             kwargs = dict(
@@ -959,13 +847,6 @@ class ChatAgentHandler(HandlerBase, ABC):
             )
             if tools_param:
                 kwargs["tools"] = tools_param
-            if turn_context is not None:
-                if request_deadline_monotonic is None:
-                    raise RuntimeError("admission request deadline is required")
-                kwargs["timeout"] = max(
-                    0.05,
-                    request_deadline_monotonic - time.monotonic(),
-                )
 
             self._apply_llm_extra_body(context, kwargs)
 
@@ -973,8 +854,6 @@ class ChatAgentHandler(HandlerBase, ABC):
 
             full_text, tool_calls, cancelled = self._stream_response(
                 context, response, output_definition, streamer, stream_key,
-                cancel_check=cancel_check,
-                publication_lock=publication_lock,
             )
 
             if cancelled:
@@ -983,12 +862,6 @@ class ChatAgentHandler(HandlerBase, ABC):
 
             if not tool_calls:
                 return full_text
-            if not use_tools:
-                logger.warning(
-                    "[ChatAgent] Ignored unsolicited tool calls with tools disabled"
-                )
-                return full_text
-
             # LLM requested tool calls — execute and continue the loop
             logger.info(
                 f"[ChatAgent] Agent loop round {round_idx + 1}: "

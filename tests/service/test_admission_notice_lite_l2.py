@@ -13,6 +13,7 @@ from loguru import logger
 from PIL import Image
 
 import service.admission_notice_lite_ingestion as ingestion_module
+from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     RecognitionJobContextLiteV1,
     ValidatedAdmissionFrameLiteV1,
@@ -33,6 +34,14 @@ from service.service_data_models.admission_notice_lite_config import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROUTE = "/api/v1/sessions/owner/admission-notice/recognitions"
 BOUNDARY = b"admission-lite-v1-test-boundary"
+_TEST_ADMISSION_CONTEXT = AdmissionContextV1(
+    schema_version="admission_context_v1",
+    institution_name="湖北交通职业技术学院",
+    college="交通信息学院",
+    name=None,
+    source_province=None,
+    major="智能交通技术",
+)
 
 
 class SessionStub:
@@ -50,7 +59,7 @@ class EngineStub:
 
     def add_session_stop_observer(
         self, observer: Callable[[str, SessionStub], None]
-    ) -> None:
+    ) -> AdmissionContextV1:
         self.observers.append(observer)
 
     def stop_session(self, session_id: str) -> None:
@@ -122,7 +131,7 @@ class ImageProcessorFake:
         self,
         context: RecognitionJobContextLiteV1,
         frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
-    ) -> None:
+    ) -> AdmissionContextV1:
         del context
         self.calls += 1
         self.live_frames = frames
@@ -151,6 +160,7 @@ class ImageProcessorFake:
                 raise self.failure
         finally:
             self.live_frames = ()
+        return _TEST_ADMISSION_CONTEXT
 
 
 def _config(

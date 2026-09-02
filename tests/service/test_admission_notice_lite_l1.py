@@ -12,6 +12,7 @@ from PIL import Image
 
 import service.admission_notice_lite_service as lite_service_module
 from chat_engine.chat_engine import ChatEngine
+from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     AdmissionNoticeLiteError,
     RecognitionErrorReasonLiteV1,
@@ -49,6 +50,14 @@ _DIRECT_TEST_FRAMES = (
         height=1,
         exif_orientation=1,
     ),
+)
+_TEST_ADMISSION_CONTEXT = AdmissionContextV1(
+    schema_version="admission_context_v1",
+    institution_name="湖北交通职业技术学院",
+    college="交通信息学院",
+    name=None,
+    source_province=None,
+    major="智能交通技术",
 )
 
 
@@ -91,7 +100,7 @@ class ControlPlaneProcessorFake:
         self,
         context: RecognitionJobContextLiteV1,
         frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
-    ) -> None:
+    ) -> AdmissionContextV1:
         del context
         assert frames
         self.calls += 1
@@ -106,6 +115,7 @@ class ControlPlaneProcessorFake:
                         raise
         if self.failure is not None:
             raise self.failure
+        return _TEST_ADMISSION_CONTEXT
 
 
 def _config(

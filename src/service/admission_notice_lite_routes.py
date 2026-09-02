@@ -8,11 +8,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from loguru import logger
 
+from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     AdmissionNoticeLiteError,
     RecognitionErrorReasonLiteV1,
     RecognitionJobLiteV1,
     RecognitionProcessorLiteV1,
+    RecognitionStateLiteV1,
 )
 from service.admission_notice_lite_ingestion import (
     ingest_admission_frames,
@@ -55,13 +57,22 @@ def _internal_error_response() -> JSONResponse:
     )
 
 
-def _status_content(job: RecognitionJobLiteV1) -> dict[str, str]:
-    content = {
+def _status_content(
+    job: RecognitionJobLiteV1,
+    admission_context: AdmissionContextV1 | None = None,
+) -> dict[str, object]:
+    content: dict[str, object] = {
         "recognition_id": job.recognition_id,
         "status": job.state.value.lower(),
     }
     if job.reason is not None:
         content["reason"] = job.reason.value
+    if job.state is RecognitionStateLiteV1.COMPLETED:
+        if type(admission_context) is not AdmissionContextV1:
+            raise ValueError("completed recognition requires AdmissionContextV1")
+        content["admission_context"] = admission_context.to_public_dict()
+    elif admission_context is not None:
+        raise ValueError("only completed recognition may expose admission context")
     return content
 
 
@@ -143,12 +154,19 @@ def register_admission_notice_lite_routes(
                 AdmissionNoticeLiteError(RecognitionErrorReasonLiteV1.INVALID_REQUEST)
             )
         try:
-            job = await service.get_recognition(session_id, recognition_id)
+            job, admission_context = await service.get_recognition_with_context(
+                session_id,
+                recognition_id,
+            )
         except AdmissionNoticeLiteError as error:
             return _error_response(error)
         except Exception:  # noqa: BLE001 - sanitize the public route boundary
             return _internal_error_response()
-        return JSONResponse(status_code=200, content=_status_content(job))
+        try:
+            content = _status_content(job, admission_context)
+        except ValueError:
+            return _internal_error_response()
+        return JSONResponse(status_code=200, content=content)
 
     @app.delete(f"{_ROUTE_BASE}/{{recognition_id}}")
     async def cancel_recognition(

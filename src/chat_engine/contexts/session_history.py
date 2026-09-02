@@ -169,7 +169,16 @@ class SessionHistory:
         with self._accumulator_lock:
             self._stream_chunk_hashes.pop(stream_key, None)
             return self._stream_accumulators.pop(stream_key, None)
-    
+
+    def clear(self) -> None:
+        """Clear all conversation events and incomplete stream accumulators."""
+        with self._accumulator_lock:
+            self._events.clear()
+            self._event_index.clear()
+            self._stream_accumulators.clear()
+            self._stream_chunk_hashes.clear()
+            self._last_cleanup_time = time.monotonic()
+
     def add_event(self, event: HistoryEvent) -> str:
         """
         Add an event to history.

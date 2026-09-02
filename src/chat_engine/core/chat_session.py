@@ -360,3 +360,10 @@ class ChatSession:
 
     def emit_signal(self, signal: ChatSignal):
         self.signal_manager.get_emitter("chat_session").emit(signal)
+
+    def clear_conversation_history(self):
+        """Clear visible/session history without stopping transports or handlers."""
+        history = self.session_context.session_history
+        if history is not None:
+            history.clear()
+        self._playback_begin_event_ids.clear()

@@ -109,6 +109,11 @@ class PendingConfirmationsManager:
         with self._lock:
             return any(i.status == "pending" for i in self._items.values())
 
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._rounds_since_reminded = 0
+
     def get_pending_items(self) -> List[PendingItem]:
         with self._lock:
             return [i for i in self._items.values() if i.status == "pending"]

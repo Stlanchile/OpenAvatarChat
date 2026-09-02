@@ -301,7 +301,7 @@ def test_l4_result_matcher_and_extractors_are_outside_the_l3_path_inventory(
     assert l3_projection_sha256(current_sources) == baseline
 
 
-def test_l5_chatagent_bridge_is_outside_the_l3_path_inventory() -> None:
+def test_removed_l5_bridge_and_l6r_dto_remain_outside_l3_inventory() -> None:
     assert set(L5_DOWNSTREAM_SOURCE_PATHS).isdisjoint(L3_QUALIFICATION_SOURCE_PATHS)
     assert set(L5_DOWNSTREAM_SOURCE_PATHS) == {
         "src/demo.py",
@@ -310,7 +310,12 @@ def test_l5_chatagent_bridge_is_outside_the_l3_path_inventory() -> None:
         "src/service/admission_notice_lite_chat_context.py",
         "src/service/admission_notice_lite_personalization.py",
     }
-    assert all((PROJECT_ROOT / path).is_file() for path in L5_DOWNSTREAM_SOURCE_PATHS)
+    assert not (
+        PROJECT_ROOT / "src/service/admission_notice_lite_personalization.py"
+    ).exists()
+    assert (
+        PROJECT_ROOT / "src/service/admission_notice_lite_chat_context.py"
+    ).is_file()
 
 
 def test_projection_rejects_unknown_shared_top_level_code(

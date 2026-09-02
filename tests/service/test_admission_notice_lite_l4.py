@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from loguru import logger
 
+from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     AdmissionNoticeLiteError,
     OcrBatchLiteV1,
@@ -558,18 +559,11 @@ class _OcrClientStub:
         return batch
 
 
-class _NoopPersonalizer:
-    async def personalize(self, context, result) -> bool:
-        del context, result
-        return True
-
-
 def _semantic_processor(
     client: _OcrClientStub,
 ) -> AdmissionNoticeSemanticProcessorLiteV1:
     return AdmissionNoticeSemanticProcessorLiteV1(
-        AdmissionNoticeOcrProcessorLiteV1(client),
-        _NoopPersonalizer(),
+        AdmissionNoticeOcrProcessorLiteV1(client)
     )
 
 
@@ -593,7 +587,16 @@ async def test_processor_composes_real_l3_contract_and_discards_l4_result() -> N
         expires_at_monotonic=time.monotonic() + 10,
         cancel_event=asyncio.Event(),
     )
-    await processor.process(context, (_validated_frame(),))
+    admission_context = await processor.process(context, (_validated_frame(),))
+    assert type(admission_context) is AdmissionContextV1
+    assert admission_context.to_public_dict() == {
+        "schema_version": "admission_context_v1",
+        "institution_name": "湖北交通职业技术学院",
+        "college": "交通信息学院",
+        "name": "张三",
+        "source_province": "湖北",
+        "major": "智能交通技术",
+    }
     assert not hasattr(processor, "result")
     assert not hasattr(context, "result")
 

@@ -23,6 +23,7 @@ from chat_engine.data_models.chat_signal import ChatSignal
 from chat_engine.data_models.chat_signal_type import ChatSignalType, ChatSignalSourceType
 from engine_utils.interval_counter import IntervalCounter
 from handlers.client.ws_client.ws_message_protocol import (
+    ConversationResetAccepted,
     EchoHumanText,
     EchoTextPayload,
     MessageHeader,
@@ -66,6 +67,7 @@ class RtcStream(AsyncAudioVideoStreamHandler):
 
         self.chat_channel = None
         self.chat_channel_loop = None
+        self._conversation_resetting = False
         self.first_audio_emitted = False
 
         self.quit = asyncio.Event()
@@ -221,7 +223,7 @@ class RtcStream(AsyncAudioVideoStreamHandler):
             raise
 
     async def receive(self, frame: tuple[int, np.ndarray]):
-        if self.client_session_delegate is None:
+        if self.client_session_delegate is None or self._conversation_resetting:
             return
         timestamp = self.client_session_delegate.get_timestamp()
         if timestamp[0] / timestamp[1] < self.stream_start_delay:
@@ -280,6 +282,8 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                         )
                     )
                 elif message['header']['name'] == 'SendHumanText':
+                    if self._conversation_resetting:
+                        return
                     # self.client_session_delegate.emit_signal(
                     #     ChatSignal(
                     #         type=ChatSignalType.INTERRUPT,
@@ -322,9 +326,55 @@ class RtcStream(AsyncAudioVideoStreamHandler):
                             self.chat_channel.send(json.dumps(serialize_message(response)))
                         except Exception as e:
                             logger.opt(exception=e).warning("Failed to send local human text echo")
+                elif message['header']['name'] == 'ResetConversation':
+                    request_id = message.get("header", {}).get("request_id")
+                    if (
+                        not isinstance(request_id, str)
+                        or not request_id
+                        or self._conversation_resetting
+                    ):
+                        return
+                    loop = self.chat_channel_loop
+                    if loop is not None and not loop.is_closed():
+                        self._conversation_resetting = True
+                        loop.create_task(self._reset_bound_conversation(request_id))
                 # else:
 
                 # channel.send(json.dumps({"type": "chat", "unique_id": unique_id, "message": message}))
+
+    async def _reset_bound_conversation(self, request_id: str) -> None:
+        try:
+            delegate = self.client_session_delegate
+            if delegate is None:
+                return
+            reset = await asyncio.to_thread(delegate.reset_conversation)
+            if self.chat_channel is None:
+                return
+            if reset:
+                response = ConversationResetAccepted(
+                    header=MessageHeader(
+                        name=MessageType.CONVERSATION_RESET_ACCEPTED,
+                        request_id=request_id,
+                    )
+                )
+                self.chat_channel.send(json.dumps(serialize_message(response)))
+                return
+            self.chat_channel.send(
+                json.dumps(
+                    {
+                        "header": {
+                            "name": "Error",
+                            "request_id": request_id,
+                        },
+                        "payload": {
+                            "code": "INTERNAL_ERROR",
+                            "message": "Conversation reset could not reach a safe boundary",
+                        },
+                    }
+                )
+            )
+        finally:
+            self._conversation_resetting = False
           
     async def on_chat_datachannel(self, message: Dict, channel):
         # {"type":"chat",id:"标识属于同一段话", "message":"Hello, world!"}

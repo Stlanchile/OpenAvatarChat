@@ -1,7 +1,7 @@
 import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Union, Tuple, Optional
+from typing import Callable, Union, Tuple, Optional
 
 import gradio
 import numpy as np
@@ -21,6 +21,12 @@ class ClientSessionDelegate(ABC):
     # FIXME the definition of ClientSessionDelegate is not clear enough
     # the caller of this class is supposed to be the client to access data from the session,
     # should be refactored.
+    _conversation_reset_callback: Callable[[], bool] | None = None
+
+    def reset_conversation(self) -> bool:
+        callback = self._conversation_reset_callback
+        return callback() if callback is not None else False
+
     @abstractmethod
     async def get_data(self, modality: EngineChannelType, timeout: Optional[float] = 0.1) -> Optional[ChatData]:
         # from chat service to client
@@ -70,6 +76,14 @@ class ClientHandlerDelegate:
             raise RuntimeError(msg)
         session_delegate = handler_env.handler_info.client_session_delegate_class()
         handler_env.handler.on_setup_session_delegate(session.session_context, handler_env.context, session_delegate)
+        from service.conversation_reset import (
+            reset_exact_chat_session_conversation,
+        )
+
+        session_delegate._conversation_reset_callback = lambda: (
+            engine.sessions.get(session_id) is session
+            and reset_exact_chat_session_conversation(session)
+        )
         self.session_delegates[session_id] = session_delegate
         return session_delegate
 

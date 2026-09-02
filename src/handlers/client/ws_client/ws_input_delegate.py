@@ -34,7 +34,8 @@ from .ws_message_protocol import (
     InterruptNotification, InterruptNotificationPayload,
     MessageHeader, EchoTextPayload, EchoAvatarAudioPayload, ErrorPayload, ErrorCode,
     InitializeAvatarSession, SendHumanAudio, SendHumanVideo,
-    SendHumanText, TriggerHeartbeat, Interrupt, EndSpeech,
+    SendHumanText, TriggerHeartbeat, Interrupt, ResetConversation,
+    ConversationResetAccepted, EndSpeech,
     MotionDataMessage, MotionDataPayload, BinaryDataInfo, ChatSignalPayload, ChatSignalMessage, MessageType,
     AudioFormat
 )
@@ -1232,6 +1233,30 @@ class WsInputSessionDelegate(ClientSessionDelegate):
         )
         await self._send_message(websocket, response)
 
+    async def _handle_reset_conversation(
+        self,
+        websocket: WebSocket,
+        msg: ResetConversation,
+    ) -> None:
+        reset = await asyncio.to_thread(self.reset_conversation)
+        if not reset:
+            await self._send_error(
+                websocket,
+                msg.header.request_id,
+                ErrorCode.INTERNAL_ERROR,
+                "Conversation reset could not reach a safe boundary",
+            )
+            return
+        await self._send_message(
+            websocket,
+            ConversationResetAccepted(
+                header=MessageHeader(
+                    name="ConversationResetAccepted",
+                    request_id=msg.header.request_id,
+                )
+            ),
+        )
+
     async def _handle_server_interrupt_signal(self, signal: ChatSignal):
         """
         处理服务端发起的 INTERRUPT 语义信号。
@@ -1344,6 +1369,8 @@ class WsInputSessionDelegate(ClientSessionDelegate):
                         await self._handle_text_data(websocket, msg)
                     elif isinstance(msg, Interrupt):
                         await self._handle_interrupt(websocket, msg)
+                    elif isinstance(msg, ResetConversation):
+                        await self._handle_reset_conversation(websocket, msg)
                     elif isinstance(msg, EndSpeech):
                         self._handle_end_speech(msg)
 

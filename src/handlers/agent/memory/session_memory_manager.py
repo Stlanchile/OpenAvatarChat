@@ -332,6 +332,13 @@ class SessionMemoryManager:
         """手动触发写回队列 flush。"""
         return self.write_back_queue.flush()
 
+    def reset_conversation(self) -> None:
+        """Clear prompt-bearing dialogue state while keeping the manager live."""
+        self.working_memory.clear()
+        self._summary_generator.clear()
+        self.write_back_queue.discard_pending()
+        logger.info("[SessionMemoryManager] conversation reset")
+
     def destroy(self):
         """会话结束时清理。"""
         self.write_back_queue.shutdown()

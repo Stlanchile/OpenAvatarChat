@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
+from service.admission_notice_lite_chat_context import AdmissionContextV1
 from service.admission_notice_lite_contracts import (
     AdmissionNoticeLiteError,
     RecognitionErrorReasonLiteV1,
@@ -13,9 +14,6 @@ from service.admission_notice_lite_contracts import (
     ValidatedAdmissionFrameLiteV1,
 )
 from service.admission_notice_lite_ocr import AdmissionNoticeOcrProcessorLiteV1
-from service.admission_notice_lite_personalization import (
-    AdmissionNoticePersonalizerProtocolLiteV1,
-)
 from service.admission_notice_lite_semantics import (
     recognize_admission_notice_semantics,
 )
@@ -23,10 +21,9 @@ from service.admission_notice_lite_semantics import (
 
 @dataclass(frozen=True, slots=True)
 class AdmissionNoticeSemanticProcessorLiteV1:
-    """Compose qualified OCR, pure semantics, and one transient ChatAgent turn."""
+    """Compose qualified OCR and pure semantics into one sanitized result."""
 
     ocr_processor: AdmissionNoticeOcrProcessorLiteV1
-    personalizer: AdmissionNoticePersonalizerProtocolLiteV1
 
     async def prepare_for_ingestion(self) -> bool:
         return await self.ocr_processor.prepare_for_ingestion()
@@ -35,7 +32,7 @@ class AdmissionNoticeSemanticProcessorLiteV1:
         self,
         context: RecognitionJobContextLiteV1,
         frames: tuple[ValidatedAdmissionFrameLiteV1, ...],
-    ) -> None:
+    ) -> AdmissionContextV1:
         batch = await self.ocr_processor.recognize_batch(context, frames)
         semantic_started = time.monotonic()
         semantic_failure_reason = None
@@ -67,39 +64,23 @@ class AdmissionNoticeSemanticProcessorLiteV1:
         ):
             del result
             raise asyncio.CancelledError
+        admission_context = AdmissionContextV1.from_result(result)
+        del result
         logger.info(
             "Admission Notice Lite semantics completed recognition_id={} "
             "duration_ms={:.1f}",
             context.recognition_id,
             (time.monotonic() - semantic_started) * 1000.0,
         )
-        personalization_started = time.monotonic()
-        personalized = False
-        try:
-            personalized = await self.personalizer.personalize(context, result)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - sanitize the ChatAgent task boundary
-            personalized = False
-        finally:
-            del result
-        if not personalized:
-            raise AdmissionNoticeLiteError(RecognitionErrorReasonLiteV1.INTERNAL_ERROR)
-        logger.info(
-            "Admission Notice Lite personalization completed recognition_id={} "
-            "duration_ms={:.1f}",
-            context.recognition_id,
-            (time.monotonic() - personalization_started) * 1000.0,
-        )
+        return admission_context
 
 
 def compose_admission_notice_semantic_processor_lite_v1(
     ocr_processor: AdmissionNoticeOcrProcessorLiteV1 | None,
-    personalizer: AdmissionNoticePersonalizerProtocolLiteV1 | None = None,
 ) -> AdmissionNoticeSemanticProcessorLiteV1 | None:
-    if ocr_processor is None or personalizer is None:
+    if ocr_processor is None:
         return None
-    return AdmissionNoticeSemanticProcessorLiteV1(ocr_processor, personalizer)
+    return AdmissionNoticeSemanticProcessorLiteV1(ocr_processor)
 
 
 __all__ = [

@@ -59,6 +59,11 @@ class WriteBackQueue(ABC):
         ...
 
     @abstractmethod
+    def discard_pending(self) -> int:
+        """Discard queued items without shutting down the live queue."""
+        ...
+
+    @abstractmethod
     def shutdown(self):
         """关闭队列，释放资源。"""
         ...
@@ -112,6 +117,12 @@ class LocalWriteBackQueue(WriteBackQueue):
 
     def pending_count(self) -> int:
         return len(self._queue)
+
+    def discard_pending(self) -> int:
+        with self._lock:
+            count = len(self._queue)
+            self._queue.clear()
+        return count
 
     def shutdown(self):
         self.flush()

@@ -22,6 +22,7 @@ class MessageType(str, Enum):
     SEND_HUMAN_TEXT = "SendHumanText"
     TRIGGER_HEARTBEAT = "TriggerHeartbeat"
     INTERRUPT = "Interrupt"
+    RESET_CONVERSATION = "ResetConversation"
     
     # 输入端口 - 服务器消息
     AVATAR_SESSION_INITIALIZED = "AvatarSessionInitialized"
@@ -31,6 +32,7 @@ class MessageType(str, Enum):
     AVATAR_HEARTBEAT = "AvatarHeartbeat"
     INTERRUPT_ACCEPTED = "InterruptAccepted"
     INTERRUPT_NOTIFICATION = "InterruptNotification"  # Server-initiated interrupt (for non-MotionData mode)
+    CONVERSATION_RESET_ACCEPTED = "ConversationResetAccepted"
     CHAT_SIGNAL = "ChatSignal"
     ERROR = "Error"
     
@@ -152,12 +154,22 @@ class Interrupt(BaseModel):
     header: MessageHeader
 
 
+class ResetConversation(BaseModel):
+    """Clear conversation state while keeping the live session connected."""
+    header: MessageHeader
+
+
 # ============================================================================
 # 输入端口 - 服务器 → 客户端消息
 # ============================================================================
 
 class AvatarSessionInitialized(BaseModel):
     """会话初始化完成"""
+    header: MessageHeader
+
+
+class ConversationResetAccepted(BaseModel):
+    """Acknowledgement for a successful bound-session reset."""
     header: MessageHeader
 
 
@@ -360,12 +372,14 @@ def parse_message(json_data: dict) -> Optional[BaseMessage]:
             MessageType.SEND_HUMAN_TEXT: SendHumanText,
             MessageType.TRIGGER_HEARTBEAT: TriggerHeartbeat,
             MessageType.INTERRUPT: Interrupt,
+            MessageType.RESET_CONVERSATION: ResetConversation,
             MessageType.AVATAR_SESSION_INITIALIZED: AvatarSessionInitialized,
             MessageType.ECHO_HUMAN_TEXT: EchoHumanText,
             MessageType.ECHO_AVATAR_TEXT: EchoAvatarText,
             MessageType.ECHO_AVATAR_AUDIO: EchoAvatarAudio,
             MessageType.AVATAR_HEARTBEAT: AvatarHeartbeat,
             MessageType.INTERRUPT_ACCEPTED: InterruptAccepted,
+            MessageType.CONVERSATION_RESET_ACCEPTED: ConversationResetAccepted,
             MessageType.ERROR: Error,
             MessageType.MOTION_DATA: MotionDataMessage,
             MessageType.MOTION_DATA_WELCOME: MotionDataMessage,
@@ -394,4 +408,3 @@ def serialize_message(message: BaseMessage) -> dict:
         JSON 字典
     """
     return message.model_dump(exclude_none=True)
-
