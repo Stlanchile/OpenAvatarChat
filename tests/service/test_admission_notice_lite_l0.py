@@ -43,6 +43,9 @@ PARSEABLE_PRESETS = (
     "chat_with_openai_compatible_edge_tts.yaml",
 )
 KNOWN_BASELINE_INVALID_PRESET = "chat_with_qwen_omni.yaml"
+ADMISSION_NOTICE_LITE_PRESET = (
+    "chat_with_openai_compatible_bailian_cosyvoice_admission_notice_lite.yaml"
+)
 
 REQUIRED_DOCUMENT_HEADINGS = (
     "Status and Normative Language",
@@ -297,7 +300,12 @@ def test_real_loader_parses_minimal_explicitly_disabled_config(
 def test_preset_inventory_matches_the_clean_base() -> None:
     preset_names = tuple(path.name for path in sorted(CONFIG_DIR.glob("*.yaml")))
 
-    assert preset_names == (*PARSEABLE_PRESETS, KNOWN_BASELINE_INVALID_PRESET)
+    assert preset_names == (
+        *PARSEABLE_PRESETS[:5],
+        ADMISSION_NOTICE_LITE_PRESET,
+        *PARSEABLE_PRESETS[5:],
+        KNOWN_BASELINE_INVALID_PRESET,
+    )
 
 
 @pytest.mark.parametrize("preset_name", PARSEABLE_PRESETS)

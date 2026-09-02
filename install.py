@@ -7,6 +7,13 @@ from pathlib import Path
 
 import yaml
 
+from scripts.admission_notice_lite_install import (
+    InstallFeature,
+    prepare_admission_notice_lite_models,
+    resolve_features,
+    sidecar_sync_command,
+    validate_sidecar_layout,
+)
 from src.engine_utils.directory_info import DirectoryInfo
 
 # Packages that were previously handled specially for MuseTalk (OpenMMLab stack).
@@ -176,10 +183,9 @@ def parse_pyproject_deps(pyproject_path: Path) -> list:
     deps = []
     for line in content.splitlines():
         stripped = line.strip()
-        if stripped.startswith("dependencies"):
-            if "[" in stripped:
-                in_deps = True
-                continue
+        if stripped.startswith("dependencies") and "[" in stripped:
+            in_deps = True
+            continue
         if in_deps:
             if stripped == "]":
                 break
@@ -204,12 +210,12 @@ def split_dep(dep_str: str) -> tuple:
 
 def collect_and_merge_deps(handler_dirs: dict) -> list:
     """Collect deps from all handler pyproject.toml files and merge them.
-    
+
     Returns a list of pip-installable requirement strings.
     """
     dep_map = {}
 
-    for handler_name, handler_dir in handler_dirs.items():
+    for handler_dir in handler_dirs.values():
         toml_path = handler_dir / "pyproject.toml"
         if not toml_path.exists():
             continue
@@ -223,7 +229,7 @@ def collect_and_merge_deps(handler_dirs: dict) -> list:
                 continue
 
             # Skip packages managed by the root project (e.g. torch)
-            if norm_name in {normalize_pkg_name(s) for s in PROTECTED_PACKAGES.keys()}:
+            if norm_name in {normalize_pkg_name(s) for s in PROTECTED_PACKAGES}:
                 continue
 
             # Apply package name replacements (e.g. onnxruntime -> onnxruntime-gpu)
@@ -246,7 +252,13 @@ def collect_and_merge_deps(handler_dirs: dict) -> list:
     return list(dep_map.values())
 
 
-def run_cmd(cmd: list, description: str = "", check: bool = True, dry_run: bool = False, env: dict = None):
+def run_cmd(
+    cmd: list,
+    description: str = "",
+    check: bool = True,
+    dry_run: bool = False,
+    env: dict | None = None,
+):
     """Run a shell command with logging."""
     cmd_str = " ".join(cmd)
     if description:
@@ -265,6 +277,39 @@ def run_cmd(cmd: list, description: str = "", check: bool = True, dry_run: bool 
         print(f"  Command: {cmd_str}")
         sys.exit(1)
     return result
+
+
+def install_admission_notice_lite(*, dry_run: bool = False) -> None:
+    """Prepare the locked CPU-only OCR sidecar environment and models."""
+    project_root = Path(DirectoryInfo.get_project_dir())
+    try:
+        layout = validate_sidecar_layout(project_root)
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1) from None
+
+    run_cmd(
+        sidecar_sync_command(layout),
+        description="Synchronizing isolated Admission Notice Lite OCR environment",
+        dry_run=dry_run,
+    )
+
+    def execute(command: list[str], description: str) -> int:
+        result = run_cmd(
+            command,
+            description=description,
+            check=False,
+            dry_run=dry_run,
+        )
+        return 0 if result is None else result.returncode
+
+    if not prepare_admission_notice_lite_models(
+        layout,
+        execute,
+        dry_run=dry_run,
+    ):
+        print("Error: Admission Notice Lite OCR model preparation failed.")
+        raise SystemExit(1)
 
 
 def main():
@@ -289,15 +334,22 @@ def main():
         print("Mode: Install ALL handler dependencies")
         handler_dirs = get_all_handler_dirs()
         configs = []
+        features = set()
     else:
         print("Mode: Install selected handler dependencies")
         handler_dirs = {}
         configs = []
+        features = set()
         for config_path in args.configs or ():
             print(f"  Loading: {config_path}")
             config = load_yaml(config_path)
             configs.append(config)
             handler_dirs.update(get_handler_dirs_from_config(config))
+            try:
+                features.update(resolve_features(config))
+            except ValueError:
+                print(f"Error: Invalid service configuration in {config_path}.")
+                sys.exit(1)
         handler_dirs.update(get_handler_dirs_from_names(args.handlers or []))
 
     if not handler_dirs:
@@ -307,6 +359,12 @@ def main():
     print(f"\nDiscovered {len(handler_dirs)} handler(s):")
     for name, path in sorted(handler_dirs.items()):
         print(f"  - {name}: {path}")
+    if features:
+        print(f"\nDiscovered {len(features)} application feature(s):")
+        for feature in sorted(features, key=lambda item: item.value):
+            if feature is InstallFeature.ADMISSION_NOTICE_LITE:
+                print("  - Admission Notice Lite")
+                print("    Sidecar: services/admission_notice_ocr")
 
     # Collect and merge dependencies
     merged_deps = collect_and_merge_deps(handler_dirs)
@@ -377,6 +435,10 @@ def main():
         dry_run=args.dry_run,
     )
 
+    for feature in sorted(features, key=lambda item: item.value):
+        if feature is InstallFeature.ADMISSION_NOTICE_LITE:
+            install_admission_notice_lite(dry_run=args.dry_run)
+
     print(f"\n{'='*60}")
     print("  Installation completed successfully!")
     print(f"{'='*60}")
@@ -388,6 +450,11 @@ def main():
         print("  Select the application runtime configuration separately.")
     else:
         print("  All handler dependencies installed. Run with any config.")
+    if features:
+        print(
+            "  Host provisioning is performed separately by "
+            "scripts/setup_liteavatar_cosyvoice_root.sh"
+        )
 
 
 if __name__ == "__main__":

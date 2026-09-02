@@ -1148,6 +1148,76 @@ limit is a strict integer from 1 through 32. Unknown Lite keys are rejected
 with the ordinary Pydantic `ValidationError`. Existing YAML presets remain
 unchanged and default to disabled by omission.
 
+### Preset-aware installation
+
+The normal LiteAvatar and non-duplex CosyVoice preset remains:
+
+```bash
+uv run install.py \
+  --config config/chat_with_openai_compatible_bailian_cosyvoice.yaml
+```
+
+Admission Notice Lite uses the derived preset:
+
+```bash
+uv run install.py \
+  --config config/chat_with_openai_compatible_bailian_cosyvoice_admission_notice_lite.yaml
+```
+
+The derived preset has the same ordinary handler configuration as the normal
+preset. Its only additional configuration is the enabled
+`service.admission_notice_lite` block. Config-driven installation therefore
+prepares the same root handler dependencies and additionally synchronizes the
+locked, CPU-only environment under `services/admission_notice_ocr`. It then
+uses the existing sidecar model provisioner to reuse or acquire the two
+approved PP-OCRv6 medium models and verify the production manifest. Paddle,
+PaddleOCR, and PaddleX are not installed into the OpenAvatarChat root
+environment.
+
+Model preparation can also be run independently:
+
+```bash
+uv run scripts/download_models.py \
+  --config config/chat_with_openai_compatible_bailian_cosyvoice_admission_notice_lite.yaml
+```
+
+The normal preset does not select Admission Notice OCR model preparation.
+Runtime sidecar startup still forbids model downloads.
+
+```text
+Lite preset
+    |
+    +-- install.py
+    |     +-- normal handler dependencies -> root environment
+    |     `-- admission_notice_lite -> isolated sidecar uv environment
+    |
+    +-- download_models.py
+    |     +-- normal handler models
+    |     `-- PP-OCRv6 provisioner -> production manifest verification
+    |
+    `-- root provisioner (separate) -> systemd, /run, and host assets
+```
+
+`install.py` preserves its existing selector behavior: a supplied `--config`
+selects service features, while any accompanying `--handler` values add
+ordinary handlers. `scripts/download_models.py` preserves its existing
+exclusive selector precedence: explicit `--handler` mode takes precedence over
+`--config`, so it does not implicitly select Admission Notice Lite.
+
+Host-level preparation remains a separate, explicit administrator operation:
+
+```bash
+sudo bash scripts/setup_liteavatar_cosyvoice_root.sh
+```
+
+`install.py` and `scripts/download_models.py` do not install or start systemd
+units. After the host has been prepared, launch the Lite preset normally:
+
+```bash
+uv run src/demo.py \
+  --config config/chat_with_openai_compatible_bailian_cosyvoice_admission_notice_lite.yaml
+```
+
 ### Optional one-time host preparation
 
 `scripts/setup_liteavatar_cosyvoice_root.sh` is an optional manual host

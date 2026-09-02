@@ -22,6 +22,15 @@ from pathlib import Path
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.admission_notice_lite_install import (
+    InstallFeature,
+    prepare_admission_notice_lite_models,
+    resolve_features,
+    validate_sidecar_layout,
+)
 
 HANDLER_MODEL_REGISTRY = {
     "liteavatar": {
@@ -195,6 +204,33 @@ def get_handlers_from_config(config_path):
                 handlers.add(handler_key)
                 break
     return handlers
+
+
+def get_features_from_config(config_path):
+    """Parse a config YAML and return explicit service features needing models."""
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    if not path.exists():
+        print(f"Error: config file not found: {path}")
+        return set()
+    with open(path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    return set(resolve_features(config))
+
+
+def download_admission_notice_lite(**_kwargs):
+    """Prepare PP-OCRv6 models through the isolated sidecar provisioner."""
+    try:
+        layout = validate_sidecar_layout(PROJECT_ROOT)
+    except RuntimeError as exc:
+        print(f"  Error: {exc}")
+        return False
+
+    def execute(command, description):
+        return 0 if run_cmd(command, description) else 1
+
+    return prepare_admission_notice_lite_models(layout, execute)
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +550,7 @@ def main():
         return
 
     needed = set()
+    features = set()
     if args.download_all:
         needed = set(HANDLER_MODEL_REGISTRY.keys())
     elif args.handlers:
@@ -521,20 +558,30 @@ def main():
     elif args.configs:
         for cfg_path in args.configs:
             needed |= get_handlers_from_config(cfg_path)
+            try:
+                features |= get_features_from_config(cfg_path)
+            except ValueError:
+                print(f"Error: Invalid service configuration in {cfg_path}.")
+                sys.exit(1)
     else:
         parser.print_help()
         print("\nError: specify --config, --all, or --handler")
         sys.exit(1)
 
-    if not needed:
+    if not needed and not features:
         print("No handlers requiring model downloads found in the given config(s).")
         return
 
-    print(f"Models to download ({len(needed)} handler(s)):")
+    print(f"Handler models to prepare ({len(needed)} handler(s)):")
     for key in sorted(needed):
         info = HANDLER_MODEL_REGISTRY.get(key, {})
         src = resolve_source(args.source, key)
         print(f"  - {info.get('label', key)} [{src}]")
+    if features:
+        print(f"Feature models to prepare ({len(features)} feature(s)):")
+        for feature in sorted(features, key=lambda item: item.value):
+            if feature is InstallFeature.ADMISSION_NOTICE_LITE:
+                print("  - Admission Notice OCR / PP-OCRv6 [sidecar provisioner]")
 
     print()
 
@@ -558,6 +605,19 @@ def main():
         except Exception as e:  # noqa: BLE001 - keep other downloads isolated
             print(f"  Error downloading {key}: {e}")
             success = False
+
+    for feature in sorted(features, key=lambda item: item.value):
+        if feature is InstallFeature.ADMISSION_NOTICE_LITE:
+            print(f"\n{'='*60}")
+            print("  Preparing: Admission Notice OCR / PP-OCRv6")
+            print("  Environment: services/admission_notice_ocr")
+            print(f"{'='*60}")
+            try:
+                if not download_admission_notice_lite():
+                    success = False
+            except Exception as e:  # noqa: BLE001 - keep other downloads isolated
+                print(f"  Error preparing {feature.value}: {e}")
+                success = False
 
     print(f"\n{'='*60}")
     if success:
