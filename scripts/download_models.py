@@ -21,7 +21,6 @@ from pathlib import Path
 
 import yaml
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 HANDLER_MODEL_REGISTRY = {
@@ -185,7 +184,7 @@ def get_handlers_from_config(config_path):
 
     handler_configs = config.get("default", {}).get("chat_engine", {}).get("handler_configs", {})
     handlers = set()
-    for _name, cfg in handler_configs.items():
+    for cfg in handler_configs.values():
         if not cfg.get("enabled", True):
             continue
         module_val = cfg.get("module", "")
@@ -210,23 +209,32 @@ def download_liteavatar(source, **_kwargs):
     """
     lite_dir = PROJECT_ROOT / "src" / "handlers" / "avatar" / "liteavatar" / "algo" / "liteavatar"
     weights_dir = lite_dir / "weights"
-    if (weights_dir / "model_1.onnx").exists():
+    speech_dir = (
+        weights_dir
+        / "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+    )
+    lm_dir = speech_dir / "lm"
+    required_files = (
+        weights_dir / "model_1.onnx",
+        speech_dir / "model.pb",
+        lm_dir / "lm.pb",
+    )
+    if all(path.is_file() and path.stat().st_size > 0 for path in required_files):
         print("  LiteAvatar weights already exist, skipping.")
         return True
 
     ensure_package("modelscope")
-    run_cmd(
+    if not run_cmd(
         ["modelscope", "download", "--model", "HumanAIGC-Engineering/LiteAvatarGallery",
          "lite_avatar_weights/lm.pb", "lite_avatar_weights/model_1.onnx",
          "lite_avatar_weights/model.pb", "--local_dir", str(lite_dir)],
         "Downloading LiteAvatar weights from ModelScope",
-    )
+    ):
+        return False
 
     # Move files to expected locations (same as download_model.sh)
     src_dir = lite_dir / "lite_avatar_weights"
     if src_dir.exists():
-        speech_dir = weights_dir / "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
-        lm_dir = speech_dir / "lm"
         for d in [weights_dir, speech_dir, lm_dir]:
             d.mkdir(parents=True, exist_ok=True)
         lm_src = src_dir / "lm.pb"
@@ -239,7 +247,12 @@ def download_liteavatar(source, **_kwargs):
         if pb_src.exists():
             shutil.move(str(pb_src), str(speech_dir / "model.pb"))
         shutil.rmtree(str(src_dir), ignore_errors=True)
-    return True
+    complete = all(
+        path.is_file() and path.stat().st_size > 0 for path in required_files
+    )
+    if not complete:
+        print("  LiteAvatar download incomplete: required weight files are missing.")
+    return complete
 
 
 def download_lam(source, **_kwargs):
@@ -542,7 +555,7 @@ def main():
             ok = func(source=src)
             if not ok:
                 success = False
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - keep other downloads isolated
             print(f"  Error downloading {key}: {e}")
             success = False
 

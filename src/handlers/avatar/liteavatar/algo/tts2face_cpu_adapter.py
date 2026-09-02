@@ -1,26 +1,29 @@
 
 import os
 import shutil
-import sys
-from typing import Optional
 import subprocess as sp
+import sys
 
 from loguru import logger
 
+from engine_utils.directory_info import DirectoryInfo
+from engine_utils.inspect_utils import InspectUtils
+from engine_utils.time_utils import timeit
 from handlers.avatar.liteavatar.algo.base_algo_adapter import BaseAlgoAdapter
 from handlers.avatar.liteavatar.algo.bg_frame_counter import BgFrameCounter
 from handlers.avatar.liteavatar.algo.liteavatar.lite_avatar import liteAvatar
-from handlers.avatar.liteavatar.model.algo_model import AvatarAlgoConfig, AvatarInitOption, AvatarStatus
-from engine_utils.directory_info import DirectoryInfo
-from engine_utils.time_utils import timeit
-from engine_utils.inspect_utils import InspectUtils
+from handlers.avatar.liteavatar.model.algo_model import (
+    AvatarAlgoConfig,
+    AvatarInitOption,
+    AvatarStatus,
+)
 
 
 class Tts2faceCpuAdapter(BaseAlgoAdapter):
 
     TARGET_FPS = 30
 
-    def __init__(self, handler_root: Optional[str] = None):
+    def __init__(self, handler_root: str | None = None):
         super().__init__()
         self.tts2face = None
         self._bg_counter = None
@@ -84,10 +87,19 @@ class Tts2faceCpuAdapter(BaseAlgoAdapter):
 
     def _get_avatar_data_dir(self, avatar_name):
         logger.info("use avatar name {}", avatar_name)
+        if os.path.isabs(avatar_name):
+            avatar_data_dir = os.path.normpath(avatar_name)
+            if not os.path.isdir(avatar_data_dir):
+                raise FileNotFoundError(
+                    f"local avatar data directory does not exist: {avatar_data_dir}"
+                )
+            return avatar_data_dir
+
         avatar_zip_path = self._download_from_modelscope(avatar_name)
+        avatar_data_name = avatar_name.removesuffix(".zip")
         avatar_dir = self.get_avatar_dir()
-        extract_dir = os.path.join(avatar_dir, os.path.dirname(avatar_name))
-        avatar_data_dir = os.path.join(avatar_dir, avatar_name)
+        extract_dir = os.path.join(avatar_dir, os.path.dirname(avatar_data_name))
+        avatar_data_dir = os.path.join(avatar_dir, avatar_data_name)
         if not os.path.exists(avatar_data_dir):
             # extract avatar data to dir
             logger.info("extract avatar data to dir {}", extract_dir)
@@ -101,17 +113,28 @@ class Tts2faceCpuAdapter(BaseAlgoAdapter):
         download avatar data from modelscope to resource/avatar/liteavatar
         return avatar_zip_path
         """
-        if not avatar_name.endswith(".zip"):
-            avatar_name = avatar_name + ".zip"
+        avatar_data_name = avatar_name.removesuffix(".zip")
+        if (
+            os.path.isabs(avatar_data_name)
+            or "\\" in avatar_data_name
+            or any(
+                component in {"", ".", ".."}
+                for component in avatar_data_name.split("/")
+            )
+        ):
+            raise ValueError(
+                "ModelScope avatar names must be safe repository-relative paths"
+            )
+        avatar_archive_name = f"{avatar_data_name}.zip"
         avatar_dir = self.get_avatar_dir()
-        avatar_zip_path = os.path.join(avatar_dir, avatar_name)
+        avatar_zip_path = os.path.join(avatar_dir, avatar_archive_name)
         if not os.path.exists(avatar_zip_path):
             cmd = [
-                "modelscope", "download", "--model", "HumanAIGC-Engineering/LiteAvatarGallery", avatar_name,
+                "modelscope", "download", "--model", "HumanAIGC-Engineering/LiteAvatarGallery", avatar_archive_name,
                 "--local_dir", avatar_dir
                 ]
             logger.info("download avatar data from modelscope, cmd: {}", " ".join(cmd))
-            sp.run(cmd)
+            sp.run(cmd, check=True)
         return avatar_zip_path
 
     @staticmethod

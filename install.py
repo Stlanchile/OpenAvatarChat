@@ -61,12 +61,19 @@ MAX_COMPILE_JOBS = 4
 def parse_args():
     parser = argparse.ArgumentParser(
         description="One-stop dependency installer for OpenAvatarChat. "
-                    "Reads config YAML(s) to determine which handlers are needed, "
-                    "then installs all dependencies in one pass."
+                    "Selects handlers from config YAMLs or explicit directories, "
+                    "then installs their dependencies in one pass."
     )
     parser.add_argument(
         "--config", type=str, action="append", dest="configs",
         help="Path to config file (can be specified multiple times)"
+    )
+    parser.add_argument(
+        "--handler",
+        type=str,
+        action="append",
+        dest="handlers",
+        help="Handler directory relative to src/handlers (repeatable)",
     )
     parser.add_argument(
         "--all", action="store_true", dest="install_all",
@@ -134,6 +141,27 @@ def get_all_handler_dirs() -> dict:
         depth = len(rel.parts)
         if depth in (1, 2):
             result[parent.name] = parent
+    return result
+
+
+def get_handler_dirs_from_names(handler_names: list[str]) -> dict:
+    """Resolve explicit handler directories without an application preset."""
+    base_dir = Path(DirectoryInfo.get_project_dir()) / "src" / "handlers"
+    result = {}
+    for handler_name in handler_names:
+        relative_path = Path(handler_name)
+        if (
+            relative_path.is_absolute()
+            or len(relative_path.parts) not in (1, 2)
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+        ):
+            print(f"Error: Invalid handler directory {handler_name!r}.")
+            sys.exit(1)
+        handler_dir = base_dir / relative_path
+        if not (handler_dir / "pyproject.toml").is_file():
+            print(f"Error: Handler directory has no pyproject.toml: {handler_name}")
+            sys.exit(1)
+        result[handler_name] = handler_dir
     return result
 
 
@@ -247,11 +275,12 @@ def main():
         print("Please run with: uv run install.py --config <config_file>")
         sys.exit(1)
 
-    if not args.configs and not args.install_all:
-        print("Error: Please specify --config <path> or --all")
+    if not args.configs and not args.handlers and not args.install_all:
+        print("Error: Please specify --config <path>, --handler <path>, or --all")
         print("Examples:")
         print("  uv run install.py --config config/chat_with_lam.yaml")
         print("  uv run install.py --config config/a.yaml --config config/b.yaml")
+        print("  uv run install.py --handler avatar/liteavatar")
         print("  uv run install.py --all")
         sys.exit(1)
 
@@ -261,14 +290,15 @@ def main():
         handler_dirs = get_all_handler_dirs()
         configs = []
     else:
-        print(f"Mode: Install dependencies for {len(args.configs)} config(s)")
+        print("Mode: Install selected handler dependencies")
         handler_dirs = {}
         configs = []
-        for config_path in args.configs:
+        for config_path in args.configs or ():
             print(f"  Loading: {config_path}")
             config = load_yaml(config_path)
             configs.append(config)
             handler_dirs.update(get_handler_dirs_from_config(config))
+        handler_dirs.update(get_handler_dirs_from_names(args.handlers or []))
 
     if not handler_dirs:
         print("No handler directories found!")
@@ -353,6 +383,9 @@ def main():
     if args.configs:
         for config_path in args.configs:
             print(f"  Run with: uv run src/demo.py --config {config_path}")
+    elif args.handlers:
+        print("  Selected handler dependencies installed.")
+        print("  Select the application runtime configuration separately.")
     else:
         print("  All handler dependencies installed. Run with any config.")
 

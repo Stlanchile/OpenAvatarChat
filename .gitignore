@@ -12,6 +12,7 @@
 temp
 # Environments
 .env
+.env.setup.*
 .venv
 env/
 venv/

@@ -1148,6 +1148,16 @@ limit is a strict integer from 1 through 32. Unknown Lite keys are rejected
 with the ordinary Pydantic `ValidationError`. Existing YAML presets remain
 unchanged and default to disabled by omission.
 
+### Optional one-time host preparation
+
+`scripts/setup_liteavatar_cosyvoice_root.sh` is an optional manual host
+preparation script. Run it explicitly with
+`sudo bash scripts/setup_liteavatar_cosyvoice_root.sh`. It prepares the
+LiteAvatar, CosyVoice, SenseVoice, and qualified OCR host assets and OCR
+service. It does not define or modify an application runtime preset; select
+runtime configuration separately. Secrets remain in the ignored local `.env`
+and must not be committed.
+
 `ocr_socket_path` is a bounded absolute Unix path. The connect timeout is a
 strict float from 0.05 through 2 seconds and defaults to 1 second. The overall
 write/inference/read timeout is a strict float from 1 through 60 seconds and
